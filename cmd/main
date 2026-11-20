@@ -1,0 +1,44 @@
+#!/bin/sh
+
+APP_STATE="${TRIM_PKGVAR:-/var/apps/AVSubscribe/var}"
+PID_FILE="$APP_STATE/scheduler.pid"
+LOG_FILE="$APP_STATE/scheduler.log"
+APP_ROOT="/var/apps/AVSubscribe/target"
+
+is_running() {
+  [ -r "$PID_FILE" ] || return 1
+  pid=$(head -n 1 "$PID_FILE" | tr -d '[:space:]')
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+case "$1" in start|stop|status) ;; *) exit 1 ;; esac
+case "$1" in
+  start)
+    mkdir -p "$APP_STATE" || exit 1
+    rm -f "$APP_STATE/disabled"
+    if is_running; then exit 0; fi
+    rm -f "$PID_FILE"
+    TRIM_PKGVAR="$APP_STATE" python3 "$APP_ROOT/bin/app.py" --scheduler >> "$LOG_FILE" 2>&1 &
+    count=0
+    while [ "$count" -lt 5 ] && ! is_running; do sleep 1; count=$((count + 1)); done
+    is_running || exit 1
+    exit 0
+    ;;
+  stop)
+    mkdir -p "$APP_STATE" || exit 1
+    : > "$APP_STATE/disabled"
+    if is_running; then
+      pid=$(head -n 1 "$PID_FILE" | tr -d '[:space:]')
+      kill -TERM "$pid" 2>/dev/null || true
+      count=0
+      while kill -0 "$pid" 2>/dev/null && [ "$count" -lt 10 ]; do sleep 1; count=$((count + 1)); done
+      if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
+    fi
+    rm -f "$PID_FILE"
+    exit 0
+    ;;
+  status)
+    [ ! -e "$APP_STATE/disabled" ] && is_running
+    exit $?
+    ;;
+esac

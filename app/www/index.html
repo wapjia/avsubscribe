@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>女优订阅 · AVSubscribe</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="shell">
+    <aside class="sidebar" aria-label="主菜单">
+      <header class="brand-row"><div class="brand-mark" aria-hidden="true">片</div><div class="brand"><p class="eyebrow">FNOS · M-TEAM</p><div class="brand-title"><h1>影片订阅</h1><span id="app-version" class="app-version"></span></div></div></header>
+      <div class="sidebar-heading"><span>工作区</span></div>
+      <nav class="main-nav" aria-label="工作区">
+        <button class="nav-item active" data-view="all" aria-current="page"><span class="nav-icon" aria-hidden="true">▦</span><span>仪表台</span></button>
+      </nav>
+      <div id="mobile-subscription-bar" class="mobile-subscription-bar" hidden>
+        <select id="mobile-subscription-picker" aria-label="选择女优订阅"><option value="">选择订阅</option></select>
+        <button id="mobile-add-subscription" class="subscription-action" type="button" title="新建女优订阅" aria-label="新建女优订阅">＋</button>
+        <button id="mobile-subscription-edit" class="subscription-action" type="button" title="编辑所选订阅" aria-label="编辑所选订阅">✎</button>
+        <button id="mobile-subscription-check" class="subscription-action" type="button" title="立即检查所选订阅" aria-label="立即检查所选订阅">↻</button>
+      </div>
+      <div class="sidebar-heading subscriptions-heading"><span>我的订阅</span><button id="add-subscription" class="small-icon-button" title="新建订阅" aria-label="新建订阅">＋</button></div>
+      <nav id="subscription-menu" class="subscription-menu" aria-label="订阅列表"></nav>
+      <div class="sidebar-bottom">
+        <div class="sidebar-status"><div class="sidebar-state"><span id="scheduler-state" class="state-indicator"><i></i><span>初始化中</span></span><span id="next-scan-time" class="next-scan-time"></span></div><button id="scan-now" class="icon-button" title="立即检查" aria-label="立即检查">↻</button></div>
+        <button class="nav-item settings-link" data-view="settings"><span class="nav-icon" aria-hidden="true">⚙</span><span>设置</span></button>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <section id="dashboard-activity" class="activity-section dashboard-activity"><div class="section-head"><div><p class="eyebrow">下载器任务</p><h2>下载任务</h2></div><span id="activity-count" class="count-label">0 项</span></div><div class="table-wrap"><table><thead><tr><th>女优</th><th>番号</th><th>资源</th><th>状态</th><th>进度</th><th>说明</th></tr></thead><tbody id="activity-body"><tr><td colspan="6" class="empty">暂无下载任务</td></tr></tbody></table></div></section>
+
+      <section id="subscription-view" class="subscription-view" hidden>
+        <div class="page-heading"><div><p class="eyebrow">订阅</p><h2 id="selected-title">选择一个订阅</h2><p id="selected-description" class="muted"></p></div><div class="page-actions"><label id="refresh-existing-option" class="refresh-existing-option" title="配合“立即检查”使用，勾选后重新获取当前女优已存在视频的分辨率、中文分级、编码和副标题等信息。&#10;不勾选时复用已有完整缓存，只补充缺失或不完整的信息。&#10;仅勾选不会立即执行刷新。"><input id="refresh-existing-info" type="checkbox"><span>刷新已存在视频信息</span></label><button id="selected-refresh-videos" class="secondary" type="button" title="单独刷新当前女优目录中全部本地视频的信息，使用每个文件已绑定的 M-Team ID 读取详情。&#10;更新分辨率、中文分级、编码、副标题和 MediaInfo，不搜索或下载新影片。&#10;没有 M-Team ID 的文件会跳过，请先补全 ID；完成后显示成功、跳过和失败数量。">刷新视频信息</button><button id="selected-backfill-mteam" class="secondary" type="button" title="从 qBittorrent 已有种子的注释读取 M-Team ID，按路径映射后的种子文件路径匹配当前女优目录中的视频。&#10;仅接受 Tracker 包含 m-team 或 manfuz 的种子，按映射后的实际文件路径匹配；同番号多文件逐个核对，已有错误 ID 会修正；匹配冲突时跳过。&#10;配置 M-Team 令牌后还会读取详情，并为标记为外挂中文字幕且缺少对应字幕的本地视频尝试下载字幕。">补全 M-Team ID</button><button id="selected-scan" class="secondary" type="button" title="立即检查当前女优订阅：同步下载器状态、扫描本地目录，并按女优名字和附加关键字搜索 M-Team。&#10;按黑名单、番号去重及洗版设置决定是否提交新下载；勾选左侧选项会同时刷新已存在视频信息。&#10;执行进度和结果可在下方日志查看；遇到限流时等待冷却后继续。">立即检查</button><button id="selected-edit" class="secondary" type="button">编辑</button><button id="selected-delete" class="danger-button" type="button">删除</button></div></div>
+        <div id="subscription-summary" class="subscription-summary"></div>
+        <section class="activity-section existing-section" aria-labelledby="existing-toggle">
+          <div class="section-head">
+            <button id="existing-toggle" class="existing-toggle" type="button" aria-expanded="true" aria-controls="existing-content">
+              <span class="existing-toggle-label"><span class="eyebrow">本地目录</span><span class="existing-title">已存在影片番号</span></span>
+            </button>
+            <span id="existing-count" class="count-label">0 个视频</span>
+          </div>
+          <div id="existing-content" class="existing-content">
+            <div class="table-wrap"><table><thead><tr><th>番号</th><th>匹配版本</th><th>文件</th></tr></thead><tbody id="existing-body"><tr><td colspan="3" class="empty">读取目录中…</td></tr></tbody></table></div>
+          </div>
+        </section>
+      </section>
+
+      <section id="settings-view" class="settings-section" aria-labelledby="settings-title" hidden>
+      <div class="section-head settings-page-head"><div><p class="eyebrow">应用配置</p><h2 id="settings-title">设置</h2></div><button id="save-settings" class="secondary settings-save-top" type="button">保存设置</button></div>
+      <div class="settings-group">
+        <div class="settings-group-heading"><h3>连接与下载器路径</h3><p>配置 M-Team、qBittorrent Web API 和下载路径转换。</p></div>
+      <div class="connection-grid">
+        <div class="connection-block">
+          <div class="block-heading"><div><h3>M-Team API</h3><p id="mteam-state" class="field-state">未配置</p></div><button id="test-mteam" class="text-button">测试连接</button></div>
+          <label for="mteam-token">个人存取令牌</label><div class="secret-row"><input id="mteam-token" type="password" autocomplete="new-password" placeholder="粘贴 M-Team API Key"><button id="toggle-token" class="icon-button" type="button" title="显示令牌" aria-label="显示令牌">◉</button><button id="clear-token" class="icon-button" type="button" title="清除令牌" aria-label="清除已保存的令牌">×</button></div>
+        </div>
+        <div class="connection-block">
+          <div class="block-heading"><div><h3>下载器 Web API</h3><p id="downloader-state" class="field-state">未配置</p></div><button id="test-downloader" class="text-button">测试连接</button></div>
+          <div class="form-grid downloader-fields"><label>下载器<span class="field-static">qBittorrent</span><input id="client-type" type="hidden" value="qbittorrent"></label><label>Web API 地址<input id="client-url" type="url" placeholder="http://127.0.0.1:8080"></label><label>用户名<input id="client-user" autocomplete="username"></label><label>密码<input id="client-password" type="password" autocomplete="new-password" placeholder="留空保持原密码"></label></div>
+          <div class="settings-subgroup downloader-paths">
+            <div class="block-heading"><div><h4>下载器路径映射</h4><p class="field-state">飞牛本地路径 → 下载器容器路径</p></div><button id="add-path-mapping" class="text-button" type="button">＋ 添加映射</button></div>
+            <div id="path-mapping-list" class="path-mapping-list"></div>
+          </div>
+        </div>
+      </div>
+      </div>
+      <div class="settings-group">
+        <div class="settings-group-heading"><h3>字幕汇总</h3><p>供 MDC-NG 的女优刮削流程读取本地中文字幕。</p></div>
+        <label class="settings-field-label" for="subtitle-collection-dir">飞牛本地目录</label>
+        <input id="subtitle-collection-dir" type="text" placeholder="例如 /vol2/1000/media/Subtitles，留空关闭" aria-describedby="subtitle-collection-note">
+        <p id="subtitle-collection-note" class="path-hint">每轮订阅检查后，将中文字幕等级且文件名带 .MT. 标记的字幕复制到此目录，供 MDC-NG 刮削女优影片时识别；按“番号.扩展名”命名，如 ABC-123.srt。源字幕保留，目录不存在时自动创建；同番号、同扩展名优先选修改时间较新的文件。</p>
+      </div>
+      <div class="settings-group">
+        <div class="settings-group-heading"><h3>检查计划</h3><p>管理自动检查频率和 M-Team 请求节奏。</p></div>
+        <div class="settings-row"><div class="settings-control"><label class="toggle"><input id="auto-scan" type="checkbox"><span class="switch"></span><span>定时检查</span></label></div><div class="settings-row-description"><strong>自动检查订阅</strong><span>按设定间隔搜索新影片；新版本完成后会清理旧下载任务及其数据。</span></div><label class="interval">间隔<input id="poll-interval" type="number" min="5" max="1440" step="5">分钟</label></div>
+        <div class="settings-row"><div class="settings-control"><label class="interval" for="mteam-request-interval">请求间隔<input id="mteam-request-interval" type="number" min="1" max="60" step="1">秒/次</label></div><div class="settings-row-description"><strong>M-Team API 速度</strong><span>每次请求之间的等待时间；数值越大，请求越慢。默认 5 秒。</span></div></div>
+      </div>
+      <div class="settings-group">
+        <div class="settings-group-heading"><h3>本地维护与诊断</h3><p>控制本地文件整理和日志详细程度。</p></div>
+        <div class="settings-row"><div class="settings-control"><label class="toggle"><input id="local-multi-disk-wash" type="checkbox"><span class="switch"></span><span>洗版本地重复番号</span></label></div><div class="settings-row-description"><strong>仅限同一女优的订阅目录</strong><span>比较目录内同番号影片；仅在分辨率或中文等级明确较低时删除本地文件，不跨女优目录洗版。</span></div></div>
+        <div class="settings-row"><div class="settings-control"><label class="toggle"><input id="cleanup-orphan-sidecars" type="checkbox"><span class="switch"></span><span>清理孤立 NFO/字幕</span></label></div><div class="settings-row-description"><strong>自动整理配套文件</strong><span>每次扫描时删除同目录内找不到对应视频的 NFO 和字幕文件。</span></div></div>
+        <div class="settings-row"><div class="settings-control"><label class="toggle"><input id="debug-mode" type="checkbox"><span class="switch"></span><span>调试模式</span></label></div><div class="settings-row-description"><strong>记录详细检查原因</strong><span>记录每个番号的搜索、过滤、跳过和提交原因；排查完成后建议关闭。</span></div></div>
+      </div>
+      <div class="settings-save-bar"><span>更改需要保存后才会生效。</span><button id="save-settings-footer" class="primary" type="button">保存设置</button></div>
+      </section>
+
+      <section id="log-section" class="log-section" aria-labelledby="log-title">
+        <div class="section-head"><div><p class="eyebrow">后台执行日志</p><h2 id="log-title">检查日志</h2></div><div class="log-actions"><span id="log-count" class="count-label">0 条</span><button id="clear-logs" class="text-button" type="button">清理全部日志</button></div></div>
+        <ol id="log-list" class="log-list"><li class="log-empty">等待检查任务。</li></ol>
+      </section>
+
+    </div>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  </main>
+
+  <dialog id="subscription-dialog">
+    <form id="subscription-form" method="dialog">
+      <div class="dialog-head"><div><p class="eyebrow">订阅设置</p><h2 id="dialog-title">新建订阅</h2></div><button id="dialog-close" class="icon-button" type="button" aria-label="关闭">×</button></div>
+      <input id="subscription-id" type="hidden">
+      <label for="performer">女优名字</label><input id="performer" maxlength="120" required placeholder="例如：三上悠亚">
+      <label for="keywords">附加关键字 <span class="optional">可选</span></label><input id="keywords" maxlength="200" placeholder="例如：ltx">
+      <label for="blacklist-input">番号黑名单 <span class="optional">可选</span></label><div id="blacklist-tags" class="tag-input"><input id="blacklist-input" autocomplete="off" placeholder="输入番号，按回车添加"></div>
+      <label for="download-dir">下载文件夹</label><input id="download-dir" required placeholder="例如：/vol1/video/三上悠亚">
+      <p class="path-hint">填写飞牛与下载器都能访问的绝对路径。</p>
+      <label class="toggle wash-toggle"><input id="wash-enabled" type="checkbox" checked><span class="switch"></span><span>自动洗版并清理旧版本</span></label>
+      <div class="rank-guide"><b>洗版顺序</b><span>4K ＞ 1080p ＞ 其他</span><span>内嵌中文 ＞ 中文字幕 ＞ 非中文</span><span>x265 ＞ x264</span></div>
+      <div class="dialog-actions"><button id="dialog-cancel" class="secondary" type="button">取消</button><button id="submit-subscription" class="primary" type="submit">保存订阅</button></div>
+    </form>
+  </dialog>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

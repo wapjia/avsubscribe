@@ -1,0 +1,12 @@
+appname = AVSubscribe
+version = 1.1.35
+display_name = AV 影片订阅
+desc = M-Team 女优影片订阅与自动洗版
+platform = all
+source = thirdparty
+maintainer = AVSubscribe
+distributor = AVSubscribe
+desktop_uidir = ui
+desktop_applaunchname = AVSubscribe.main
+ctl_stop = true
+micro_app = true
