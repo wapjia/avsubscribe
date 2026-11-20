@@ -589,8 +589,8 @@ function renderLogs(entries) {
       const label = document.createElement("span");
       label.textContent = entry.message;
       row.append(label);
-      if (entry.message.includes("开始") && entry.round_id && !copyButtons.has(entry.round_id)) {
-        copyButtons.add(entry.round_id);
+      if (entry.round_id && !copyButtons.has(`${entry.round_id}:${entry.message.includes("开始") ? "start" : "end"}`)) {
+        copyButtons.add(`${entry.round_id}:${entry.message.includes("开始") ? "start" : "end"}`);
         row.append(makeButton("复制本轮", "text-button log-copy-round", () => copyLogRound(entry.round_id, entriesWithContent), "复制本轮可见日志"));
       }
       list.append(row);
@@ -787,6 +787,8 @@ async function copyLogRound(roundId, visibleEntries) {
 async function clearLogs() {
   const selected = subscriptions.find((item) => item.id === selectedSubscriptionId);
   const scoped = activeView === "subscription" && selected;
+  const scopeLabel = scoped ? `“${selected.performer}”的日志` : "全部日志";
+  if (!window.confirm(`确定清理${scopeLabel}吗？此操作无法撤销。`)) return;
   const query = scoped ? `?subscription=${encodeURIComponent(selected.performer)}` : "";
   const button = $("#clear-logs");
   button.disabled = true;
