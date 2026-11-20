@@ -19,6 +19,12 @@ let existingVideosLoading = false;
 let lastStatusState = "";
 let currentStatus = {};
 let awaitedBackfillJobId = "";
+let refreshInFlight = false;
+let subscriptionsLoaded = false;
+let logsLoaded = false;
+let lastSubscriptionRefresh = 0;
+let lastActivityRefresh = 0;
+let lastLogId = 0;
 let blacklistNumbers = [];
 let pathMappings = [];
 const videoSubtitleRequests = new Map();
@@ -626,7 +632,7 @@ const LOG_EVENT_LABELS = {
   local_scan_started: "本地扫描", local_scan_completed: "本地扫描",
   mteam_search_started: "M-Team 搜索", mteam_search_completed: "M-Team 搜索",
   retry_waiting: "限流等待", waiting_retry: "限流等待", retry_resuming: "继续检查", rate_limited: "限流",
-  debug_decision: "检查依据", release: "资源处理", duplicate_task: "已有任务",
+  debug_decision: "检查依据", debug_performance: "性能统计", release: "资源处理", duplicate_task: "已有任务",
   subtitle_download_completed: "字幕", subtitle_download_failed: "字幕",
   subtitle_not_found: "字幕", subtitle_directory_unavailable: "字幕",
   subtitle_id_missing: "字幕", subtitle_metadata_failed: "字幕",
@@ -635,7 +641,7 @@ const LOG_EVENT_LABELS = {
   mteam_id_backfill_started: "开始补全", mteam_id_backfill_progress: "补全进度",
   mteam_id_backfill_completed: "补全完成", mteam_id_backfill_failed: "补全失败",
   mteam_id_backfill_corrected: "ID 修正",
-  local_wash_completed: "本地洗版", local_wash_failed: "本地洗版",
+  local_wash_completed: "本地洗版", local_wash_failed: "本地洗版", local_wash_skipped: "本地洗版",
   orphan_sidecars_cleaned: "清理", existing_task_directory_recheck: "任务校验",
   existing_task_directory_missing: "任务校验", request_interrupted: "已中断",
   scheduler_error: "后台服务", scheduler_recovered: "后台服务", state_error: "状态错误",
@@ -794,7 +800,9 @@ async function clearLogs() {
   button.disabled = true;
   try {
     const result = await api(`/api/logs${query}`, { method: "DELETE" });
-    logEntries = await api("/api/logs");
+    logEntries = scoped
+      ? logEntries.filter((entry) => entry.subscription !== selected.performer)
+      : [];
     renderLogs(logEntries);
     toast(`已清理 ${result.deleted} 条${scoped ? `${selected.performer}的` : ""}日志`);
   } catch (error) {
@@ -919,24 +927,45 @@ function renderScanButtons() {
 }
 
 async function refresh() {
+  if (refreshInFlight) return;
+  refreshInFlight = true;
   try {
+    const now = Date.now();
+    const loadSubscriptions = !subscriptionsLoaded || now - lastSubscriptionRefresh >= 30000;
+    const loadActivity = activeView === "all" && now - lastActivityRefresh >= 15000;
     const backfillPath = selectedSubscriptionId
       ? `/api/subscriptions/${encodeURIComponent(selectedSubscriptionId)}/mteam-id-backfill`
       : "";
+    const logsPath = logsLoaded ? `/api/logs?after_id=${lastLogId}` : "/api/logs";
     const [nextSubscriptions, status, nextActivity, nextLogs, backfill] = await Promise.all([
-      api("/api/subscriptions"), api("/api/status"), api("/api/activity"), api("/api/logs"),
+      loadSubscriptions ? api("/api/subscriptions") : Promise.resolve(null),
+      api("/api/status"),
+      loadActivity ? api("/api/activity") : Promise.resolve(null),
+      api(logsPath),
       backfillPath ? api(backfillPath) : Promise.resolve(null)
     ]);
-    subscriptions = nextSubscriptions;
-    activity = nextActivity;
-    logEntries = nextLogs;
+    if (nextSubscriptions) {
+      subscriptions = nextSubscriptions;
+      subscriptionsLoaded = true;
+      lastSubscriptionRefresh = Date.now();
+    }
+    if (nextActivity) {
+      activity = nextActivity;
+      lastActivityRefresh = Date.now();
+    }
+    if (!logsLoaded || nextLogs.length) {
+      logEntries = [...logEntries, ...nextLogs].slice(-500);
+      logsLoaded = true;
+      lastLogId = logEntries.reduce((maximum, entry) => Math.max(maximum, Number(entry.id) || 0), lastLogId);
+      renderLogs(logEntries);
+    }
     if (activeView === "subscription" && !subscriptions.some((item) => item.id === selectedSubscriptionId)) {
       activeView = "all";
       selectedSubscriptionId = "";
     }
-    renderSubscriptions();
+    if (nextSubscriptions) renderSubscriptions();
     renderStatus(status);
-    renderLogs(logEntries);
+    if (nextActivity) renderActivity();
     renderBackfillStatus(backfill);
     if (selectedSubscriptionId && ["completed", "failed"].includes(status.state) && ["running", "queued"].includes(lastStatusState)) {
       loadExistingVideos(selectedSubscriptionId);
@@ -947,6 +976,8 @@ async function refresh() {
   } catch (error) {
     $("#scheduler-state").dataset.state = "failed";
     $("#scheduler-state").lastElementChild.textContent = "连接异常";
+  } finally {
+    refreshInFlight = false;
   }
 }
 

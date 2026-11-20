@@ -1,6 +1,7 @@
 import io
 import json
 import hashlib
+import concurrent.futures
 import os
 import sqlite3
 import tempfile
@@ -48,6 +49,27 @@ class FakeDownloader:
 
     def remove(self, info_hash, delete_data=True):
         self.removed.append((info_hash, delete_data))
+
+
+class FileMetadataDownloader(FakeDownloader):
+    def __init__(self, tasks, files, metadata):
+        super().__init__()
+        self.tasks, self.files, self.metadata = tasks, files, metadata
+        self.list_calls = 0
+        self.file_calls = []
+        self.metadata_calls = []
+
+    def list_tasks(self, hashes=None):
+        self.list_calls += 1
+        return self.tasks
+
+    def list_task_files(self, info_hash):
+        self.file_calls.append(info_hash)
+        return self.files[info_hash]
+
+    def task_mteam_metadata(self, info_hash):
+        self.metadata_calls.append(info_hash)
+        return self.metadata[info_hash]
 
 
 class ReleaseLogicTests(unittest.TestCase):
@@ -522,7 +544,8 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
         root = Path(temp.name)
         self.enterContext(patch.object(app, "DATA_ROOT", root))
         self.enterContext(patch.object(app, "LOCAL_VIDEO_DATABASE", root / "local-videos.sqlite3"))
-        for name in ("SETTINGS_FILE", "SUBSCRIPTIONS_FILE", "RECORDS_FILE", "STATUS_FILE", "BACKFILL_STATUS_FILE", "BACKFILL_STATUS_LOCK_FILE", "LOG_FILE", "LOG_LOCK_FILE", "REQUEST_FILE", "LOCK_FILE", "DISABLED_FILE", "MTEAM_LIMIT_FILE", "MTEAM_REQUEST_STATE_FILE", "MTEAM_REQUEST_LOCK_FILE"):
+        self.enterContext(patch.object(app, "LOG_DATABASE_FILE", root / "activity-log.sqlite3"))
+        for name in ("SETTINGS_FILE", "SUBSCRIPTIONS_FILE", "RECORDS_FILE", "STATUS_FILE", "SCHEDULE_FILE", "BACKFILL_STATUS_FILE", "BACKFILL_STATUS_LOCK_FILE", "LOG_FILE", "LOG_LOCK_FILE", "REQUEST_FILE", "LOCK_FILE", "DISABLED_FILE", "MTEAM_LIMIT_FILE", "MTEAM_REQUEST_STATE_FILE", "MTEAM_REQUEST_LOCK_FILE"):
             self.enterContext(patch.object(app, name, root / (name.lower() + ".json")))
         self.enterContext(patch.object(app, "mteam_detail", return_value={"performer": "三上悠亚 Actress"}))
 
@@ -764,6 +787,21 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
         app.write_json(app.STATUS_FILE, {"state": "completed", "last_scan_at": "2026-11-13T02:30:00+00:00"})
         expected = app.datetime.datetime.fromisoformat("2026-11-13T02:30:00+00:00").timestamp()
         self.assertEqual(app.scheduler_last_run(), expected)
+
+    def test_manual_scan_does_not_change_global_scheduled_scan_time(self):
+        scheduled_at = "2026-11-13T02:30:00+00:00"
+        manual_at = "2026-11-13T03:00:00+00:00"
+        app.record_scheduled_run("scheduled", scheduled_at)
+        app.record_scheduled_run("manual", manual_at)
+        self.assertEqual(app.read_json(app.SCHEDULE_FILE, {})["last_run_at"], scheduled_at)
+        self.assertEqual(app.scheduler_last_run(), app.datetime.datetime.fromisoformat(scheduled_at).timestamp())
+        app.write_json(app.STATUS_FILE, {"trigger": "manual", "state": "completed", "last_scan_at": manual_at})
+        self.assertEqual(app.scheduler_last_run(), app.datetime.datetime.fromisoformat(scheduled_at).timestamp())
+
+    def test_scheduled_scan_updates_global_timer(self):
+        scheduled_at = "2026-11-13T03:30:00+00:00"
+        self.assertTrue(app.record_scheduled_run("scheduled", scheduled_at))
+        self.assertEqual(app.scheduler_last_run(), app.datetime.datetime.fromisoformat(scheduled_at).timestamp())
 
     def test_status_exposes_next_scheduled_scan_time(self):
         app.write_json(app.SETTINGS_FILE, {"poll_interval_minutes": 30, "auto_scan": True})
@@ -1318,6 +1356,39 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
         self.assertEqual(app.clear_logs(), {"deleted": 2})
         self.assertEqual(app.get_logs(), [])
 
+    def test_legacy_json_logs_are_imported_once_and_incremental_reads_use_ids(self):
+        legacy = [
+            {"time": "2026-11-20T10:00:00+00:00", "event": "started", "message": "legacy", "round_id": "round-1"},
+            {"time": "2026-11-20T10:00:01+00:00", "event": "completed", "message": "old"},
+        ]
+        app.write_json(app.LOG_FILE, legacy)
+        imported = app.get_logs()
+        self.assertEqual([item["message"] for item in imported], ["legacy", "old"])
+        self.assertEqual(imported[0]["round_id"], "round-1")
+        connection = app.connect_log_database()
+        self.addCleanup(connection.close)
+        self.assertFalse(connection.in_transaction)
+        app.log_event("new", subscription="Actress")
+        delta = app.get_logs(after_id=imported[-1]["id"])
+        self.assertEqual([item["message"] for item in delta], ["new"])
+        self.assertEqual(app.clear_logs("Actress"), {"deleted": 1})
+        self.assertEqual([item["message"] for item in app.get_logs()], ["legacy", "old"])
+
+    def test_legacy_log_import_retains_only_the_most_recent_500_entries(self):
+        app.write_json(app.LOG_FILE, [
+            {"time": str(index), "event": "status", "message": str(index)}
+            for index in range(505)
+        ])
+        rows = app.get_logs()
+        self.assertEqual(len(rows), 500)
+        self.assertEqual((rows[0]["message"], rows[-1]["message"]), ("5", "504"))
+
+    def test_concurrent_log_writes_are_preserved(self):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(lambda index: app.log_event(f"parallel-{index}"), range(40)))
+        messages = {item["message"] for item in app.get_logs()}
+        self.assertEqual(len(messages), 40)
+
     def test_local_video_files_are_indexed_by_number(self):
         root = Path(app.DATA_ROOT) / "videos"
         root.mkdir()
@@ -1837,7 +1908,8 @@ class UpgradeTests(unittest.TestCase):
         self.directory = __import__("tempfile").TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.enterContext(patch.object(app, "LOCAL_VIDEO_DATABASE", __import__("pathlib").Path(self.directory.name) / "local-videos.sqlite3"))
-        for name in ("DATA_ROOT", "SETTINGS_FILE", "SUBSCRIPTIONS_FILE", "RECORDS_FILE", "STATUS_FILE", "BACKFILL_STATUS_FILE", "BACKFILL_STATUS_LOCK_FILE", "LOG_FILE", "LOG_LOCK_FILE", "REQUEST_FILE", "LOCK_FILE", "DISABLED_FILE", "MTEAM_LIMIT_FILE", "MTEAM_REQUEST_STATE_FILE", "MTEAM_REQUEST_LOCK_FILE"):
+        self.enterContext(patch.object(app, "LOG_DATABASE_FILE", __import__("pathlib").Path(self.directory.name) / "activity-log.sqlite3"))
+        for name in ("DATA_ROOT", "SETTINGS_FILE", "SUBSCRIPTIONS_FILE", "RECORDS_FILE", "STATUS_FILE", "SCHEDULE_FILE", "BACKFILL_STATUS_FILE", "BACKFILL_STATUS_LOCK_FILE", "LOG_FILE", "LOG_LOCK_FILE", "REQUEST_FILE", "LOCK_FILE", "DISABLED_FILE", "MTEAM_LIMIT_FILE", "MTEAM_REQUEST_STATE_FILE", "MTEAM_REQUEST_LOCK_FILE"):
             self.enterContext(patch.object(app, name, __import__("pathlib").Path(self.directory.name) / (name.lower() + ".json")))
         self.enterContext(patch.object(app, "mteam_detail", return_value={"performer": "三上悠亚 Actress"}))
 
@@ -2388,6 +2460,253 @@ class UpgradeTests(unittest.TestCase):
         self.assertIn("分辨率：1080p → 4K", local_wash["message"])
         self.assertEqual(local_wash["subscription"], "三上悠亚")
 
+    def test_check_auto_binds_each_duplicate_before_local_washing(self):
+        root = Path(self.directory.name) / "auto-bind-wash"
+        root.mkdir()
+        embedded, external = [root / f"MIRD-284 4k x265 {suffix}.mp4" for suffix in ("A", "Z")]
+        for video in (embedded, external):
+            video.write_bytes(b"video")
+        subscription = {"id": "sub", "performer": "Actress", "download_dir": str(root)}
+        app.write_json(app.SUBSCRIPTIONS_FILE, [subscription])
+        downloader = FileMetadataDownloader(
+            {key: {"name": video.name, "save_path": str(root), "content_path": str(video), "complete": True} for key, video in (("first", embedded), ("second", external))},
+            {"first": [{"name": embedded.name}], "second": [{"name": external.name}]},
+            {"first": ({"comment": "https://kp.m-team.cc/detail/1286124"}, [{"url": "https://tracker.m-team.cc/announce"}]),
+             "second": ({"comment": "1280579"}, [{"url": "https://tracker.manfuz.co/announce"}])},
+        )
+        details = {
+            "1286124": {"performer": "Actress", "resolution": "2160p", "videoCodec": "x265", "labelsNew": ["中字"], "hasChineseSubtitle": False},
+            "1280579": {"performer": "Actress", "resolution": "2160p", "videoCodec": "x265", "labelsNew": [], "hasChineseSubtitle": True},
+        }
+        records = {}
+        with patch.object(app, "mteam_search", return_value=[]), patch.object(app, "mteam_detail", side_effect=lambda identifier, token: details[identifier]) as detail:
+            app.process_subscription(subscription, records, {"mteam_token": "token", "local_multi_disk_wash": True}, downloader, [])
+        self.assertTrue(embedded.exists())
+        self.assertFalse(external.exists())
+        self.assertEqual(downloader.removed, [("second", False)])
+        self.assertEqual(downloader.list_calls, 1)
+        self.assertCountEqual(downloader.file_calls, ["first", "second"])
+        self.assertEqual(detail.call_count, 2)
+        self.assertEqual(records["sub"]["MIRD-284"]["local_files"][str(embedded)]["id"], "1286124")
+        with closing(sqlite3.connect(app.LOCAL_VIDEO_DATABASE)) as database:
+            self.assertEqual(database.execute("SELECT mteam_id FROM local_video_files").fetchall(), [("1286124",)])
+
+    def test_check_auto_binds_single_file_without_wash_or_duplicate_download(self):
+        root = Path(self.directory.name) / "auto-bind-single"
+        root.mkdir()
+        video = root / "SSNI-618.mp4"
+        video.write_bytes(b"video")
+        subscription = {"id": "sub", "performer": "Actress", "download_dir": str(root)}
+        app.write_json(app.SUBSCRIPTIONS_FILE, [subscription])
+        downloader = FileMetadataDownloader(
+            {"hash": {"name": video.name, "save_path": str(root), "content_path": str(video)}},
+            {"hash": [{"name": video.name}]},
+            {"hash": ({"comment": "1283711"}, [{"url": "https://tracker.m-team.cc/announce"}])},
+        )
+        records = {}
+        candidate = {"id": "1283711", "code": "SSNI-618", "title": "SSNI-618", "rank": [1, 2, 2], "seeders": 1, "created": "2026", "metadata_complete": True}
+        detail = {"performer": "Actress", "resolution": "1080p", "videoCodec": "x265", "labelsNew": ["中字"]}
+        with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "mteam_detail", return_value=detail), patch.object(app, "fetch_torrent") as fetch, patch.object(app, "mteam_subtitle_download") as subtitle:
+            app.process_subscription(subscription, records, {"mteam_token": "token"}, downloader, [])
+        record = records["sub"]["SSNI-618"]
+        self.assertEqual(record["local_files"][str(video)]["id"], "1283711")
+        self.assertEqual(record["local_files"][str(video)]["id_source"], "qbittorrent_file")
+        self.assertEqual(record["current"]["rank"], [1, 2, 2])
+        self.assertEqual(downloader.added, [])
+        fetch.assert_not_called()
+        subtitle.assert_not_called()
+
+    def test_auto_bind_leaves_existing_ids_and_avoids_downloader_requests_when_complete(self):
+        root = Path(self.directory.name) / "auto-bind-complete"
+        root.mkdir()
+        video = root / "SSNI-618.mp4"
+        video.touch()
+        records = {"SSNI-618": {"local_files": {str(video): {"id": "1283711", "rank": [1, 2, 2]}}}}
+        downloader = FileMetadataDownloader({}, {}, {})
+        app.bind_missing_local_mteam_ids({"performer": "Actress"}, app.scan_local_releases(str(root)), records, downloader)
+        self.assertEqual(downloader.list_calls, 0)
+        self.assertEqual(records["SSNI-618"]["local_files"][str(video)]["id"], "1283711")
+
+    def test_auto_bind_reuses_qb_file_and_comment_cache_within_one_round(self):
+        root = Path(self.directory.name) / "auto-bind-cache"
+        root.mkdir()
+        videos = [root / f"SSNI-{number}.mp4" for number in (618, 619)]
+        for video in videos:
+            video.touch()
+        downloader = FileMetadataDownloader(
+            {"hash": {"name": "合集", "save_path": str(root.parent), "content_path": str(root)}},
+            {"hash": [{"name": f"{root.name}/{video.name}"} for video in videos]},
+            {"hash": ({"comment": "1283711"}, [{"url": "https://tracker.m-team.cc/announce"}])},
+        )
+        scanned = app.scan_local_releases(str(root))
+        records, cache = {}, {}
+        for code in ("SSNI-618", "SSNI-619"):
+            app.bind_missing_local_mteam_ids({"performer": "Actress"}, {code: scanned[code]}, records, downloader, cache)
+        self.assertEqual(downloader.list_calls, 1)
+        self.assertEqual(downloader.file_calls, ["hash"])
+        self.assertEqual(downloader.metadata_calls, ["hash"])
+        self.assertEqual({record["local_files"][str(video)]["id"] for record, video in zip(records.values(), videos)}, {"1283711"})
+
+    def test_auto_bind_rejects_untrusted_wrong_path_and_conflicting_torrents(self):
+        root = Path(self.directory.name) / "auto-bind-rejected"
+        root.mkdir()
+        videos = [root / f"SSNI-{number}.mp4" for number in (618, 619, 620)]
+        for video in videos:
+            video.touch()
+        first, second, third = videos
+        downloader = FileMetadataDownloader(
+            {key: {"name": video.name, "save_path": str(root), "content_path": str(video)} for key, video in (("untrusted", first), ("wrongpath", second), ("conflict1", third), ("conflict2", third))},
+            {"untrusted": [{"name": first.name}], "wrongpath": [{"name": f"elsewhere/{second.name}"}], "conflict1": [{"name": third.name}], "conflict2": [{"name": third.name}]},
+            {"untrusted": ({"comment": "1283711"}, [{"url": "https://tracker.example.org/announce"}]),
+             "conflict1": ({"comment": "1283712"}, [{"url": "https://tracker.m-team.cc/announce"}]),
+             "conflict2": ({"comment": "1283713"}, [{"url": "https://tracker.manfuz.co/announce"}])},
+        )
+        records = {}
+        app.bind_missing_local_mteam_ids({"performer": "Actress"}, app.scan_local_releases(str(root)), records, downloader)
+        self.assertEqual(records, {})
+        self.assertNotIn("wrongpath", downloader.metadata_calls)
+
+    def test_local_wash_uses_individual_mteam_grades_before_deleting(self):
+        root = Path(self.directory.name) / "metadata-before-wash"
+        root.mkdir()
+        embedded = root / "MIRD-284 4k x265 A.mp4"
+        external = root / "MIRD-284 4k x265 Z.mp4"
+        embedded.write_bytes(b"embedded video")
+        external.write_bytes(b"external video")
+        embedded_nfo = embedded.with_suffix(".nfo")
+        external_subtitle = external.with_suffix(".srt")
+        embedded_nfo.write_text("<movie/>", encoding="utf-8")
+        external_subtitle.write_text("subtitle", encoding="utf-8")
+        subscription = {"id": "sub", "performer": "Actress", "download_dir": str(root)}
+        records = {"sub": {"MIRD-284": {"local_files": {
+            str(embedded): {"id": "111", "rank": [2, 0, 2]},
+            str(external): {"id": "222", "rank": [2, 0, 2]},
+        }}}}
+        details = {
+            "111": {"performer": "Actress", "resolution": "2160p", "videoCodec": "x265", "labelsNew": ["中字"], "hasChineseSubtitle": False},
+            "222": {"performer": "Actress", "resolution": "2160p", "videoCodec": "x265", "labelsNew": [], "hasChineseSubtitle": True},
+        }
+        class MatchingDownloader(FakeDownloader):
+            def list_tasks(self, hashes=None):
+                return {"embeddedhash": {"complete": True, "content_path": str(embedded)},
+                    "externalhash": {"complete": True, "content_path": str(external)}}
+
+        downloader = MatchingDownloader()
+        with patch.object(app, "mteam_search", return_value=[]), patch.object(app, "mteam_detail", side_effect=lambda identifier, token: details[identifier]) as detail, patch.object(app, "_download_existing_local_subtitles"):
+            app.process_subscription(subscription, records, {"mteam_token": "token", "local_multi_disk_wash": True}, downloader, [])
+        self.assertTrue(embedded.exists())
+        self.assertFalse(external.exists())
+        self.assertTrue(embedded_nfo.exists())
+        self.assertFalse(external_subtitle.exists())
+        self.assertEqual(downloader.removed, [("externalhash", False)])
+        self.assertEqual({call.args[0] for call in detail.call_args_list}, {"111", "222"})
+        log = next(item for item in app.get_logs() if item["event"] == "local_wash_completed")
+        self.assertIn("中文等级：中文字幕 → 内嵌中文", log["message"])
+        self.assertIn("M-Team ID 111", log["message"])
+        self.assertIn("M-Team ID 222", log["message"])
+        self.assertNotIn("版本等级相同", log["message"])
+
+    def test_local_wash_reuses_complete_file_cache_and_never_uses_number_level_rank(self):
+        root = Path(self.directory.name) / "cached-wash"
+        root.mkdir()
+        embedded = root / "MIRD-284 4k x265 A.mp4"
+        external = root / "MIRD-284 4k x265 Z.mp4"
+        embedded.write_bytes(b"embedded video")
+        external.write_bytes(b"external video")
+        files = {}
+        for path, identifier, rank in ((embedded, "111", [2, 2, 2]), (external, "222", [2, 1, 2])):
+            stat = path.stat()
+            files[str(path)] = {"id": identifier, "rank": rank, "metadata_complete": True,
+                "mteam_rank_version": app.MTEAM_RANK_VERSION, "rank_version": app.LOCAL_MTEAM_RANK_VERSION,
+                "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        subscription = {"id": "sub", "performer": "Actress", "download_dir": str(root)}
+        records = {"sub": {"MIRD-284": {"local_files": files,
+            "mteam_metadata": {"id": "999", "rank": [2, 1, 2]}}}}
+        with patch.object(app, "mteam_search", return_value=[]), patch.object(app, "mteam_detail", side_effect=AssertionError("complete cache should be reused")), patch.object(app, "_download_existing_local_subtitles"):
+            app.process_subscription(subscription, records, {"mteam_token": "token", "local_multi_disk_wash": True}, FakeDownloader(), [])
+        self.assertTrue(embedded.exists())
+        self.assertFalse(external.exists())
+
+    def test_local_wash_keeps_entire_group_when_mteam_verification_fails(self):
+        root = Path(self.directory.name) / "failed-wash"
+        root.mkdir()
+        first = root / "MIRD-284 4k x265 A.mp4"
+        second = root / "MIRD-284 4k x265 Z.mp4"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        subscription = {"id": "sub", "performer": "Actress", "download_dir": str(root)}
+        records = {"sub": {"MIRD-284": {"local_files": {str(first): {"id": "111"}, str(second): {"id": "222"}}}}}
+        failures = [app.AppError("详情接口失败"),
+            {"performer": "Other", "resolution": "2160p", "videoCodec": "x265", "labelsNew": ["中字"]},
+            {"performer": "Actress", "labelsNew": ["中字"]}]
+        for failure in failures:
+            with self.subTest(failure=failure):
+                kwargs = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
+                with patch.object(app, "mteam_search", return_value=[]), patch.object(app, "mteam_detail", **kwargs), patch.object(app, "_download_existing_local_subtitles"):
+                    downloader = FakeDownloader()
+                    app.process_subscription(subscription, records, {"mteam_token": "token", "local_multi_disk_wash": True}, downloader, [])
+                self.assertTrue(first.exists())
+                self.assertTrue(second.exists())
+                self.assertEqual(downloader.removed, [])
+        self.assertTrue(any(item["event"] == "local_wash_skipped" for item in app.get_logs()))
+
+    def test_local_wash_does_not_assign_one_number_level_id_to_duplicate_files(self):
+        root = Path(self.directory.name) / "unbound-wash"
+        root.mkdir()
+        first = root / "MIRD-284 4k x265 A.mp4"
+        second = root / "MIRD-284 4k x265 Z.mp4"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        subscription = {"id": "sub", "performer": "Actress", "download_dir": str(root)}
+        records = {"sub": {"MIRD-284": {"mteam_metadata": {"id": "999", "rank": [2, 2, 2]}}}}
+        with patch.object(app, "mteam_search", return_value=[]), patch.object(app, "_download_existing_local_subtitles"):
+            app.process_subscription(subscription, records, {"mteam_token": "token", "local_multi_disk_wash": True}, FakeDownloader(), [])
+        self.assertTrue(first.exists())
+        self.assertTrue(second.exists())
+
+    def test_local_wash_rate_limit_does_not_delete_files(self):
+        root = Path(self.directory.name) / "limited-wash"
+        root.mkdir()
+        first = root / "MIRD-284 4k x265 A.mp4"
+        second = root / "MIRD-284 4k x265 Z.mp4"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        subscription = {"id": "sub", "performer": "Actress", "download_dir": str(root)}
+        records = {"sub": {"MIRD-284": {"local_files": {str(first): {"id": "111"}, str(second): {"id": "222"}}}}}
+        with patch.object(app, "mteam_detail", side_effect=app.MTeamRateLimitError("限流")):
+            with self.assertRaises(app.MTeamRateLimitError):
+                app.process_subscription(subscription, records, {"mteam_token": "token", "local_multi_disk_wash": True}, FakeDownloader(), [])
+        self.assertTrue(first.exists())
+        self.assertTrue(second.exists())
+
+    def test_local_wash_reads_each_directory_owner_metadata_without_cross_performer_comparison(self):
+        root = Path(self.directory.name)
+        own_dir, other_dir, unrelated_dir = [root / name for name in ("own", "same-performer", "other-performer")]
+        for directory in (own_dir, other_dir, unrelated_dir):
+            directory.mkdir()
+        embedded = other_dir / "MIRD-284 4k x265 A.mp4"
+        external = other_dir / "MIRD-284 4k x265 Z.mp4"
+        unrelated = unrelated_dir / "MIRD-284 4k x265 A.mp4"
+        for video in (embedded, external, unrelated):
+            video.write_bytes(b"video")
+        subscription = {"id": "sub", "performer": "Actress", "download_dir": str(own_dir)}
+        app.write_json(app.SUBSCRIPTIONS_FILE, [subscription,
+            {"id": "same", "performer": "Actress", "download_dir": str(other_dir)},
+            {"id": "different", "performer": "Different", "download_dir": str(unrelated_dir)}])
+        files = {}
+        for video, identifier, rank in ((embedded, "111", [2, 2, 2]), (external, "222", [2, 1, 2])):
+            stat = video.stat()
+            files[str(video)] = {"id": identifier, "rank": rank, "metadata_complete": True,
+                "mteam_rank_version": app.MTEAM_RANK_VERSION, "rank_version": app.LOCAL_MTEAM_RANK_VERSION,
+                "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        records = {"sub": {}, "same": {"MIRD-284": {"local_files": files}},
+            "different": {"MIRD-284": {"local_files": {str(unrelated): {"id": "999", "rank": [2, 2, 2]}}}}}
+        with patch.object(app, "mteam_search", return_value=[]), patch.object(app, "mteam_detail", side_effect=AssertionError("cached file metadata is sufficient")):
+            app.process_subscription(subscription, records, {"mteam_token": "token", "local_multi_disk_wash": True}, FakeDownloader(), [])
+        self.assertTrue(embedded.exists())
+        self.assertFalse(external.exists())
+        self.assertTrue(unrelated.exists())
+
     def test_local_duplicate_wash_removes_matching_downloader_task_and_sidecars(self):
         root = Path(self.directory.name) / "三上悠亚"
         root.mkdir()
@@ -2613,6 +2932,29 @@ class UpgradeTests(unittest.TestCase):
         self.assertIs(records["sub"]["IPX-811"]["current"], old)
         self.assertNotIn("pending", records["sub"]["IPX-811"])
         self.assertEqual(downloader.removed, [])
+
+    def test_same_tracked_mteam_id_is_redownloaded_when_its_file_is_gone_and_local_rank_is_lower(self):
+        root = Path(self.directory.name) / "restore-embedded"
+        root.mkdir()
+        external = root / "MIRD-284 4k x265.mkv"
+        external.write_bytes(b"external subtitles release")
+        stat = external.stat()
+        candidate = {"id": "1286124", "code": "MIRD-284", "title": "MIRD-284 4K 内嵌中文 x265", "rank": [2, 2, 2], "seeders": 20, "created": "2026", "metadata_complete": True}
+        subscription = {"id": "restore", "performer": "Actress", "keywords": "", "download_dir": str(root), "wash_enabled": True}
+        old_current = {"id": "1286124", "code": "MIRD-284", "title": "MIRD-284 4K 内嵌中文 x265", "rank": [2, 2, 2], "hash": "old-embedded-hash", "state": "completed"}
+        file_metadata = {"id": "1280579", "title": "MIRD-284 4K 中文字幕 x265", "rank": [2, 1, 2], "metadata_complete": True,
+            "mteam_rank_version": app.MTEAM_RANK_VERSION, "rank_version": app.LOCAL_MTEAM_RANK_VERSION, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        records = {"restore": {"MIRD-284": {"code": "MIRD-284", "current": old_current,
+            "mteam_metadata": {"id": "1286124", "title": candidate["title"], "rank": [2, 2, 2], "metadata_complete": True, "mteam_rank_version": app.MTEAM_RANK_VERSION},
+            "local_files": {str(external): file_metadata}}}}
+        downloader = FakeDownloader("new-embedded-hash")
+        detail = {"performer": "Actress", "resolution": "2160p", "videoCodec": "x265", "labelsNew": ["中字"], "hasChineseSubtitle": False}
+        with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "mteam_detail", return_value=detail), patch.object(app, "fetch_torrent", return_value=torrent_bytes()):
+            app.process_subscription(subscription, records, {"mteam_token": "token"}, downloader, [])
+        self.assertEqual(len(downloader.added), 1)
+        self.assertTrue(external.exists())
+        self.assertEqual(records["restore"]["MIRD-284"]["pending"]["id"], "1286124")
+        self.assertEqual(records["restore"]["MIRD-284"]["pending"]["upgrade_reason"], "中文等级：中文字幕 → 内嵌中文")
 
     def test_unknown_existing_rank_never_triggers_automatic_replacement(self):
         subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": "/video", "wash_enabled": True}
