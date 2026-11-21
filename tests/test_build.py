@@ -31,6 +31,11 @@ class BuildVersionTests(unittest.TestCase):
         cgi = (Path(__file__).resolve().parents[1] / "app/ui/index.cgi").read_text(encoding="utf-8")
         self.assertIn("/version.js) FILE=\"version.js\" ;;", cgi)
 
+    def test_cgi_serves_round_log_module_as_javascript(self):
+        cgi = (Path(__file__).resolve().parents[1] / "app/ui/index.cgi").read_text(encoding="utf-8")
+        self.assertIn("/log-utils.mjs) FILE=\"log-utils.mjs\" ;;", cgi)
+        self.assertIn('*.js|*.mjs) CONTENT_TYPE="application/javascript; charset=utf-8" ;;', cgi)
+
     def test_packaged_icons_use_supplied_png_assets_at_expected_sizes(self):
         for size in (64, 256):
             data = png_icon(size)

@@ -18,12 +18,13 @@ case "$REL_PATH" in
   /style.css) FILE="style.css" ;;
   /app.js) FILE="app.js" ;;
   /version.js) FILE="version.js" ;;
+  /log-utils.mjs) FILE="log-utils.mjs" ;;
   *) printf 'Status: 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nNot Found'; exit 0 ;;
 esac
 case "$FILE" in
   *.html) CONTENT_TYPE="text/html; charset=utf-8" ;;
   *.css) CONTENT_TYPE="text/css; charset=utf-8" ;;
-  *.js) CONTENT_TYPE="application/javascript; charset=utf-8" ;;
+  *.js|*.mjs) CONTENT_TYPE="application/javascript; charset=utf-8" ;;
 esac
 if [ ! -f "$APP_ROOT/www/$FILE" ]; then
   printf 'Status: 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nNot Found'

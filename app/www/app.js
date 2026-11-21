@@ -1,5 +1,6 @@
 import { TrimApp } from "./vendor/trim-web-app.js";
 import { APP_VERSION } from "./version.js";
+import { selectLogRound } from "./log-utils.mjs";
 
 const $ = (selector) => document.querySelector(selector);
 const fnosApp = new TrimApp();
@@ -18,7 +19,8 @@ let existingVideoCount = 0;
 let existingVideosLoading = false;
 let lastStatusState = "";
 let currentStatus = {};
-let awaitedBackfillJobId = "";
+let repairJobs = [];
+const awaitedRepairJobs = new Set();
 let refreshInFlight = false;
 let subscriptionsLoaded = false;
 let logsLoaded = false;
@@ -29,6 +31,14 @@ let blacklistNumbers = [];
 let pathMappings = [];
 const videoSubtitleRequests = new Map();
 const videoFileInfoRequests = new Map();
+const videoCoverRequests = new Map();
+const coverPreview = document.createElement("div");
+coverPreview.className = "cover-preview";
+coverPreview.id = "video-cover-preview";
+coverPreview.setAttribute("role", "tooltip");
+coverPreview.hidden = true;
+document.body.append(coverPreview);
+let coverAnchor = null;
 const videoRefreshStates = new Map();
 const appBase = window.location.pathname.replace(/\/$/, "");
 $("#app-version").textContent = `v${APP_VERSION}`;
@@ -175,6 +185,97 @@ function videoRefreshKey(subscriptionId, path) {
   return JSON.stringify([subscriptionId, path]);
 }
 
+function hideCoverPreview() {
+  coverAnchor?.removeAttribute("aria-describedby");
+  coverAnchor = null;
+  coverPreview.hidden = true;
+  coverPreview.replaceChildren();
+}
+
+function positionCoverPreview() {
+  if (!coverAnchor?.isConnected) return hideCoverPreview();
+  const bounds = coverAnchor.getBoundingClientRect();
+  const box = coverPreview.getBoundingClientRect();
+  const width = document.documentElement.clientWidth;
+  const height = window.innerHeight;
+  const left = bounds.right + 10 + box.width <= width - 8 ? bounds.right + 10 : Math.max(8, bounds.left - box.width - 10);
+  coverPreview.style.left = `${Math.min(left, Math.max(8, width - box.width - 8))}px`;
+  coverPreview.style.top = `${Math.max(8, Math.min(bounds.top, height - box.height - 8))}px`;
+}
+
+function attachCoverPreview(anchor, code, files, subscriptionId) {
+  anchor.tabIndex = 0;
+  const show = async () => {
+    hideCoverPreview();
+    coverAnchor = anchor;
+    anchor.setAttribute("aria-describedby", coverPreview.id);
+    coverPreview.hidden = false;
+    const file = [...files].filter((item) => item.mteam_id).sort((a, b) => {
+      for (let i = 0; i < 3; i++) {
+        const difference = (b.rank?.[i] || 0) - (a.rank?.[i] || 0);
+        if (difference) return difference;
+      }
+      return 0;
+    })[0];
+    const caption = document.createElement("div");
+    caption.className = "cover-caption";
+    caption.textContent = file?.subtitle || file?.rank_title || code;
+    const message = document.createElement("div");
+    message.className = "cover-message";
+    message.textContent = file ? "正在加载封面…" : "暂无关联 M-Team ID，请先修复数据。";
+    coverPreview.replaceChildren(caption, message);
+    positionCoverPreview();
+    if (!file) return;
+    try {
+      let url = file.cover_url || "";
+      if (!url && !file.cover_checked) {
+        const key = `${subscriptionId}:${file.path}:${file.mteam_id}`;
+        if (!videoCoverRequests.has(key)) {
+          const request = api(`/api/subscriptions/${encodeURIComponent(subscriptionId)}/videos/${encodeURIComponent(code)}/cover`, {
+            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: file.path })
+          }).catch((error) => { videoCoverRequests.delete(key); throw error; });
+          videoCoverRequests.set(key, request);
+        }
+        const result = await videoCoverRequests.get(key);
+        file.cover_url = result.cover_url || "";
+        file.cover_checked = Boolean(result.cover_checked);
+        url = file.cover_url;
+      }
+      if (coverAnchor !== anchor) return;
+      if (!url || !/^https?:\/\//i.test(url)) {
+        message.textContent = "M-Team 详情暂无封面。";
+        return;
+      }
+      const image = document.createElement("img");
+      image.alt = `${code} 封面`;
+      image.referrerPolicy = "no-referrer";
+      image.addEventListener("load", () => {
+        if (coverAnchor !== anchor) return;
+        message.remove();
+        positionCoverPreview();
+      });
+      image.addEventListener("error", () => {
+        if (coverAnchor !== anchor) return;
+        image.remove();
+        message.textContent = "封面图片加载失败。";
+        positionCoverPreview();
+      });
+      coverPreview.insertBefore(image, caption);
+      image.src = url;
+      positionCoverPreview();
+    } catch (error) {
+      if (coverAnchor === anchor) message.textContent = `封面读取失败：${error.message}`;
+    }
+  };
+  anchor.addEventListener("mouseenter", show);
+  anchor.addEventListener("focus", show);
+  anchor.addEventListener("mouseleave", hideCoverPreview);
+  anchor.addEventListener("blur", hideCoverPreview);
+}
+window.addEventListener("resize", hideCoverPreview);
+window.addEventListener("scroll", hideCoverPreview, true);
+document.addEventListener("keydown", (event) => { if (event.key === "Escape") hideCoverPreview(); });
+
 function updateVideoRefreshButton(button, state) {
   const pending = state?.state === "pending";
   const success = state?.state === "success";
@@ -185,8 +286,8 @@ function updateVideoRefreshButton(button, state) {
   button.classList.toggle("refresh-error", Boolean(failed));
   button.setAttribute("aria-busy", String(Boolean(pending)));
   const seconds = pending ? Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000)) : 0;
-  const label = pending ? `${seconds >= 15 ? "仍在读取" : "刷新中"}${seconds ? ` ${seconds}秒` : "…"}`
-    : success ? "已刷新" : failed ? "重试" : "";
+  const label = pending ? `${state.phaseLabel || "修复中"}${seconds ? ` ${formatLogDuration(seconds)}` : "…"}`
+    : success ? "已修复" : failed ? "重试" : "";
   button.replaceChildren();
   const icon = document.createElement("span");
   icon.className = "video-refresh-icon";
@@ -198,51 +299,31 @@ function updateVideoRefreshButton(button, state) {
     text.textContent = label;
     button.append(text);
   }
-  button.title = pending ? "正在重新读取 M-Team 详情及 MediaInfo，请稍候。"
+  button.title = pending ? (state.message || "正在核对 ID、刷新信息及检查字幕，请稍候。")
     : success ? state.message
-    : failed ? `${state.message}\n点击重试刷新此视频信息。`
-    : "刷新此视频的分辨率、语言、编码、副标题和 MediaInfo。";
-  button.setAttribute("aria-label", `${button.dataset.filename}：${label || "刷新视频信息"}${failed ? `，${state.message}` : ""}`);
+    : failed ? `${state.message}\n点击重试修复此视频数据。`
+    : "修复此视频数据：先核对并修正 M-Team ID，再刷新信息和 MediaInfo；中文字幕且缺少字幕时自动下载。";
+  button.setAttribute("aria-label", `${button.dataset.filename}：${label || "修复此视频数据"}${failed ? `，${state.message}` : ""}`);
 }
 
 async function refreshVideoInformation(subscriptionId, code, file) {
-  const originalPath = file.path;
-  const key = videoRefreshKey(subscriptionId, originalPath);
-  if (videoRefreshStates.get(key)?.state === "pending") return;
-  if (!file.mteam_id) {
-    toast(`${code} 没有关联 M-Team ID，请先补全 ID。`, true);
-    return;
-  }
-  videoRefreshStates.set(key, { state: "pending", startedAt: Date.now() });
-  videoFileInfoRequests.delete(`${subscriptionId}:${file.path}`);
-  videoSubtitleRequests.delete(`${subscriptionId}:${code}`);
+  const key = videoRefreshKey(subscriptionId, file.path);
+  if (videoRefreshStates.get(key)?.state === "pending" || repairJobs.some((job) =>
+    job.subscription_id === subscriptionId && ["queued", "running"].includes(job.state) && (!job.path || job.path === file.path))) return;
+  videoRefreshStates.set(key, { state: "pending", startedAt: Date.now(), phaseLabel: "正在排队" });
   renderExistingVideos();
-  toast(`正在刷新 ${code} 的视频信息和 MediaInfo…`);
   try {
-    const result = await api(`/api/subscriptions/${encodeURIComponent(subscriptionId)}/videos/${encodeURIComponent(code)}/refresh`, {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: file.path })
+    const result = await api(`/api/subscriptions/${encodeURIComponent(subscriptionId)}/repair`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: file.path, code })
     });
-    if (!result.file?.path) throw new Error("刷新响应中缺少视频信息，请重试。");
-    const updated = result.file;
-    Object.assign(file, updated);
-    if (selectedSubscriptionId === subscriptionId) {
-      for (const group of existingVideos) {
-        const current = (group.files || []).find((entry) => entry.path === originalPath || entry.path === updated.path);
-        if (current) Object.assign(current, updated);
-      }
-    }
-    const fileInfo = { path: updated.path, mediainfo: updated.mediainfo || "", mediainfo_checked: Boolean(updated.mediainfo_checked) };
-    videoFileInfoRequests.set(`${subscriptionId}:${originalPath}`, Promise.resolve(fileInfo));
-    videoFileInfoRequests.set(`${subscriptionId}:${updated.path}`, Promise.resolve(fileInfo));
-    const message = updated.mediainfo ? "视频信息及 MediaInfo 已刷新。" : "视频信息已刷新；M-Team 当前未提供 MediaInfo。";
-    videoRefreshStates.set(key, { state: "success", message, completedAt: Date.now() });
-    toast(`${code}：${message}`);
+    awaitedRepairJobs.add(result.job_id);
+    repairJobs = [...repairJobs.filter((job) => job.job_id !== result.job_id), result];
+    renderDataRepairStatus(repairJobs);
+    toast(result.message || "视频数据修复已排队。");
   } catch (error) {
-    videoFileInfoRequests.delete(`${subscriptionId}:${originalPath}`);
     videoRefreshStates.set(key, { state: "error", message: error.message });
-    toast(`${code} 刷新失败：${error.message}`, true);
-  } finally {
-    if (selectedSubscriptionId === subscriptionId) renderExistingVideos();
+    toast(`${code} 修复失败：${error.message}`, true);
+    renderExistingVideos();
   }
 }
 
@@ -386,9 +467,7 @@ function renderPage() {
     description.textContent = "查看订阅设置";
   }
   $("#selected-scan").hidden = all;
-  $("#selected-refresh-videos").hidden = all || !selected;
-  $("#selected-backfill-mteam").hidden = all || !selected;
-  $("#refresh-existing-option").hidden = !selected;
+  $("#selected-repair-data").hidden = all || !selected;
   $("#selected-edit").hidden = all || !selected;
   $("#selected-delete").hidden = all || !selected;
   const summary = $("#subscription-summary");
@@ -422,12 +501,12 @@ function renderPage() {
 function showSubscription(id) {
   selectedSubscriptionId = id;
   activeView = "subscription";
-  $("#refresh-existing-info").checked = false;
   existingForId = "";
   renderSubscriptions();
 }
 
 function renderExistingVideos(errorMessage = "") {
+  hideCoverPreview();
   const body = $("#existing-body");
   body.replaceChildren();
   $("#existing-count").textContent = `${existingVideoCount} 个视频`;
@@ -448,7 +527,7 @@ function renderExistingVideos(errorMessage = "") {
     const codeCell = document.createElement("td");
     codeCell.textContent = item.code || "";
     codeCell.className = "number-group-cell";
-    codeCell.title = `${(item.files || []).length} 个同番号文件`;
+    attachCoverPreview(codeCell, item.code, item.files || [], selectedSubscriptionId);
     if ((item.files || []).length > 1) {
       const count = document.createElement("span");
       count.className = "number-file-count";
@@ -468,8 +547,14 @@ function renderExistingVideos(errorMessage = "") {
       const versionLine = document.createElement(file.mteam_id ? "a" : "div");
       versionLine.className = "version-line";
       versionLine.textContent = rankNames.join(" · ");
-      versionLine.title = file.mteam_id ? (file.subtitle || `在 M-Team 打开影片详情 ${file.mteam_id}`) : rankNames.join(" · ");
+      versionLine.title = rankNames.join(" · ");
       if (file.mteam_id) {
+        const mainTitle = (file.rank_title || "").trim();
+        const subtitle = (file.subtitle_raw ?? file.subtitle ?? "").trim();
+        const titleLines = [];
+        if (mainTitle) titleLines.push(`主标题：${mainTitle}`);
+        if (subtitle && subtitle !== mainTitle) titleLines.push(`副标题：${subtitle}`);
+        versionLine.title = titleLines.join("\n") || `在 M-Team 打开影片详情 ${file.mteam_id}`;
         versionLine.href = `https://kp.m-team.cc/detail/${encodeURIComponent(file.mteam_id)}`;
         useSystemBrowser(versionLine);
       }
@@ -482,6 +567,16 @@ function renderExistingVideos(errorMessage = "") {
       refresh.className = "video-refresh";
       refresh.dataset.refreshKey = videoRefreshKey(subscriptionId, file.path);
       refresh.dataset.filename = file.name;
+      const activeRepair = repairJobs.find((job) => job.subscription_id === subscriptionId && ["queued", "running"].includes(job.state) && (!job.path || job.path === file.path));
+      if (activeRepair) {
+        const phaseLabel = activeRepair.state === "queued" ? "排队中" : ({
+          scan: "扫描视频", matching: "核对 ID", details: "刷新信息", subtitles: "检查字幕", waiting_retry: "等待限流结束"
+        })[activeRepair.phase] || "修复中";
+        videoRefreshStates.set(refresh.dataset.refreshKey, {
+          state: "pending", startedAt: Date.parse(activeRepair.started_at || activeRepair.queued_at) || Date.now(),
+          phaseLabel, message: activeRepair.message, jobId: activeRepair.job_id
+        });
+      }
       updateVideoRefreshButton(refresh, videoRefreshStates.get(refresh.dataset.refreshKey));
       refresh.addEventListener("click", () => refreshVideoInformation(subscriptionId, item.code, file));
       versionRow.append(refresh);
@@ -597,7 +692,7 @@ function renderLogs(entries) {
       row.append(label);
       if (entry.round_id && !copyButtons.has(`${entry.round_id}:${entry.message.includes("开始") ? "start" : "end"}`)) {
         copyButtons.add(`${entry.round_id}:${entry.message.includes("开始") ? "start" : "end"}`);
-        row.append(makeButton("复制本轮", "text-button log-copy-round", () => copyLogRound(entry.round_id, entriesWithContent), "复制本轮可见日志"));
+        row.append(makeButton("复制本轮", "text-button log-copy-round", () => copyLogRound(entry.id, entry.round_id, entriesWithContent), "复制本轮可见日志"));
       }
       list.append(row);
       continue;
@@ -646,6 +741,7 @@ const LOG_EVENT_LABELS = {
   existing_task_directory_missing: "任务校验", request_interrupted: "已中断",
   scheduler_error: "后台服务", scheduler_recovered: "后台服务", state_error: "状态错误",
   downloader_location_changed: "下载器", duplicate_task_recheck: "下载器", duplicate_task_paused_missing: "下载器",
+  repair_queued: "修复排队", repair_started: "开始修复", repair_cooldown_check: "修复状态", repair_retry_waiting: "修复等待", repair_scan_started: "本地扫描", repair_scan_completed: "本地扫描", repair_matching_started: "ID 核对", repair_matching_completed: "ID 核对", repair_detail_started: "读取详情", repair_detail_completed: "保存详情", repair_subtitle_check: "字幕检查", repair_file_completed: "文件修复", repair_progress: "修复进度", repair_completed: "修复完成", repair_failed: "修复失败", repair_file_failed: "文件修复", repair_id_corrected: "ID 修正", repair_subtitle: "字幕修复", repair_downloader_failed: "ID 核对",
   run_separator: "检查轮次", status: "状态"
 };
 
@@ -654,6 +750,7 @@ function logEventLabel(event) {
 }
 
 function logCategory(event) {
+  if (/^repair_/.test(event)) return "修复";
   if (/^debug_/.test(event)) return "排查";
   if (/^subtitle_/.test(event)) return "字幕";
   if (/^local_(scan|video|wash)/.test(event) || event === "orphan_sidecars_cleaned") return "本地";
@@ -767,8 +864,9 @@ function logLine(entry) {
   return `${time} ${source} · ${logCategory(entry.event)} · ${formattedLogEntry(entry)}`;
 }
 
-async function copyLogRound(roundId, visibleEntries) {
-  const roundEntries = compactLogStages(uniqueRoundSeparators(visibleEntries)).filter((entry) => entry.round_id === roundId);
+async function copyLogRound(separatorId, roundId, visibleEntries) {
+  const selectedRound = selectLogRound(visibleEntries, separatorId, roundId);
+  const roundEntries = compactLogStages(uniqueRoundSeparators(selectedRound));
   const text = roundEntries.map(logLine).join("\n");
   try {
     if (navigator.clipboard?.writeText) {
@@ -933,16 +1031,13 @@ async function refresh() {
     const now = Date.now();
     const loadSubscriptions = !subscriptionsLoaded || now - lastSubscriptionRefresh >= 30000;
     const loadActivity = activeView === "all" && now - lastActivityRefresh >= 15000;
-    const backfillPath = selectedSubscriptionId
-      ? `/api/subscriptions/${encodeURIComponent(selectedSubscriptionId)}/mteam-id-backfill`
-      : "";
     const logsPath = logsLoaded ? `/api/logs?after_id=${lastLogId}` : "/api/logs";
-    const [nextSubscriptions, status, nextActivity, nextLogs, backfill] = await Promise.all([
+    const [nextSubscriptions, status, nextActivity, nextLogs, repairs] = await Promise.all([
       loadSubscriptions ? api("/api/subscriptions") : Promise.resolve(null),
       api("/api/status"),
       loadActivity ? api("/api/activity") : Promise.resolve(null),
       api(logsPath),
-      backfillPath ? api(backfillPath) : Promise.resolve(null)
+      api("/api/repair-jobs")
     ]);
     if (nextSubscriptions) {
       subscriptions = nextSubscriptions;
@@ -966,7 +1061,7 @@ async function refresh() {
     if (nextSubscriptions) renderSubscriptions();
     renderStatus(status);
     if (nextActivity) renderActivity();
-    renderBackfillStatus(backfill);
+    renderDataRepairStatus(repairs);
     if (selectedSubscriptionId && ["completed", "failed"].includes(status.state) && ["running", "queued"].includes(lastStatusState)) {
       loadExistingVideos(selectedSubscriptionId);
     }
@@ -981,38 +1076,79 @@ async function refresh() {
   }
 }
 
-function renderBackfillStatus(status) {
-  const button = $("#selected-backfill-mteam");
-  if (!button || !status) return;
-  const active = status.state === "queued" || status.state === "running";
-  button.disabled = active;
-  if (status.state === "queued") {
-    button.textContent = "排队中…";
-    button.title = status.message || "补全任务等待后台处理";
-  } else if (status.state === "running") {
-    const phase = ({
-      starting: "启动中", scan: "扫描本地视频", downloader: "读取下载任务",
-      matching: "匹配文件与种子", details: "读取影片详情", subtitles: "检查字幕",
-      waiting_retry: "等待限流"
-    })[status.phase] || "正在处理";
-    const progress = status.phase === "waiting_retry"
-      ? ` ${formatCountdown(Math.max(0, Math.ceil(Number(status.retry_at || 0) - Date.now() / 1000)))}`
-      : Number(status.total) > 0 ? ` ${Number(status.completed)}/${Number(status.total)}` : "";
-    button.textContent = `${phase}${progress}…`;
-    button.title = status.message || phase;
+function renderDataRepairStatus(jobs) {
+  const previouslyActive = repairJobs.some((job) => ["queued", "running"].includes(job.state));
+  repairJobs = jobs || [];
+  const button = $("#selected-repair-data");
+  const allActive = repairJobs.filter((job) => ["queued", "running"].includes(job.state));
+  const active = repairJobs.filter((job) => job.subscription_id === selectedSubscriptionId && ["queued", "running"].includes(job.state));
+  const repairCooldown = repairJobs.find((job) => ["queued", "running"].includes(job.state) && job.phase === "waiting_retry");
+  renderRetryCountdown(repairCooldown);
+  if (allActive.length) {
+    const state = $("#scheduler-state");
+    state.dataset.state = repairCooldown ? "waiting_retry" : "running";
+    state.lastElementChild.textContent = repairCooldown ? "修复等待限流恢复" : "正在修复数据";
+    $("#next-scan-time").textContent = "";
   } else {
-    button.textContent = "补全 M-Team ID";
-    button.title = "按 qBittorrent 文件列表的实际保存路径读取种子注释中的 M-Team ID。同番号多个视频会逐文件核对并修正错误 ID；路径存在冲突时跳过。后台执行，可在日志查看结果。";
+    renderStatus(currentStatus);
   }
-  if (status.job_id && status.job_id === awaitedBackfillJobId && ["completed", "failed"].includes(status.state)) {
-    awaitedBackfillJobId = "";
-    if (status.state === "completed") {
-      const summary = status.summary || {};
-      toast(`补全完成：新增 ${summary.filled || 0} 个，修正 ${summary.corrected || 0} 个 ID，候选冲突 ${summary.ambiguous || 0} 个`);
-      if (selectedSubscriptionId === status.subscription_id) loadExistingVideos(status.subscription_id);
-    } else {
-      toast(`补全失败：${status.message || "后台任务执行失败"}`, true);
+  const phaseLabel = (job) => job.state === "queued" ? "排队中" : ({
+    scan: "扫描视频", matching: "核对 ID", details: "刷新信息", subtitles: "检查字幕", waiting_retry: "等待限流结束"
+  })[job.phase] || "修复中";
+  button.disabled = active.length > 0;
+  const current = active[0];
+  if (current) {
+    const progress = current.phase === "waiting_retry"
+      ? ` ${formatCountdown(Math.max(0, Math.ceil(Number(current.retry_at || 0) - Date.now() / 1000)))}`
+      : current.total > 0 ? ` ${current.completed}/${current.total}` : "";
+    button.textContent = `${phaseLabel(current)}${progress}…`;
+    button.title = current.message;
+  } else {
+    button.textContent = "修复数据";
+    button.title = "先逐文件核对并修正 M-Team ID，再刷新影片信息和 MediaInfo；中文字幕缺少配套字幕时下载。已有字幕保留，缺 ID 或匹配冲突时跳过并记录原因。";
+  }
+  button.setAttribute("aria-live", "polite");
+  for (const group of existingVideos) {
+    for (const file of group.files || []) {
+      const job = active.find((value) => !value.path || value.path === file.path);
+      const key = videoRefreshKey(selectedSubscriptionId, file.path);
+      if (job) videoRefreshStates.set(key, { state: "pending", startedAt: Date.parse(job.started_at || job.queued_at) || Date.now(), phaseLabel: phaseLabel(job), message: job.message, jobId: job.job_id });
+      else if (videoRefreshStates.get(key)?.state === "pending" && videoRefreshStates.get(key)?.jobId) videoRefreshStates.delete(key);
     }
+  }
+  for (const job of repairJobs) {
+    if (!awaitedRepairJobs.has(job.job_id) || !["completed", "failed"].includes(job.state)) continue;
+    awaitedRepairJobs.delete(job.job_id);
+    videoFileInfoRequests.clear();
+    videoCoverRequests.clear();
+    videoSubtitleRequests.clear();
+    if (job.path) {
+      const outcome = job.outcomes?.[job.path];
+      const failed = job.state === "failed" || ["failed", "partial", "skipped"].includes(outcome?.state);
+      videoRefreshStates.set(videoRefreshKey(job.subscription_id, job.path), {
+        state: failed ? "error" : "success", message: outcome?.message || job.message, completedAt: Date.now()
+      });
+    }
+    toast(job.message, job.state === "failed" || Number(job.summary?.failed) > 0);
+    if (selectedSubscriptionId === job.subscription_id) loadExistingVideos(job.subscription_id);
+  }
+  if (active.length || previouslyActive) renderExistingVideos();
+}
+
+function renderRetryCountdown(repairCooldown = null) {
+  const countdown = $("#repair-retry-countdown");
+  if (!countdown) return;
+  if (repairCooldown) {
+    const remaining = Math.max(0, Math.ceil(Number(repairCooldown.retry_at || 0) - Date.now() / 1000));
+    countdown.textContent = `修复限流重试 ${formatCountdown(remaining)} 后继续`;
+    countdown.hidden = false;
+  } else if (currentStatus.state === "waiting_retry") {
+    const remaining = Math.max(0, Math.ceil(Number(currentStatus.retry_at || 0) - Date.now() / 1000));
+    countdown.textContent = `限流恢复倒计时 ${formatCountdown(remaining)}`;
+    countdown.hidden = false;
+  } else {
+    countdown.textContent = "";
+    countdown.hidden = true;
   }
 }
 
@@ -1068,7 +1204,7 @@ async function removeSubscription(item) {
   } catch (error) { toast(error.message, true); }
 }
 
-async function runScan(subscriptionId = "", refreshExistingInfo = false) {
+async function runScan(subscriptionId = "") {
   if (busy) {
     toast("已有检查任务正在运行");
     return;
@@ -1079,7 +1215,7 @@ async function runScan(subscriptionId = "", refreshExistingInfo = false) {
   try {
     await api(subscriptionId ? `/api/subscriptions/${encodeURIComponent(subscriptionId)}/scan` : "/api/scan", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ refresh_existing_info: Boolean(subscriptionId) && refreshExistingInfo })
+      body: JSON.stringify({})
     });
     toast("检查任务已加入队列");
     await refresh();
@@ -1259,36 +1395,20 @@ for (const button of document.querySelectorAll(".nav-item")) {
     renderSubscriptions();
   });
 }
-$("#selected-scan").addEventListener("click", () => runScan(selectedSubscriptionId, $("#refresh-existing-info").checked));
-$("#selected-refresh-videos").addEventListener("click", async (event) => {
-  const button = event.currentTarget;
-  if (!selectedSubscriptionId || button.disabled) return;
-  button.disabled = true;
-  button.textContent = "刷新中…";
-  try {
-    const result = await api(`/api/subscriptions/${encodeURIComponent(selectedSubscriptionId)}/videos/refresh`, { method: "POST" });
-    await loadExistingVideos(selectedSubscriptionId);
-    toast(`刷新完成：成功 ${result.refreshed} 个，跳过 ${result.skipped} 个，失败 ${result.failed} 个`);
-  } catch (error) {
-    toast(error.message, true);
-  } finally {
-    button.disabled = false;
-    button.textContent = "刷新视频信息";
-  }
-});
-$("#selected-backfill-mteam").addEventListener("click", async (event) => {
+$("#selected-scan").addEventListener("click", () => runScan(selectedSubscriptionId));
+$("#selected-repair-data").addEventListener("click", async (event) => {
   const button = event.currentTarget;
   if (!selectedSubscriptionId || button.disabled) return;
   button.disabled = true;
   button.textContent = "正在排队…";
   try {
-    const result = await api(`/api/subscriptions/${encodeURIComponent(selectedSubscriptionId)}/mteam-id-backfill`, { method: "POST" });
-    awaitedBackfillJobId = result.job_id || "";
-    toast(result.message || "M-Team ID 补全已加入后台队列。");
-    await refresh();
+    const result = await api(`/api/subscriptions/${encodeURIComponent(selectedSubscriptionId)}/repair`, { method: "POST" });
+    awaitedRepairJobs.add(result.job_id);
+    repairJobs = [...repairJobs.filter((job) => job.job_id !== result.job_id), result];
+    renderDataRepairStatus(repairJobs);
+    toast(result.message || "数据修复已排队。");
   } catch (error) {
-    button.disabled = false;
-    button.textContent = "补全 M-Team ID";
+    renderDataRepairStatus(repairJobs);
     toast(error.message, true);
   }
 });
@@ -1307,9 +1427,28 @@ $("#selected-delete").addEventListener("click", () => {
   if (selected) removeSubscription(selected);
 });
 $("#clear-logs").addEventListener("click", clearLogs);
+function setLogFullscreen(enabled) {
+  const section = $("#log-section");
+  const button = $("#log-fullscreen");
+  section.classList.toggle("is-fullscreen", enabled);
+  document.body.classList.toggle("log-fullscreen-open", enabled);
+  button.setAttribute("aria-pressed", String(enabled));
+  button.setAttribute("aria-label", enabled ? "退出全屏日志" : "全屏查看日志");
+  button.title = enabled ? "退出全屏日志（Esc）" : "全屏查看日志";
+  button.textContent = enabled ? "×" : "⛶";
+  if (enabled) $("#log-list").focus({ preventScroll: true });
+}
+$("#log-fullscreen").addEventListener("click", () => {
+  setLogFullscreen(!$("#log-section").classList.contains("is-fullscreen"));
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && $("#log-section").classList.contains("is-fullscreen")) {
+    setLogFullscreen(false);
+  }
+});
 $("#dialog-close").addEventListener("click", () => dialog.close());
 $("#dialog-cancel").addEventListener("click", () => dialog.close());
-$("#scan-now").addEventListener("click", runScan);
+$("#scan-now").addEventListener("click", () => runScan());
 $("#save-settings").addEventListener("click", () => saveSettings());
 $("#save-settings-footer").addEventListener("click", () => saveSettings());
 $("#add-path-mapping").addEventListener("click", () => {
@@ -1336,6 +1475,7 @@ window.setInterval(() => {
   for (const button of document.querySelectorAll(".video-refresh")) {
     updateVideoRefreshButton(button, videoRefreshStates.get(button.dataset.refreshKey));
   }
+  renderRetryCountdown(repairJobs.find((job) => ["queued", "running"].includes(job.state) && job.phase === "waiting_retry"));
   if (currentStatus.state === "waiting_retry") {
     renderStatus(currentStatus);
     renderScanButtons();

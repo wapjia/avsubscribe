@@ -24,6 +24,7 @@
       <nav id="subscription-menu" class="subscription-menu" aria-label="订阅列表"></nav>
       <div class="sidebar-bottom">
         <div class="sidebar-status"><div class="sidebar-state"><span id="scheduler-state" class="state-indicator"><i></i><span>初始化中</span></span><span id="next-scan-time" class="next-scan-time"></span></div><button id="scan-now" class="icon-button" title="立即检查" aria-label="立即检查">↻</button></div>
+        <span id="repair-retry-countdown" class="repair-retry-countdown" hidden></span>
         <button class="nav-item settings-link" data-view="settings"><span class="nav-icon" aria-hidden="true">⚙</span><span>设置</span></button>
       </div>
     </aside>
@@ -32,7 +33,7 @@
       <section id="dashboard-activity" class="activity-section dashboard-activity"><div class="section-head"><div><p class="eyebrow">下载器任务</p><h2>下载任务</h2></div><span id="activity-count" class="count-label">0 项</span></div><div class="table-wrap"><table><thead><tr><th>女优</th><th>番号</th><th>资源</th><th>状态</th><th>进度</th><th>说明</th></tr></thead><tbody id="activity-body"><tr><td colspan="6" class="empty">暂无下载任务</td></tr></tbody></table></div></section>
 
       <section id="subscription-view" class="subscription-view" hidden>
-        <div class="page-heading"><div><p class="eyebrow">订阅</p><h2 id="selected-title">选择一个订阅</h2><p id="selected-description" class="muted"></p></div><div class="page-actions"><label id="refresh-existing-option" class="refresh-existing-option" title="配合“立即检查”使用，勾选后重新获取当前女优已存在视频的分辨率、中文分级、编码和副标题等信息。&#10;不勾选时复用已有完整缓存，只补充缺失或不完整的信息。&#10;仅勾选不会立即执行刷新。"><input id="refresh-existing-info" type="checkbox"><span>刷新已存在视频信息</span></label><button id="selected-refresh-videos" class="secondary" type="button" title="单独刷新当前女优目录中全部本地视频的信息，使用每个文件已绑定的 M-Team ID 读取详情。&#10;更新分辨率、中文分级、编码、副标题和 MediaInfo，不搜索或下载新影片。&#10;没有 M-Team ID 的文件会跳过，请先补全 ID；完成后显示成功、跳过和失败数量。">刷新视频信息</button><button id="selected-backfill-mteam" class="secondary" type="button" title="从 qBittorrent 已有种子的注释读取 M-Team ID，按路径映射后的种子文件路径匹配当前女优目录中的视频。&#10;仅接受 Tracker 包含 m-team 或 manfuz 的种子，按映射后的实际文件路径匹配；同番号多文件逐个核对，已有错误 ID 会修正；匹配冲突时跳过。&#10;配置 M-Team 令牌后还会读取详情，并为标记为外挂中文字幕且缺少对应字幕的本地视频尝试下载字幕。">补全 M-Team ID</button><button id="selected-scan" class="secondary" type="button" title="立即检查当前女优订阅：同步下载器状态、扫描本地目录，并按女优名字和附加关键字搜索 M-Team。&#10;按黑名单、番号去重及洗版设置决定是否提交新下载；勾选左侧选项会同时刷新已存在视频信息。&#10;执行进度和结果可在下方日志查看；遇到限流时等待冷却后继续。">立即检查</button><button id="selected-edit" class="secondary" type="button">编辑</button><button id="selected-delete" class="danger-button" type="button">删除</button></div></div>
+        <div class="page-heading"><div><p class="eyebrow">订阅</p><h2 id="selected-title">选择一个订阅</h2><p id="selected-description" class="muted"></p></div><div class="page-actions"><button id="selected-repair-data" class="secondary" type="button" title="修复当前订阅全部本地视频：先按 qBittorrent 精确文件路径核对并修正 M-Team ID，再强制刷新视频信息及 MediaInfo；中文字幕视频缺少配套字幕时下载字幕。&#10;无匹配种子时沿用已有逐文件 ID；缺 ID 或匹配冲突时跳过并记录日志。&#10;后台执行，限流后等待并继续；不新增种子、不洗版或删除视频。">修复数据</button><button id="selected-scan" class="secondary" type="button" title="立即检查当前女优订阅：同步下载器状态、扫描本地目录，并按女优名字和附加关键字搜索 M-Team。&#10;按黑名单、番号去重及洗版设置决定是否提交新下载；核对 ID、刷新影片信息和补字幕请使用“修复数据”按钮。&#10;执行进度和结果可在下方日志查看；遇到限流时等待冷却后继续。">立即检查</button><button id="selected-edit" class="secondary" type="button">编辑</button><button id="selected-delete" class="danger-button" type="button">删除</button></div></div>
         <div id="subscription-summary" class="subscription-summary"></div>
         <section class="activity-section existing-section" aria-labelledby="existing-toggle">
           <div class="section-head">
@@ -87,8 +88,8 @@
       </section>
 
       <section id="log-section" class="log-section" aria-labelledby="log-title">
-        <div class="section-head"><div><p class="eyebrow">后台执行日志</p><h2 id="log-title">检查日志</h2></div><div class="log-actions"><span id="log-count" class="count-label">0 条</span><button id="clear-logs" class="text-button" type="button">清理全部日志</button></div></div>
-        <ol id="log-list" class="log-list"><li class="log-empty">等待检查任务。</li></ol>
+        <div class="section-head"><div><p class="eyebrow">后台执行日志</p><h2 id="log-title">检查日志</h2></div><div class="log-actions"><span id="log-count" class="count-label">0 条</span><button id="log-fullscreen" class="icon-button log-fullscreen-button" type="button" title="全屏查看日志" aria-label="全屏查看日志" aria-pressed="false">⛶</button><button id="clear-logs" class="text-button" type="button">清理全部日志</button></div></div>
+        <ol id="log-list" class="log-list" tabindex="-1"><li class="log-empty">等待检查任务。</li></ol>
       </section>
 
     </div>

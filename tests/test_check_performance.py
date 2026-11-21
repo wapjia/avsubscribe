@@ -121,6 +121,7 @@ class CheckPerformanceTests(unittest.TestCase):
         directory.mkdir()
         video = directory / "SSNI-618 1080p.mp4"
         video.touch()
+        video.with_suffix(".nfo").write_text("<movie><video><width>1920</width><height>1080</height></video></movie>", encoding="utf-8")
         with patch.object(app, "_scan_local_releases_uncached", wraps=app._scan_local_releases_uncached) as scan:
             first = app.scan_local_releases(str(directory))
             first["SSNI-618"][0]["rank"][0] = 99

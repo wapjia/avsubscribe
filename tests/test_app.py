@@ -73,6 +73,10 @@ class FileMetadataDownloader(FakeDownloader):
 
 
 class ReleaseLogicTests(unittest.TestCase):
+    def test_es_module_assets_are_served_with_javascript_mime_types(self):
+        self.assertEqual(app.WEB_MEDIA_TYPES[".js"], "application/javascript; charset=utf-8")
+        self.assertEqual(app.WEB_MEDIA_TYPES[".mjs"], "application/javascript; charset=utf-8")
+
     def test_mteam_id_backfill_helpers_parse_comment_and_filter_trackers(self):
         self.assertEqual(app.mteam_id_from_torrent_comment("1294522"), "1294522")
         self.assertEqual(app.mteam_id_from_torrent_comment("https://kp.m-team.cc/detail/1289514"), "1289514")
@@ -155,6 +159,50 @@ class ReleaseLogicTests(unittest.TestCase):
         metadata = {"width": 3840, "height": 2160, "codec": "HEVC", "language": "chi"}
         self.assertEqual(app.release_rank("SSNI-618 1080p x264", metadata), (2, 1, 2))
 
+    def test_actual_nfo_resolution_and_codec_override_wrong_higher_filename_tags(self):
+        metadata = {"width": 1920, "height": 1080, "codec": "AVC"}
+        self.assertEqual(app.release_rank("ABF-017 4K x265", metadata), (1, 0, 1))
+
+    def test_local_scan_does_not_infer_rank_from_filename_without_media_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "ABF-017 4K 内嵌中文 x265.mp4"
+            video.touch()
+            scanned = app.scan_local_releases(str(root))
+        self.assertEqual(scanned["ABF-017"][0]["rank"], [0, 0, 0])
+
+    def test_mteam_detail_mediainfo_stream_overrides_release_title_and_summary(self):
+        detail = {
+            "performer": "Actress",
+            "resolution": "2160p",
+            "videoCodec": "H.265",
+            "labelsNew": ["中字"],
+            "hasChineseSubtitle": False,
+            "mediainfo": """General
+Complete name : ABF-017 4K x265.mkv
+Video
+Format : AVC
+Width : 1 920 pixels
+Height : 1 080 pixels
+Audio
+Format : AAC""",
+        }
+        with patch.object(app, "mteam_detail", return_value=detail):
+            enriched = app.enrich_candidate_from_detail({
+                "id": "1292971", "code": "ABF-017", "title": "ABF-017 4K x265",
+                "rank": [2, 2, 2],
+            }, "token")
+        self.assertEqual(enriched["rank"], [1, 2, 1])
+        self.assertEqual(enriched["resolution"], "1080p")
+        self.assertEqual(enriched["video_codec"], "AVC")
+
+    def test_cached_mediainfo_stream_overrides_stale_rank_fields(self):
+        mediainfo = """Video
+Format : HEVC
+Width : 3 840 pixels
+Height : 2 160 pixels"""
+        self.assertEqual(app.apply_mediainfo_rank([1, 2, 1], mediainfo), [2, 2, 2])
+
     def test_reads_resolution_and_codec_from_xml_nfo(self):
         with tempfile.TemporaryDirectory() as directory:
             video = Path(directory) / "SSNI-618.mkv"
@@ -186,6 +234,19 @@ class ReleaseLogicTests(unittest.TestCase):
         self.assertEqual(rows[0]["subtitle"], "LTX模型无码破解 三上悠亚")
         self.assertEqual(rows[0]["seeders"], 1234)
         request.assert_called_once()
+
+    def test_mteam_search_marks_resolution_tag_conflict_for_detail_refresh(self):
+        response = {"code": 0, "data": {"data": [{
+            "id": 1292971, "name": "ABF-017 新人OL 涼森れむ",
+            "labelsNew": ["中字", "4k", "AI破解"], "hasChineseSubtitle": False,
+            "smallDescr": "LTX模型 4K高清画质破解 4k x264", "standard": "6", "videoCodec": "1",
+        }]}}
+        with patch.object(app, "mteam_json", return_value=response), patch.object(
+            app, "mteam_option_map", side_effect=lambda endpoint, token: {"6": "1080p"} if "standardList" in endpoint else {"1": "H.264"}
+        ):
+            rows = app.mteam_search("凉森玲梦", "token")
+        self.assertEqual(rows[0]["rank"][0], 2)
+        self.assertFalse(rows[0]["metadata_complete"])
 
     def test_mteam_subtitle_download_uses_most_downloaded_chinese_item_and_video_filename(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1305,6 +1366,27 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
         self.assertNotIn("otherhash", [item["hash"] for item in rows])
         self.assertNotIn("FAILED-001", [item["code"] for item in rows])
 
+    def test_activity_prefers_upgrade_association_for_a_shared_downloader_task(self):
+        regular = app.create_subscription({"performer": "Regular", "download_dir": "/vol1/regular"})
+        upgrading = app.create_subscription({"performer": "Upgrading", "download_dir": "/vol1/upgrading"})
+        app.write_json(app.SETTINGS_FILE, {"mteam_token": "token", "downloader": {"type": "qbittorrent", "url": "http://nas:8080"}})
+        app.write_json(app.RECORDS_FILE, {
+            regular["id"]: {"SSNI-618": {"current": {"hash": "sharedhash", "rank": [0, 0, 0]}}},
+            upgrading["id"]: {"SSNI-618": {"pending": {"hash": "sharedhash", "rank": [2, 2, 0]}}},
+        })
+
+        class LiveDownloader:
+            def __init__(self, config):
+                self.config = config
+
+            def list_tasks(self, hashes=None):
+                return {"sharedhash": {"name": "SSNI-618 4K", "progress": .42, "complete": False, "state": "downloading", "failed": False}}
+
+        with patch.object(app, "Downloader", LiveDownloader):
+            rows = app.get_activity()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["subscription"], rows[0]["state"], rows[0]["pending"]), ("Upgrading", "upgrading", True))
+
     def test_activity_joins_untracked_task_by_number_to_failed_subscription_record(self):
         subscription = app.create_subscription({"performer": "三上悠亚", "download_dir": "/vol1/video"})
         app.write_json(app.SETTINGS_FILE, {"mteam_token": "token", "downloader": {"type": "qbittorrent", "url": "http://nas:8080", "username": "user", "password": "secret"}})
@@ -1392,7 +1474,9 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
     def test_local_video_files_are_indexed_by_number(self):
         root = Path(app.DATA_ROOT) / "videos"
         root.mkdir()
-        (root / "IPX-811 1080p x264.mkv").write_bytes(b"old")
+        video = root / "IPX-811 1080p x264.mkv"
+        video.write_bytes(b"old")
+        video.with_suffix(".nfo").write_text("<movie><video><width>1920</width><height>1080</height><codec>AVC</codec></video></movie>", encoding="utf-8")
         (root / "notes.txt").write_text("not a video", encoding="utf-8")
         found = app.scan_local_releases(str(root))
         self.assertEqual(found["IPX-811"][0]["rank"], [1, 0, 1])
@@ -1497,7 +1581,9 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
     def test_unrelated_subtitle_does_not_raise_local_video_language_rank(self):
         root = Path(app.DATA_ROOT) / "videos"
         root.mkdir()
-        (root / "IPX-811 1080p x264.mkv").touch()
+        video = root / "IPX-811 1080p x264.mkv"
+        video.touch()
+        video.with_suffix(".nfo").write_text("<movie><video><width>1920</width><height>1080</height><codec>AVC</codec></video></movie>", encoding="utf-8")
         (root / "IPX-812.srt").touch()
         found = app.scan_local_releases(str(root))
         self.assertEqual(found["IPX-811"][0]["rank"], [1, 0, 1])
@@ -1779,8 +1865,7 @@ class DownloaderTests(unittest.TestCase):
         self.assertTrue(result["recheck_requested"])
         info_request = next(item for item in calls if item.full_url.endswith("/torrents/info?hashes=" + info_hash))
         self.assertIsNotNone(info_request)
-        duplicate_log = next(message for message, _event in progress if "已存在相同种子" in message)
-        self.assertIn("/downloads/demo.mkv", duplicate_log)
+        self.assertFalse(any("已存在相同种子" in message for message, _event in progress))
         self.assertTrue(any(item.full_url.endswith("/torrents/recheck") for item in calls))
 
     def test_qbittorrent_http_409_tracks_matching_existing_task(self):
@@ -1803,6 +1888,73 @@ class DownloaderTests(unittest.TestCase):
         self.assertEqual(result["hash"], info_hash)
         self.assertFalse(result["owned"])
         self.assertEqual(result["existing_task"]["state"], "downloading")
+
+    def test_existing_duplicate_outside_subscription_directory_is_moved_and_rechecked(self):
+        raw_torrent = torrent_bytes()
+        info_hash = app.torrent_info_hash(raw_torrent)
+        calls = []
+
+        def fake_open(request, timeout=30):
+            calls.append(request)
+            path = request.full_url.split("nas:8080", 1)[-1]
+            if path.endswith("/auth/login"):
+                return FakeResponse(b"Ok.", headers={"Set-Cookie": "SID=abc"})
+            if path.endswith("/torrents/add"):
+                raise urllib.error.HTTPError(request.full_url, 409, "Conflict", Message(), io.BytesIO(b"Torrent already exists"))
+            if "/torrents/info" in path:
+                return FakeResponse(json.dumps([{"hash": info_hash, "progress": 1, "state": "queuedUP",
+                    "save_path": "/downloads/old", "content_path": "/downloads/old/demo.mp4"}]).encode())
+            if path.endswith("/torrents/setLocation") or path.endswith("/torrents/recheck"):
+                return FakeResponse(b"")
+            raise AssertionError(path)
+
+        client = app.Downloader({"type": "qbittorrent", "url": "http://nas:8080", "username": "u", "password": "p",
+            "path_mappings": [{"local": "/volume/performer", "remote": "/downloads/new"}]})
+        with patch.object(app.urllib.request, "urlopen", side_effect=fake_open):
+            result = client.add(raw_torrent, "demo", "/volume/performer")
+        self.assertTrue(result["recheck_requested"])
+        self.assertEqual(result["recheck_location"], "/downloads/new")
+        set_location = next(call for call in calls if call.full_url.endswith("/torrents/setLocation"))
+        self.assertIn(b"location=%2Fdownloads%2Fnew", set_location.data)
+        self.assertTrue(any(call.full_url.endswith("/torrents/recheck") for call in calls))
+
+    def test_existing_duplicate_requires_exact_save_path_even_if_content_path_is_under_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "subscription"
+            target.mkdir()
+            content = target / "ABP-933.mp4"
+            content.write_bytes(b"video")
+            client = app.Downloader({"type": "qbittorrent", "url": "http://nas:8080"})
+            with patch.object(client, "recheck", return_value="/downloads/subscription") as recheck:
+                result = client._track_existing_qb_task("a" * 40, {
+                    "state": "queuedUP", "complete": True,
+                    "save_path": "/downloads", "content_path": str(content),
+                }, str(target))
+            recheck.assert_called_once_with("a" * 40, str(target))
+            self.assertTrue(result["recheck_requested"])
+            self.assertEqual(result["recheck_location"], "/downloads/subscription")
+
+    def test_existing_duplicate_with_mapped_save_path_is_not_rechecked(self):
+        client = app.Downloader({"type": "qbittorrent", "url": "http://nas:8080",
+            "path_mappings": [{"local": "/volume", "remote": "/downloads"}]})
+        with patch.object(client, "recheck") as recheck:
+            result = client._track_existing_qb_task("a" * 40, {
+                "state": "uploading", "complete": True,
+                "save_path": "/downloads/subscription", "content_path": "",
+            }, "/volume/subscription")
+        recheck.assert_not_called()
+        self.assertFalse(result["recheck_requested"])
+
+    def test_qbittorrent_checking_state_is_not_reported_as_complete_at_full_progress(self):
+        info_hash = "a" * 40
+        def fake_open(request, timeout=30):
+            path = request.full_url.split("nas:8080", 1)[-1]
+            if path.endswith("/auth/login"):
+                return FakeResponse(b"Ok.", headers={"Set-Cookie": "SID=abc"})
+            return FakeResponse(json.dumps([{"hash": info_hash, "progress": 1, "state": "checkingDL"}]).encode())
+        client = app.Downloader({"type": "qbittorrent", "url": "http://nas:8080", "username": "u", "password": "p"})
+        with patch.object(app.urllib.request, "urlopen", side_effect=fake_open):
+            self.assertFalse(client.list_tasks([info_hash])[info_hash]["complete"])
 
     def test_qbittorrent_recheck_requests_only_the_missing_task_hash(self):
         calls = []
@@ -2232,7 +2384,19 @@ class UpgradeTests(unittest.TestCase):
         with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "scan_local_releases", return_value={}):
             app.process_subscription(subscription, records, {"mteam_token": "token", "debug_mode": True}, FakeDownloader(), [])
         messages = [entry["message"] for entry in app.get_logs() if entry["event"] == "debug_decision"]
-        self.assertTrue(any("与当前记录相同" in message for message in messages))
+        self.assertTrue(any("已由本地文件 ID 或记录确认安装" in message for message in messages))
+        self.assertTrue(any("候选开始：M-Team ID 1287499" in message and "current=ID 1287499" in message for message in messages))
+
+    def test_debug_mode_logs_when_local_number_is_missing_from_search_results(self):
+        root = Path(self.directory.name) / "debug-missing-search-result"
+        root.mkdir()
+        video = root / "ABF-017.mp4"
+        video.touch()
+        subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": str(root), "wash_enabled": True}
+        with patch.object(app, "mteam_search", return_value=[]):
+            app.process_subscription(subscription, {}, {"mteam_token": "token", "debug_mode": True}, FakeDownloader(), [])
+        messages = [entry["message"] for entry in app.get_logs() if entry["event"] == "debug_decision"]
+        self.assertTrue(any("ABF-017 搜索诊断" in message and "没有返回该番号候选" in message for message in messages))
 
     def test_manual_poll_can_check_only_the_requested_subscription(self):
         app.write_json(app.SETTINGS_FILE, {"mteam_token": "token", "downloader": {"type": "qbittorrent", "url": "http://nas:8080"}})
@@ -2430,10 +2594,266 @@ class UpgradeTests(unittest.TestCase):
         self.assertFalse(old_path.exists())
         self.assertEqual(records["sub"]["IPX-811"]["current"]["hash"], "newhash")
 
+    def test_completed_qbit_duplicate_upgrade_is_reconciled_in_same_check(self):
+        root = Path(self.directory.name) / "duplicate-completed-upgrade"
+        root.mkdir()
+        old_video = root / "ABF-017 1080p x264 old.mkv"
+        new_video = root / "ABF-017 4K 内嵌中文 x264 new.mp4"
+        old_video.write_bytes(b"old release")
+        subscription = {"id": "sub", "performer": "凉森玲梦", "keywords": "", "download_dir": str(root), "wash_enabled": True}
+        candidate = {"id": "new-mteam-id", "code": "ABF-017", "title": "ABF-017 4K 内嵌中文 x264", "rank": [2, 2, 1], "seeders": 20, "created": "2026", "metadata_complete": True}
+
+        class CompletedDuplicateDownloader(FakeDownloader):
+            def add(self, data, title, download_dir):
+                self.added.append((data, title, download_dir))
+                new_video.write_bytes(b"already complete in qBittorrent")
+                return {"hash": "existinghash", "owned": False, "existing_task": {
+                    "progress": 1.0, "complete": True, "state": "queuedUP", "content_path": str(new_video),
+                }}
+
+            def list_tasks(self, hashes=None):
+                requested = set(hashes or {"existinghash"})
+                return {"existinghash": {"progress": 1.0, "complete": True, "state": "queuedUP", "content_path": str(new_video)}} if "existinghash" in requested else {}
+
+        downloader = CompletedDuplicateDownloader()
+        records = {}
+        results = []
+        with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "mteam_detail", return_value={"performer": "凉森玲梦"}), patch.object(app, "fetch_torrent", return_value=torrent_bytes()):
+            app.process_subscription(subscription, records, {"mteam_token": "token"}, downloader, results)
+
+        self.assertFalse(old_video.exists())
+        self.assertTrue(new_video.exists())
+        record = records["sub"]["ABF-017"]
+        self.assertNotIn("pending", record)
+        self.assertEqual(record["current"]["hash"], "existinghash")
+        self.assertEqual(record["current"]["state"], "completed")
+        self.assertFalse(record["current"]["owns_task"])
+        self.assertIn("已确认 qBittorrent 中已有", record["current"]["message"])
+        self.assertNotEqual(record["current"]["message"], "下载完成。")
+        self.assertFalse(any(item.get("state") == "upgrading" for item in results))
+        self.assertEqual([item["state"] for item in results if item.get("code") == "ABF-017"], ["completed"])
+        self.assertTrue(any(item["event"] == "downloader_sync_started" for item in app.get_logs()))
+        self.assertTrue(any(item["event"] == "downloader_sync_completed" for item in app.get_logs()))
+
+    def test_folder_with_old_same_number_file_does_not_satisfy_new_seed_file_check(self):
+        root = Path(self.directory.name) / "torrent-folder"
+        old_dir = root / "ABP-933 old 1080p"
+        candidate_dir = root / "ABP-933 new 1080p"
+        old_dir.mkdir(parents=True)
+        candidate_dir.mkdir()
+        old_video = old_dir / "ABP-933 1080p 中文字幕.mp4"
+        expected_video = candidate_dir / "ABP-933 1080p 内嵌中文.mp4"
+        old_video.write_bytes(b"old external-subtitle release")
+        subscription = {"id": "sub", "performer": "Actress", "download_dir": str(root), "wash_enabled": True}
+        candidate = {"id": "new-embedded-id", "code": "ABP-933", "title": "ABP-933 1080p 内嵌中文", "rank": [1, 2, 1], "seeders": 20, "created": "2026", "metadata_complete": True}
+        task = {"content_path": str(candidate_dir), "save_path": str(root)}
+
+        class DirectoryTaskDownloader(FakeDownloader):
+            def list_task_files(self, info_hash):
+                return [{"name": str(expected_video.relative_to(root)).replace("\\", "/")}]
+
+        downloader = DirectoryTaskDownloader()
+        self.assertEqual(app.existing_task_release_in_subscription(task, str(root), "ABP-933", downloader, "hash"), "")
+        expected_video.write_bytes(b"new embedded release")
+        self.assertEqual(app.existing_task_release_in_subscription(task, str(root), "ABP-933", downloader, "hash"), str(expected_video.resolve()))
+
+    def test_old_same_number_file_does_not_complete_or_clean_pending_seed_upgrade(self):
+        root = Path(self.directory.name) / "torrent-folder-upgrade"
+        old_dir = root / "ABP-933 old 1080p"
+        candidate_dir = root / "ABP-933 new 1080p"
+        old_dir.mkdir(parents=True)
+        candidate_dir.mkdir()
+        old_video = old_dir / "ABP-933 1080p 中文字幕.mp4"
+        expected_video = candidate_dir / "ABP-933 1080p 内嵌中文.mp4"
+        old_video.write_bytes(b"old release")
+        active = {"id": "new-id", "code": "ABP-933", "hash": "existinghash", "state": "upgrading", "owns_task": False,
+                  "download_dir": str(root), "progress": 0, "rank": [1, 2, 1]}
+        old = {"id": "old-id", "code": "ABP-933", "hash": "oldhash", "state": "completed", "owns_task": True,
+               "download_dir": str(root), "rank": [1, 1, 1], "local_existing": True, "local_paths": [str(old_video)]}
+        records = {"sub": {"ABP-933": {"code": "ABP-933", "current": old, "pending": active}}}
+
+        class IncompleteDirectoryTask(FakeDownloader):
+            def __init__(self):
+                super().__init__()
+                self.rechecked = []
+
+            def list_tasks(self, hashes=None):
+                return {"existinghash": {"complete": True, "progress": 1, "state": "queuedUP",
+                    "content_path": str(candidate_dir), "save_path": str(root)}}
+
+            def list_task_files(self, info_hash):
+                return [{"name": str(expected_video.relative_to(root)).replace("\\", "/")}]
+
+            def recheck(self, info_hash, download_dir=""):
+                self.rechecked.append(info_hash)
+                return download_dir
+
+        downloader = IncompleteDirectoryTask()
+        results = []
+        app.poll_downloader_records(downloader, records["sub"], results, records, "Actress")
+        self.assertEqual(active["state"], "downloading")
+        self.assertEqual(old["state"], "completed")
+        self.assertTrue(old_video.exists())
+        self.assertFalse(expected_video.exists())
+        self.assertEqual(downloader.rechecked, ["existinghash"])
+        self.assertIn("pending", records["sub"]["ABP-933"])
+
+    def test_verified_existing_candidate_is_not_reupgraded_until_file_changes(self):
+        root = Path(self.directory.name) / "verified-repeat"
+        root.mkdir()
+        video = root / "ABP-933 1080p 内嵌中文.mp4"
+        video.write_bytes(b"verified candidate file")
+        stat = video.stat()
+        subscription = {"id": "sub", "performer": "Actress", "download_dir": str(root), "wash_enabled": True}
+        candidate = {"id": "new-id", "code": "ABP-933", "title": video.stem, "rank": [1, 2, 1], "seeders": 20, "created": "2026", "metadata_complete": True}
+        record = {"code": "ABP-933", "current": {"id": "new-id", "hash": "existinghash", "state": "completed", "owns_task": False,
+            "rank": [1, 0, 1], "verified_local_path": str(video), "verified_local_signature": {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}}}
+        records = {"sub": {"ABP-933": record}}
+        downloader = FakeDownloader()
+        with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "scan_local_releases", return_value={"ABP-933": [{"path": str(video), "title": video.name, "rank": [0, 0, 0], "metadata": {}}]}), patch.object(app, "fetch_torrent") as fetch:
+            app.process_subscription(subscription, records, {"mteam_token": "token", "debug_mode": True}, downloader, [])
+        fetch.assert_not_called()
+        self.assertEqual(downloader.added, [])
+        self.assertTrue(any("已由本地文件 ID 或记录确认安装" in item["message"] for item in app.get_logs() if item["event"] == "debug_decision"))
+
+    def test_same_mteam_id_search_rank_mismatch_refreshes_detail_before_wash(self):
+        root = Path(self.directory.name) / "same-id-rank-mismatch"
+        root.mkdir()
+        video = root / "ABF-017 mislabeled 4K x264.mp4"
+        video.write_bytes(b"1080p local video")
+        video.with_suffix(".nfo").write_text("<movie><video><width>1920</width><height>1080</height><codec>AVC</codec></video></movie>", encoding="utf-8")
+        stat = video.stat()
+        subscription = {"id": "sub", "performer": "凉森玲梦", "keywords": "", "download_dir": str(root), "wash_enabled": True}
+        candidate = {"id": "1292971", "code": "ABF-017", "title": "ABF-017 4K x264", "rank": [2, 2, 1],
+            "seeders": 10, "created": "2026", "metadata_complete": True}
+        local_metadata = {"id": "1285318", "rank": [1, 2, 1], "metadata_complete": True,
+            "mteam_rank_version": app.MTEAM_RANK_VERSION, "rank_version": app.LOCAL_MTEAM_RANK_VERSION,
+            "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        records = {"sub": {"ABF-017": {
+            "code": "ABF-017",
+            "current": {"id": "", "code": "ABF-017", "rank": [1, 2, 1], "state": "completed",
+                "local_existing": True, "owns_task": False, "local_paths": [str(video)], "download_dir": str(root)},
+            "mteam_metadata": {"id": "1292971", "title": candidate["title"], "rank": [1, 2, 1],
+                "metadata_complete": True, "mteam_rank_version": app.MTEAM_RANK_VERSION},
+            "local_files": {str(video): local_metadata},
+        }}}
+        detail = {"performer": "凉森玲梦", "resolution": "1080p", "videoCodec": "H.264",
+            "labelsNew": ["中字"], "hasChineseSubtitle": False,
+            "mediainfo": "Video\nFormat : AVC\nWidth : 1 920 pixels\nHeight : 1 080 pixels"}
+        downloader = FakeDownloader("replacement")
+        results = []
+        with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "mteam_detail", return_value=detail) as detail_lookup, patch.object(app, "fetch_torrent", return_value=torrent_bytes()):
+            app.process_subscription(subscription, records, {"mteam_token": "token"}, downloader, results)
+        detail_lookup.assert_called_once_with("1292971", "token", force_refresh=True)
+        self.assertEqual(records["sub"]["ABF-017"]["mteam_metadata"]["rank"], [1, 2, 1])
+        self.assertNotIn("pending", records["sub"]["ABF-017"])
+        self.assertEqual(downloader.added, [])
+
+    def test_same_mteam_id_stale_lower_cache_is_replaced_by_media_info_and_washed(self):
+        root = Path(self.directory.name) / "same-id-rank-upgrade"
+        root.mkdir()
+        video = root / "ABF-017 mislabeled 4K x264.mp4"
+        video.write_bytes(b"1080p local video")
+        video.with_suffix(".nfo").write_text("<movie><video><width>1920</width><height>1080</height><codec>AVC</codec></video></movie>", encoding="utf-8")
+        stat = video.stat()
+        subscription = {"id": "sub", "performer": "凉森玲梦", "keywords": "", "download_dir": str(root), "wash_enabled": True}
+        candidate = {"id": "1292971", "code": "ABF-017", "title": "ABF-017 4K x264", "rank": [2, 2, 1],
+            "seeders": 10, "created": "2026", "metadata_complete": True}
+        local_metadata = {"id": "1285318", "rank": [1, 2, 1], "metadata_complete": True,
+            "mteam_rank_version": app.MTEAM_RANK_VERSION, "rank_version": app.LOCAL_MTEAM_RANK_VERSION,
+            "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        records = {"sub": {"ABF-017": {
+            "code": "ABF-017",
+            "current": {"id": "", "code": "ABF-017", "rank": [1, 2, 1], "state": "completed",
+                "local_existing": True, "owns_task": False, "local_paths": [str(video)], "download_dir": str(root)},
+            "mteam_metadata": {"id": "1292971", "title": candidate["title"], "rank": [1, 2, 1],
+                "metadata_complete": True, "mteam_rank_version": app.MTEAM_RANK_VERSION},
+            "local_files": {str(video): local_metadata},
+        }}}
+        detail = {"performer": "凉森玲梦", "resolution": "2160p", "videoCodec": "H.264",
+            "labelsNew": ["中字"], "hasChineseSubtitle": False,
+            "mediainfo": "Video\nFormat : AVC\nWidth : 3 840 pixels\nHeight : 2 160 pixels"}
+        downloader = FakeDownloader("replacement")
+        results = []
+        with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "mteam_detail", return_value=detail) as detail_lookup, patch.object(app, "fetch_torrent", return_value=torrent_bytes()):
+            app.process_subscription(subscription, records, {"mteam_token": "token"}, downloader, results)
+        detail_lookup.assert_called_once_with("1292971", "token", force_refresh=True)
+        self.assertEqual(records["sub"]["ABF-017"]["mteam_metadata"]["rank"], [2, 2, 1])
+        self.assertEqual(records["sub"]["ABF-017"]["pending"]["id"], "1292971")
+        self.assertEqual(records["sub"]["ABF-017"]["pending"]["upgrade_reason"], "分辨率：1080p → 4K")
+        self.assertEqual(len(downloader.added), 1)
+
+    def test_verified_same_id_file_is_bound_to_local_index_instead_of_requeued(self):
+        root = Path(self.directory.name) / "verified-same-id"
+        root.mkdir()
+        video = root / "ABF-017 4K x264.mp4"
+        video.write_bytes(b"verified torrent file")
+        stat = video.stat()
+        candidate = {"id": "1292971", "code": "ABF-017", "title": video.stem,
+            "rank": [2, 2, 1], "seeders": 10, "created": "2026", "metadata_complete": True}
+        current = {"id": "1292971", "code": "ABF-017", "rank": [2, 2, 1], "state": "completed",
+            "owns_task": False, "download_dir": str(root), "verified_local_path": str(video),
+            "verified_local_signature": {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}}
+        record = {"code": "ABF-017", "current": current}
+        records = {"sub": {"ABF-017": record}}
+        local_item = {"path": str(video), "title": video.name, "rank": [2, 1, 1], "metadata": {}}
+        subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": str(root), "wash_enabled": True}
+        downloader = FakeDownloader()
+        with patch.object(app, "mteam_search", return_value=[candidate]), \
+             patch.object(app, "scan_local_releases", return_value={"ABF-017": [local_item]}), \
+             patch.object(app, "cache_local_file_mteam_metadata"), \
+             patch.object(app, "_download_existing_local_subtitles"), \
+             patch.object(app, "index_subscription_videos"), \
+             patch.object(app, "collect_subscription_subtitles"):
+            app.process_subscription(subscription, records, {"mteam_token": "token"}, downloader, [])
+        self.assertEqual(record["local_files"][str(video)]["id"], "1292971")
+        self.assertEqual(local_item["rank"], [2, 2, 1])
+        self.assertEqual(local_item["rank_source"], "M-Team")
+        self.assertEqual(downloader.added, [])
+        self.assertTrue(any(entry["event"] == "verified_release_reconciled" for entry in app.get_logs()))
+
+    def test_completed_duplicate_with_only_old_same_number_file_does_not_clean_old_version(self):
+        root = Path(self.directory.name) / "duplicate-missing-target"
+        root.mkdir()
+        old_video = root / "ABF-017 1080p x264 old.mkv"
+        new_video = root / "ABF-017 4K 内嵌中文 x264 new.mp4"
+        old_video.write_bytes(b"old release")
+        subscription = {"id": "sub", "performer": "凉森玲梦", "download_dir": str(root), "wash_enabled": True}
+        candidate = {"id": "new-mteam-id", "code": "ABF-017", "title": new_video.stem, "rank": [2, 2, 1], "seeders": 20, "created": "2026", "metadata_complete": True}
+
+        class MissingDuplicateDownloader(FakeDownloader):
+            def add(self, data, title, download_dir):
+                return {"hash": "existinghash", "owned": False, "existing_task": {
+                    "progress": 1, "complete": True, "state": "queuedUP", "content_path": str(new_video),
+                }}
+
+            def list_tasks(self, hashes=None):
+                requested = set(hashes or {"existinghash"})
+                return {"existinghash": {"progress": 1, "complete": True, "state": "queuedUP", "content_path": str(new_video)}} if "existinghash" in requested else {}
+
+            def recheck(self, info_hash, download_dir=""):
+                self.removed.append(("recheck", info_hash, download_dir))
+                return download_dir
+
+        downloader = MissingDuplicateDownloader()
+        records = {}
+        results = []
+        with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "mteam_detail", return_value={"performer": "凉森玲梦"}), patch.object(app, "fetch_torrent", return_value=torrent_bytes()):
+            app.process_subscription(subscription, records, {"mteam_token": "token"}, downloader, results)
+        record = records["sub"]["ABF-017"]
+        self.assertTrue(old_video.exists())
+        self.assertFalse(new_video.exists())
+        self.assertIn("pending", record)
+        self.assertEqual(record["pending"]["state"], "downloading")
+        self.assertEqual(downloader.removed, [("recheck", "existinghash", str(root))])
+        self.assertEqual(results[-1]["state"], "downloading")
+
     def test_existing_local_number_is_not_downloaded_twice(self):
         root = Path(self.directory.name) / "videos"
         root.mkdir()
-        (root / "IPX-811 4K 中文 x265.mkv").write_bytes(b"already downloaded")
+        video = root / "IPX-811 4K 中文 x265.mkv"
+        video.write_bytes(b"already downloaded")
+        video.with_suffix(".nfo").write_text("<movie><video><width>3840</width><height>2160</height><codec>HEVC</codec></video><subtitlelanguage>chi</subtitlelanguage></movie>", encoding="utf-8")
         subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": str(root), "wash_enabled": True}
         candidate = {"id": "new", "code": "IPX-811", "title": "IPX-811 1080p x264", "rank": [1, 0, 1], "seeders": 8, "created": "2026"}
         records = {}
@@ -2451,6 +2871,8 @@ class UpgradeTests(unittest.TestCase):
         lower = root / "SSNI-229 1080p 中文字幕 x264-U.ltx.mp4"
         better.write_bytes(b"better")
         lower.write_bytes(b"lower")
+        better.with_suffix(".nfo").write_text("<movie><video><width>3840</width><height>2160</height><codec>HEVC</codec></video></movie>", encoding="utf-8")
+        lower.with_suffix(".nfo").write_text("<movie><video><width>1920</width><height>1080</height><codec>AVC</codec></video></movie>", encoding="utf-8")
         subscription = {"id": "sub", "performer": "三上悠亚", "keywords": "", "download_dir": str(root), "wash_enabled": True}
         with patch.object(app, "mteam_search", return_value=[]):
             app.process_subscription(subscription, {}, {"mteam_token": "token", "local_multi_disk_wash": True}, FakeDownloader(), [])
@@ -3087,13 +3509,50 @@ class UpgradeTests(unittest.TestCase):
             app.process_subscription(subscription, records, {"mteam_token": "token"}, downloader, results)
 
         self.assertEqual(results[0]["state"], "downloading")
-        self.assertIn("已存在相同种子", results[0]["message"])
+        self.assertIn("已有该种子", results[0]["message"])
         self.assertIn("/downloads/SSNI-229.mp4", results[0]["message"])
-        self.assertIn("不会自动硬链接", results[0]["message"])
+        self.assertIn("不自动硬链接", results[0]["message"])
+        self.assertFalse(any(item["event"] == "duplicate_task" for item in app.get_logs()))
         release = records["sub"]["SSNI-229"]["current"]
         self.assertIsNotNone(release)
         self.assertFalse(release["copy_required"])
         self.assertFalse(target.exists())
+
+    def test_existing_same_torrent_with_file_in_subscription_directory_is_not_warned(self):
+        root = Path(self.directory.name) / "same-torrent-installed"
+        root.mkdir()
+        video = root / "SSNI-229 4K 中文 x265.mp4"
+        video.write_bytes(b"already installed")
+        subscription = {"id": "sub", "performer": "Actress", "download_dir": str(root), "wash_enabled": True}
+        candidate = {"id": "1289514", "code": "SSNI-229", "title": video.stem, "rank": [2, 1, 2], "seeders": 5, "created": "2026", "metadata_complete": True}
+
+        class InstalledDuplicateDownloader(FakeDownloader):
+            def __init__(self):
+                super().__init__()
+                self.progress = []
+                self.progress_callback = None
+
+            def _progress(self, message, event):
+                self.progress.append((message, event))
+
+            def add(self, data, title, download_dir):
+                self.added.append((data, title, download_dir))
+                return {"hash": "existinghash", "owned": False, "existing_task": {
+                    "state": "uploading", "complete": True, "content_path": str(video),
+                }}
+
+        downloader = InstalledDuplicateDownloader()
+        records = {}
+        results = []
+        with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "mteam_detail", return_value={"performer": "Actress"}), patch.object(app, "fetch_torrent", return_value=torrent_bytes()):
+            app.process_subscription(subscription, records, {"mteam_token": "token"}, downloader, results)
+
+        self.assertFalse(any(event == "duplicate_task" for _message, event in downloader.progress))
+        record = records["sub"]["SSNI-229"]
+        self.assertTrue(record["current"]["local_existing"])
+        self.assertEqual(downloader.added, [])
+        self.assertFalse(any(event == "duplicate_task" for _message, event in downloader.progress))
+        self.assertFalse(any("已存在相同种子" in item.get("message", "") for item in results))
 
     def test_completed_existing_downloader_task_warns_when_subscription_file_is_missing(self):
         root = Path(self.directory.name)
@@ -3113,16 +3572,18 @@ class UpgradeTests(unittest.TestCase):
                 super().__init__()
                 self.rechecked = []
                 self.progress_callback = None
+                self.content_path = str(source)
 
             def _progress(self, message, event):
                 if self.progress_callback:
                     self.progress_callback(message, event)
 
             def list_tasks(self, hashes=None):
-                return {"existinghash": {"complete": True, "progress": 1, "content_path": str(source)}}
+                return {"existinghash": {"complete": True, "progress": 1, "content_path": self.content_path}}
 
             def recheck(self, info_hash, download_dir=""):
                 self.rechecked.append(info_hash)
+                self.content_path = str(Path(download_dir) / "SSNI-229.mp4")
 
         results = []
         downloader = CompletedDownloader()
