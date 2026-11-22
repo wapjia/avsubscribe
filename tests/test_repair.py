@@ -40,6 +40,7 @@ class DataRepairTests(unittest.TestCase):
             value = self.root if name == "DATA_ROOT" else self.root / name.lower()
             self.enterContext(patch.object(app, name, value))
         self.enterContext(patch.object(app, "STOP_SCHEDULER", False))
+        self.enterContext(patch.object(app.cover_images, "fetch", side_effect=OSError("模拟图片不可用")))
         for name in ("execution", "active", "performer", "repair_job_id"):
             self.enterContext(patch.object(app.MTEAM_POLL_CACHE, name, None, create=True))
         self.videos = self.root / "videos"
@@ -48,8 +49,8 @@ class DataRepairTests(unittest.TestCase):
         app.write_json(app.SUBSCRIPTIONS_FILE, [self.subscription])
         app.write_json(app.SETTINGS_FILE, {"mteam_token": "token", "downloader": {"url": "http://qb", "type": "qbittorrent"}})
 
-    def video(self, name="ABC-123.mp4", identifier="", extra=None):
-        path = self.videos / name
+    def video(self, name="ABC-123.mp4", identifier="", extra=None, archived=True):
+        path = (self.videos / app.normalize_code(name) if archived else self.videos) / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"video")
         records = app.read_json(app.RECORDS_FILE, {})
@@ -80,6 +81,57 @@ class DataRepairTests(unittest.TestCase):
 
     def saved(self, path):
         return app.read_json(app.RECORDS_FILE, {})["sub"][app.normalize_code(path.name)]["local_files"][str(path)]
+
+    def test_subscription_repair_archives_legacy_video_and_matching_sidecars(self):
+        old = self.video("SNIS-872.mp4", "22999", archived=False)
+        old.with_suffix(".nfo").write_text("<movie><title>Old title</title></movie>", encoding="utf-8")
+        subtitle = old.with_name("SNIS-872.MT.zh-HK.srt")
+        subtitle.write_text("captions", encoding="utf-8")
+        unrelated = old.with_name("ABC-123.txt")
+        unrelated.touch()
+        signature = old.stat()
+        with patch.object(app, "mteam_detail", return_value=self.detail(2)):
+            job = self.run_job()
+        self.assertEqual(job["summary"]["archived"], 1)
+        target = self.videos / "SNIS-872" / old.name
+        self.assertFalse(old.exists())
+        self.assertEqual(target.stat().st_ino, signature.st_ino)
+        self.assertTrue(target.with_suffix(".nfo").is_file())
+        self.assertTrue(target.with_name(subtitle.name).is_file())
+        self.assertTrue(unrelated.is_file())
+        self.assertEqual(self.saved(target)["id"], "22999")
+
+    def test_subscription_repair_moves_qbittorrent_data_via_downloader(self):
+        old = self.video("SNIS-872.mp4", "22999", archived=False)
+        downloader = self.matched_downloader([("one", old, "22999")])
+        downloader.tasks["one"]["complete"] = True
+        calls = []
+
+        def relocate(info_hash, location):
+            calls.append((info_hash, location))
+            destination = Path(location)
+            destination.mkdir()
+            new = old.rename(destination / old.name)
+            downloader.tasks[info_hash].update(save_path=location, content_path=str(new))
+            downloader.files[info_hash] = [{"name": new.name}]
+
+        downloader.set_location = relocate
+        with patch.object(app, "mteam_detail", return_value=self.detail(2)):
+            job = self.run_job(downloader)
+        self.assertEqual(job["summary"]["archived"], 1)
+        self.assertEqual(calls, [("one", str(self.videos / "SNIS-872"))])
+        self.assertTrue((self.videos / "SNIS-872" / old.name).is_file())
+        self.assertFalse(old.exists())
+
+    def test_archive_preserves_both_versions_on_collision(self):
+        old = self.video("SNIS-872.mp4", "22999", archived=False)
+        destination = self.video("SNIS-872.mp4", "23000")
+        destination.write_bytes(b"other")
+        with patch.object(app, "mteam_detail", return_value=self.detail(2)):
+            job = self.run_job()
+        self.assertEqual(job["summary"]["archive_failed"], 1)
+        self.assertEqual(old.read_bytes(), b"video")
+        self.assertEqual(destination.read_bytes(), b"other")
 
     def test_all_ids_are_corrected_before_details_and_each_id_is_fetched_once(self):
         first = self.video("ABC-123 one.mp4", "11111", {"mediainfo": "old", "subtitle_check": {"state": "not_found"}})
@@ -332,6 +384,34 @@ class DataRepairTests(unittest.TestCase):
         self.assertEqual(app.detail_cover_url({"imageList": ["javascript:alert(1)"],
             "descr": "![](https://img.m-team.cc/fallback.jpg)"}), "https://img.m-team.cc/fallback.jpg")
         self.assertEqual(app.detail_cover_url({"imageList": ["https://user:secret@example.com/a", None]}), "")
+
+    def test_single_video_repair_forces_cover_and_gallery_refresh_for_that_number(self):
+        target = self.video(identifier="22222")
+        self.video("DEF-123.mp4", "33333", {"cover_url": "https://example.com/other-cover.jpg"})
+        cover_url = "https://example.com/cover.jpg"
+        screenshot_url = "https://example.com/screenshot.jpg"
+        dmm_code = "https://www.dmm.co.jp/mono/dvd/-/detail/=/cid=abc123/"
+        detail = {**self.detail(2), "imageList": [cover_url], "dmmCode": dmm_code}
+        old = b"\xff\xd8\xff\xe0old-image\xff\xd9"
+        new = b"\xff\xd8\xff\xe0new-image\xff\xd9"
+        directory = target.parent
+        with patch.object(app.cover_images, "crop_poster", return_value=old), patch.object(app, "mteam_detail", return_value=detail) as details, \
+             patch.object(app, "mteam_json", return_value={"data": {"picData": screenshot_url}}) as dmm_api:
+            with patch.object(app.cover_images, "fetch", return_value=(".jpg", old)) as fetch:
+                self.run_job(path=target, code="ABC-123")
+                self.assertEqual([call.args[0] for call in fetch.call_args_list], [cover_url, screenshot_url])
+            with patch.object(app.cover_images, "fetch", return_value=(".jpg", new)) as fetch:
+                job = self.run_job(path=target, code="ABC-123")
+                self.assertEqual([call.args[0] for call in fetch.call_args_list], [cover_url, screenshot_url])
+            self.assertEqual(job["summary"]["covers_downloaded"], 1)
+            self.assertEqual(job["summary"]["screenshots_downloaded"], 1)
+            self.assertEqual(dmm_api.call_count, 2)
+            self.assertEqual([call.args[0] for call in details.call_args_list], ["22222", "22222"])
+            job = self.run_job(path=target, code="ABC-123")
+            self.assertEqual(job["summary"]["image_failed"], 2)
+        self.assertEqual((directory / "fansrt.jpg").read_bytes(), new)
+        self.assertEqual((directory / "screenshot-1.jpg").read_bytes(), new)
+        self.assertFalse((directory.parent / "DEF-123" / "fansrt.jpg").exists())
 
     def test_repair_saves_distinct_cover_urls_per_file_and_sqlite(self):
         first = self.video("ABC-123 one.mp4", "22222")

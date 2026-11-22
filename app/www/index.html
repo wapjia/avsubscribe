@@ -33,7 +33,7 @@
       <section id="dashboard-activity" class="activity-section dashboard-activity"><div class="section-head"><div><p class="eyebrow">下载器任务</p><h2>下载任务</h2></div><span id="activity-count" class="count-label">0 项</span></div><div class="table-wrap"><table><thead><tr><th>女优</th><th>番号</th><th>资源</th><th>状态</th><th>进度</th><th>说明</th></tr></thead><tbody id="activity-body"><tr><td colspan="6" class="empty">暂无下载任务</td></tr></tbody></table></div></section>
 
       <section id="subscription-view" class="subscription-view" hidden>
-        <div class="page-heading"><div><p class="eyebrow">订阅</p><h2 id="selected-title">选择一个订阅</h2><p id="selected-description" class="muted"></p></div><div class="page-actions"><button id="selected-repair-data" class="secondary" type="button" title="修复当前订阅全部本地视频：先按 qBittorrent 精确文件路径核对并修正 M-Team ID，再强制刷新视频信息及 MediaInfo；中文字幕视频缺少配套字幕时下载字幕。&#10;无匹配种子时沿用已有逐文件 ID；缺 ID 或匹配冲突时跳过并记录日志。&#10;后台执行，限流后等待并继续；不新增种子、不洗版或删除视频。">修复数据</button><button id="selected-scan" class="secondary" type="button" title="立即检查当前女优订阅：同步下载器状态、扫描本地目录，并按女优名字和附加关键字搜索 M-Team。&#10;按黑名单、番号去重及洗版设置决定是否提交新下载；核对 ID、刷新影片信息和补字幕请使用“修复数据”按钮。&#10;执行进度和结果可在下方日志查看；遇到限流时等待冷却后继续。">立即检查</button><button id="selected-edit" class="secondary" type="button">编辑</button><button id="selected-delete" class="danger-button" type="button">删除</button></div></div>
+        <div class="page-heading"><div><p class="eyebrow">订阅</p><h2 id="selected-title">选择一个订阅</h2><p id="selected-description" class="muted"></p></div><div class="page-actions"><button id="selected-repair-data" class="secondary" type="button" title="修复当前订阅全部本地视频：先将已有影片归档到各自番号目录，再逐文件核对 M-Team ID、刷新 MediaInfo、补字幕，并在视频旁保存封面、海报和截图。&#10;无匹配种子时沿用已有逐文件 ID；缺 ID 或匹配冲突时跳过并记录日志。&#10;后台执行，限流后等待并继续；不新增种子、不洗版或删除视频。">修复数据</button><button id="selected-scan" class="secondary" type="button" title="立即检查当前女优订阅：同步下载器状态、扫描本地目录，并按女优名字和附加关键字搜索 M-Team。&#10;按黑名单、番号去重及洗版设置决定是否提交新下载；核对 ID、刷新影片信息和补字幕请使用“修复数据”按钮。&#10;执行进度和结果可在下方日志查看；遇到限流时等待冷却后继续。">立即检查</button><button id="selected-edit" class="secondary" type="button">编辑</button><button id="selected-delete" class="danger-button" type="button">删除</button></div></div>
         <div id="subscription-summary" class="subscription-summary"></div>
         <section class="activity-section existing-section" aria-labelledby="existing-toggle">
           <div class="section-head">
@@ -43,7 +43,7 @@
             <span id="existing-count" class="count-label">0 个视频</span>
           </div>
           <div id="existing-content" class="existing-content">
-            <div class="table-wrap"><table><thead><tr><th>番号</th><th>匹配版本</th><th>文件</th></tr></thead><tbody id="existing-body"><tr><td colspan="3" class="empty">读取目录中…</td></tr></tbody></table></div>
+            <div class="table-wrap"><table><thead><tr><th>番号</th><th>封面</th><th>匹配版本</th><th>文件</th></tr></thead><tbody id="existing-body"><tr><td colspan="4" class="empty">读取目录中…</td></tr></tbody></table></div>
           </div>
         </section>
       </section>
@@ -74,6 +74,20 @@
         <p id="subtitle-collection-note" class="path-hint">每轮订阅检查后，将中文字幕等级且文件名带 .MT. 标记的字幕复制到此目录，供 MDC-NG 刮削女优影片时识别；按“番号.扩展名”命名，如 ABC-123.srt。源字幕保留，目录不存在时自动创建；同番号、同扩展名优先选修改时间较新的文件。</p>
       </div>
       <div class="settings-group">
+        <div class="settings-group-heading"><h3>影片资料翻译</h3><p id="azure-key-state" class="field-state">未配置</p></div>
+        <div class="form-grid azure-settings">
+          <div>
+            <label for="azure-key">Azure Translator 密钥</label>
+            <div class="secret-row">
+              <input id="azure-key" type="password" autocomplete="new-password" aria-describedby="azure-settings-note">
+              <button id="clear-azure-key" class="icon-button" type="button" title="清除 Azure 密钥" aria-label="清除 Azure 翻译密钥" disabled>×</button>
+            </div>
+          </div>
+          <label for="azure-region">Azure 区域（可选）<input id="azure-region" type="text" autocomplete="off" placeholder="例如 eastasia"></label>
+        </div>
+        <p id="azure-settings-note" class="path-hint">检查或修复时翻译标题、基本资料、系列和简介，并同步同名 NFO 的标题和简介。区域资源请填写 Azure 控制台显示的区域代码。</p>
+      </div>
+      <div class="settings-group">
         <div class="settings-group-heading"><h3>检查计划</h3><p>管理自动检查频率和 M-Team 请求节奏。</p></div>
         <div class="settings-row"><div class="settings-control"><label class="toggle"><input id="auto-scan" type="checkbox"><span class="switch"></span><span>定时检查</span></label></div><div class="settings-row-description"><strong>自动检查订阅</strong><span>按设定间隔搜索新影片；新版本完成后会清理旧下载任务及其数据。</span></div><label class="interval">间隔<input id="poll-interval" type="number" min="5" max="1440" step="5">分钟</label></div>
         <div class="settings-row"><div class="settings-control"><label class="interval" for="mteam-request-interval">请求间隔<input id="mteam-request-interval" type="number" min="1" max="60" step="1">秒/次</label></div><div class="settings-row-description"><strong>M-Team API 速度</strong><span>每次请求之间的等待时间；数值越大，请求越慢。默认 5 秒。</span></div></div>
@@ -82,7 +96,7 @@
         <div class="settings-group-heading"><h3>本地维护与诊断</h3><p>控制本地文件整理和日志详细程度。</p></div>
         <div class="settings-row"><div class="settings-control"><label class="toggle"><input id="local-multi-disk-wash" type="checkbox"><span class="switch"></span><span>洗版本地重复番号</span></label></div><div class="settings-row-description"><strong>仅限同一女优的订阅目录</strong><span>比较目录内同番号影片；仅在分辨率或中文等级明确较低时删除本地文件，不跨女优目录洗版。</span></div></div>
         <div class="settings-row"><div class="settings-control"><label class="toggle"><input id="cleanup-orphan-sidecars" type="checkbox"><span class="switch"></span><span>清理孤立 NFO/字幕</span></label></div><div class="settings-row-description"><strong>自动整理配套文件</strong><span>每次扫描时删除同目录内找不到对应视频的 NFO 和字幕文件。</span></div></div>
-        <div class="settings-row"><div class="settings-control"><label class="toggle"><input id="debug-mode" type="checkbox"><span class="switch"></span><span>调试模式</span></label></div><div class="settings-row-description"><strong>记录详细检查原因</strong><span>记录每个番号的搜索、过滤、跳过和提交原因；排查完成后建议关闭。</span></div></div>
+        <div class="settings-row"><div class="settings-control"><label class="toggle"><input id="debug-mode" type="checkbox"><span class="switch"></span><span>调试模式</span></label></div><div class="settings-row-description"><strong>记录检查详情和接口响应</strong><span>展开「接口响应」日志可查看并复制脱敏后的 JSON。</span></div></div>
       </div>
       <div class="settings-save-bar"><span>更改需要保存后才会生效。</span><button id="save-settings-footer" class="primary" type="button">保存设置</button></div>
       </section>
@@ -95,6 +109,35 @@
     </div>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </main>
+
+  <dialog id="cover-dialog" aria-labelledby="cover-title">
+    <div id="cover-viewer" class="cover-viewer">
+      <div class="cover-viewer-toolbar">
+        <button id="cover-back" class="secondary" type="button" hidden>返回图片列表</button>
+        <h2 id="cover-title"></h2>
+        <button id="cover-close" class="icon-button" type="button" aria-label="关闭图片浏览" autofocus>×</button>
+      </div>
+      <div id="cover-gallery" class="cover-gallery" tabindex="0" aria-label="封面和截图">
+        <div id="cover-gallery-images" class="cover-gallery-images"></div>
+        <p id="cover-gallery-message" role="status" hidden></p>
+      </div>
+      <div id="cover-stage" class="cover-stage" hidden>
+        <img id="cover-large" alt="" draggable="false">
+        <p id="cover-viewer-message" role="status" hidden></p>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="nfo-dialog" aria-labelledby="nfo-title">
+    <form method="dialog">
+      <div class="dialog-head">
+        <h2 id="nfo-title">NFO</h2>
+        <button class="icon-button" type="submit" aria-label="关闭 NFO" autofocus>×</button>
+      </div>
+      <p id="nfo-message" role="status" hidden></p>
+      <pre id="nfo-content" tabindex="0" aria-label="NFO 内容" hidden></pre>
+    </form>
+  </dialog>
 
   <dialog id="subscription-dialog">
     <form id="subscription-form" method="dialog">

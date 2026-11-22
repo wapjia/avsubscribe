@@ -9,6 +9,7 @@ const form = $("#subscription-form");
 let subscriptions = [];
 let activity = [];
 let logEntries = [];
+const expandedResponseLogs = new Set();
 let busy = false;
 let toastTimer = 0;
 let activeView = "all";
@@ -39,6 +40,7 @@ coverPreview.setAttribute("role", "tooltip");
 coverPreview.hidden = true;
 document.body.append(coverPreview);
 let coverAnchor = null;
+let nfoLoad = 0;
 const videoRefreshStates = new Map();
 const appBase = window.location.pathname.replace(/\/$/, "");
 $("#app-version").textContent = `v${APP_VERSION}`;
@@ -203,31 +205,35 @@ function positionCoverPreview() {
   coverPreview.style.top = `${Math.max(8, Math.min(bounds.top, height - box.height - 8))}px`;
 }
 
-function attachCoverPreview(anchor, code, files, subscriptionId) {
+function sortCoverFiles(files) {
+  return [...files].sort((a, b) => {
+    for (let i = 0; i < 3; i++) {
+      const difference = (b.rank?.[i] || 0) - (a.rank?.[i] || 0);
+      if (difference) return difference;
+    }
+    return 0;
+  });
+}
+
+function attachCoverPreview(anchor, code, files, subscriptionId, localImage) {
   anchor.tabIndex = 0;
   const show = async () => {
     hideCoverPreview();
     coverAnchor = anchor;
     anchor.setAttribute("aria-describedby", coverPreview.id);
     coverPreview.hidden = false;
-    const file = [...files].filter((item) => item.mteam_id).sort((a, b) => {
-      for (let i = 0; i < 3; i++) {
-        const difference = (b.rank?.[i] || 0) - (a.rank?.[i] || 0);
-        if (difference) return difference;
-      }
-      return 0;
-    })[0];
+    const file = sortCoverFiles(files).find((item) => item.mteam_id);
     const caption = document.createElement("div");
     caption.className = "cover-caption";
     caption.textContent = file?.subtitle || file?.rank_title || code;
     const message = document.createElement("div");
     message.className = "cover-message";
-    message.textContent = file ? "正在加载封面…" : "暂无关联 M-Team ID，请先修复数据。";
+    message.textContent = file || localImage ? "正在加载封面…" : "暂无关联 M-Team ID，请先修复数据。";
     coverPreview.replaceChildren(caption, message);
     positionCoverPreview();
-    if (!file) return;
+    if (!file && !localImage) return;
     try {
-      let url = file.cover_url || "";
+      let url = localImage ? appUrl(localImage) : file.cover_url || "";
       if (!url && !file.cover_checked) {
         const key = `${subscriptionId}:${file.path}:${file.mteam_id}`;
         if (!videoCoverRequests.has(key)) {
@@ -242,7 +248,7 @@ function attachCoverPreview(anchor, code, files, subscriptionId) {
         url = file.cover_url;
       }
       if (coverAnchor !== anchor) return;
-      if (!url || !/^https?:\/\//i.test(url)) {
+      if (!url || (!localImage && !/^https?:\/\//i.test(url))) {
         message.textContent = "M-Team 详情暂无封面。";
         return;
       }
@@ -273,6 +279,230 @@ function attachCoverPreview(anchor, code, files, subscriptionId) {
   anchor.addEventListener("blur", hideCoverPreview);
 }
 window.addEventListener("resize", hideCoverPreview);
+
+const coverDialog = $("#cover-dialog");
+const coverViewer = $("#cover-viewer");
+const coverGallery = $("#cover-gallery");
+const coverGalleryImages = $("#cover-gallery-images");
+const coverGalleryMessage = $("#cover-gallery-message");
+const coverBack = $("#cover-back");
+const coverStage = $("#cover-stage");
+const coverLarge = $("#cover-large");
+const coverMessage = $("#cover-viewer-message");
+const coverPointers = new Map();
+let coverZoom = 1;
+let coverOffset = { x: 0, y: 0 };
+let coverGalleryLoad = 0;
+let coverGalleryScroll = 0;
+let coverZoomTrigger = null;
+
+function applyCoverTransform() {
+  const { clientWidth: width, clientHeight: height } = coverStage;
+  const { naturalWidth, naturalHeight } = coverLarge;
+  if (!width || !height || !naturalWidth || !naturalHeight) return;
+  const fit = Math.min(1, width / naturalWidth, height / naturalHeight);
+  const clamp = (offset, image, viewport) => {
+    const limit = Math.max(0, (image * fit * coverZoom - viewport) / 2);
+    return Math.min(limit, Math.max(-limit, offset));
+  };
+  coverOffset.x = clamp(coverOffset.x, naturalWidth, width);
+  coverOffset.y = clamp(coverOffset.y, naturalHeight, height);
+  coverLarge.style.transform = `translate(${coverOffset.x}px, ${coverOffset.y}px) scale(${coverZoom})`;
+}
+
+function resetCoverZoom() {
+  coverPointers.clear();
+  coverZoom = 1;
+  coverOffset = { x: 0, y: 0 };
+  coverLarge.style.transform = "";
+  coverLarge.removeAttribute("src");
+}
+
+function zoomGalleryImage(trigger, label, url) {
+  coverGalleryScroll = coverGallery.scrollTop;
+  coverZoomTrigger = trigger;
+  coverGallery.hidden = true;
+  coverStage.hidden = false;
+  coverBack.hidden = false;
+  coverLarge.alt = label;
+  coverLarge.hidden = true;
+  coverMessage.textContent = "正在加载图片…";
+  coverMessage.hidden = false;
+  coverLarge.src = url;
+  coverBack.focus({ preventScroll: true });
+}
+
+function showCoverGallery() {
+  resetCoverZoom();
+  coverStage.hidden = true;
+  coverBack.hidden = true;
+  coverGallery.hidden = false;
+  coverGallery.scrollTop = coverGalleryScroll;
+  coverZoomTrigger?.focus({ preventScroll: true });
+  coverZoomTrigger = null;
+}
+
+function appendGalleryImage(label, url, lazy) {
+  const figure = document.createElement("figure");
+  const caption = document.createElement("figcaption");
+  if (!url) {
+    figure.className = "cover-gallery-missing";
+    caption.textContent = `${label}暂不可用`;
+    figure.append(caption);
+    coverGalleryImages.append(figure);
+    return;
+  }
+  const button = document.createElement("button");
+  button.type = "button";
+  button.setAttribute("aria-label", `放大${label}`);
+  const image = document.createElement("img");
+  image.alt = "";
+  image.loading = lazy ? "lazy" : "eager";
+  image.decoding = "async";
+  image.referrerPolicy = "no-referrer";
+  caption.textContent = label;
+  image.addEventListener("error", () => {
+    button.disabled = true;
+    caption.textContent = `${label}加载失败`;
+  });
+  image.src = url;
+  button.append(image);
+  button.addEventListener("click", () => zoomGalleryImage(button, label, url));
+  figure.append(button, caption);
+  coverGalleryImages.append(figure);
+}
+
+function appendGalleryMetadata(metadata) {
+  if (!metadata) return;
+  const entries = Object.entries(metadata.base_info || {}).filter(([label]) =>
+    !metadata.series || !["系列", "シリーズ", "Series"].includes(label));
+  if (metadata.series) entries.unshift(["系列", metadata.series]);
+  if (!entries.length && !metadata.title && !metadata.text_data) return;
+  const details = document.createElement("section");
+  details.className = "cover-gallery-details";
+  if (metadata.title) {
+    const title = document.createElement("h3");
+    title.className = "cover-gallery-title";
+    title.textContent = metadata.title;
+    details.append(title);
+  }
+  if (entries.length) {
+    const list = document.createElement("dl");
+    for (const [label, value] of entries) {
+      const term = document.createElement("dt");
+      term.textContent = label;
+      const definition = document.createElement("dd");
+      definition.textContent = Array.isArray(value) ? value.join("、") : value && typeof value === "object" ? JSON.stringify(value) : String(value ?? "");
+      list.append(term, definition);
+    }
+    details.append(list);
+  }
+  if (metadata.text_data) {
+    const title = document.createElement("h3");
+    title.textContent = "影片简介";
+    const synopsis = document.createElement("p");
+    synopsis.textContent = metadata.text_data;
+    details.append(title, synopsis);
+  }
+  coverGalleryImages.append(details);
+}
+
+async function openCoverViewer(code, url, subscriptionId) {
+  hideCoverPreview();
+  const load = ++coverGalleryLoad;
+  $("#cover-title").textContent = code;
+  coverGalleryScroll = 0;
+  showCoverGallery();
+  coverGalleryImages.replaceChildren();
+  appendGalleryImage("封面", url, false);
+  coverGalleryMessage.textContent = "正在加载截图…";
+  coverGalleryMessage.hidden = false;
+  coverDialog.showModal();
+  coverGallery.scrollTop = 0;
+  coverGallery.focus({ preventScroll: true });
+  if (window.matchMedia("(pointer: coarse)").matches && document.fullscreenEnabled && coverViewer.requestFullscreen) {
+    coverViewer.requestFullscreen().then(() => {
+      if (!coverDialog.open && document.fullscreenElement === coverViewer) return document.exitFullscreen();
+    }).catch(() => {});
+  }
+  try {
+    const { screenshots, metadata } = await api(`/api/subscriptions/${encodeURIComponent(subscriptionId)}/videos/${encodeURIComponent(code)}/gallery`);
+    if (!coverDialog.open || load !== coverGalleryLoad) return;
+    appendGalleryMetadata(metadata);
+    for (const screenshot of screenshots) {
+      appendGalleryImage(`截图 ${screenshot.position}`, appUrl(screenshot.url), true);
+    }
+    coverGalleryMessage.textContent = "暂无已保存的截图。";
+    coverGalleryMessage.hidden = screenshots.length > 0;
+  } catch (error) {
+    if (!coverDialog.open || load !== coverGalleryLoad) return;
+    coverGalleryMessage.textContent = `读取截图失败：${error.message}`;
+  }
+}
+
+$("#cover-close").addEventListener("click", () => coverDialog.close());
+coverBack.addEventListener("click", showCoverGallery);
+coverDialog.addEventListener("cancel", (event) => {
+  if (!coverStage.hidden) {
+    event.preventDefault();
+    showCoverGallery();
+  }
+});
+coverDialog.addEventListener("click", (event) => {
+  if (event.target === coverDialog) coverDialog.close();
+});
+coverDialog.addEventListener("close", () => {
+  coverGalleryLoad++;
+  if (document.fullscreenElement === coverViewer) document.exitFullscreen().catch(() => {});
+  resetCoverZoom();
+  coverZoomTrigger = null;
+  coverGalleryImages.replaceChildren();
+});
+coverLarge.addEventListener("load", () => {
+  if (!coverDialog.open || coverStage.hidden) return;
+  coverLarge.hidden = false;
+  coverMessage.hidden = true;
+  applyCoverTransform();
+});
+coverLarge.addEventListener("error", () => {
+  if (!coverDialog.open || coverStage.hidden) return;
+  coverLarge.hidden = true;
+  coverMessage.textContent = "图片加载失败。";
+  coverMessage.hidden = false;
+});
+coverStage.addEventListener("pointerdown", (event) => {
+  if (coverLarge.hidden || event.button !== 0 || coverPointers.size >= 2) return;
+  coverPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+  coverStage.setPointerCapture(event.pointerId);
+});
+coverStage.addEventListener("pointermove", (event) => {
+  if (!coverPointers.has(event.pointerId)) return;
+  const before = [...coverPointers.values()];
+  coverPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+  const after = [...coverPointers.values()];
+  if (after.length === 2) {
+    const distance = ([a, b]) => Math.hypot(a.x - b.x, a.y - b.y);
+    const priorDistance = distance(before);
+    if (priorDistance < 1) return;
+    const nextZoom = Math.min(5, Math.max(1, coverZoom * distance(after) / priorDistance));
+    const rect = coverStage.getBoundingClientRect();
+    for (const axis of ["x", "y"]) {
+      const center = axis === "x" ? rect.left + rect.width / 2 : rect.top + rect.height / 2;
+      const previous = (before[0][axis] + before[1][axis]) / 2 - center;
+      const next = (after[0][axis] + after[1][axis]) / 2 - center;
+      coverOffset[axis] = next - (previous - coverOffset[axis]) * nextZoom / coverZoom;
+    }
+    coverZoom = nextZoom;
+  } else if (coverZoom > 1) {
+    coverOffset.x += after[0].x - before[0].x;
+    coverOffset.y += after[0].y - before[0].y;
+  }
+  applyCoverTransform();
+});
+for (const event of ["pointerup", "pointercancel", "lostpointercapture"]) {
+  coverStage.addEventListener(event, ({ pointerId }) => coverPointers.delete(pointerId));
+}
+window.addEventListener("resize", applyCoverTransform);
 window.addEventListener("scroll", hideCoverPreview, true);
 document.addEventListener("keydown", (event) => { if (event.key === "Escape") hideCoverPreview(); });
 
@@ -299,10 +529,10 @@ function updateVideoRefreshButton(button, state) {
     text.textContent = label;
     button.append(text);
   }
-  button.title = pending ? (state.message || "正在核对 ID、刷新信息及检查字幕，请稍候。")
+  button.title = pending ? (state.message || "正在核对 ID、刷新信息、检查字幕和图片，请稍候。")
     : success ? state.message
     : failed ? `${state.message}\n点击重试修复此视频数据。`
-    : "修复此视频数据：先核对并修正 M-Team ID，再刷新信息和 MediaInfo；中文字幕且缺少字幕时自动下载。";
+    : "修复此视频数据：核对 M-Team ID、刷新影片信息和 MediaInfo、补齐缺少的中文字幕，并重新下载封面和截图。";
   button.setAttribute("aria-label", `${button.dataset.filename}：${label || "修复此视频数据"}${failed ? `，${state.message}` : ""}`);
 }
 
@@ -473,7 +703,8 @@ function renderPage() {
   const summary = $("#subscription-summary");
   summary.replaceChildren();
   if (selected) {
-    const details = [["搜索词", [selected.performer, selected.keywords].filter(Boolean).join(" ")], ["飞牛目录", selected.download_dir], ["下载器路径", mapDownloaderPath(selected.download_dir)], ["自动洗版", selected.wash_enabled ? "开启" : "关闭"]];
+    const downloadPath = mapDownloaderPath(selected.download_dir).replace(/\/$/, "");
+    const details = [["搜索词", [selected.performer, selected.keywords].filter(Boolean).join(" ")], ["飞牛目录", selected.download_dir], ["下载器路径", `${downloadPath}/〈番号〉`], ["自动洗版", selected.wash_enabled ? "开启" : "关闭"]];
     for (const [labelText, valueText] of details) {
       const item = document.createElement("div");
       item.className = "detail-item";
@@ -505,6 +736,74 @@ function showSubscription(id) {
   renderSubscriptions();
 }
 
+async function openVideoNfo(subscriptionId, code, file) {
+  const request = ++nfoLoad;
+  const viewer = $("#nfo-dialog");
+  const title = $("#nfo-title");
+  const message = $("#nfo-message");
+  const content = $("#nfo-content");
+  title.textContent = file.name;
+  message.textContent = "正在读取 NFO…";
+  message.hidden = false;
+  content.textContent = "";
+  content.hidden = true;
+  if (!viewer.open) viewer.showModal();
+  try {
+    const result = await api(`/api/subscriptions/${encodeURIComponent(subscriptionId)}/videos/${encodeURIComponent(code)}/nfo`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: file.path })
+    });
+    if (!viewer.open || request !== nfoLoad) return;
+    title.textContent = result.name;
+    content.textContent = result.content;
+    content.hidden = !result.content;
+    message.textContent = "NFO 文件为空。";
+    message.hidden = Boolean(result.content);
+  } catch (error) {
+    if (viewer.open && request === nfoLoad) message.textContent = error.message;
+  }
+}
+
+function galleryThumbnail(item, subscriptionId) {
+  const poster = item.poster_image ? appUrl(item.poster_image) : "";
+  const localCover = item.cover_image ? appUrl(item.cover_image) : "";
+  const remoteCover = sortCoverFiles(item.files || []).find((file) => /^https?:\/\//i.test(file.cover_url || ""))?.cover_url || "";
+  const preview = item.screenshot_thumbnail ? appUrl(item.screenshot_thumbnail) : "";
+  const covers = [localCover, remoteCover].filter(Boolean);
+  const thumbnails = [...new Set([poster, ...covers, preview].filter(Boolean))];
+  const failed = new Set();
+  let displayed = "";
+  const thumbnail = document.createElement("button");
+  thumbnail.type = "button";
+  thumbnail.className = "cover-thumbnail";
+  thumbnail.setAttribute("aria-label", `查看 ${item.code} 封面和截图`);
+  const image = document.createElement("img");
+  image.alt = "";
+  image.loading = "lazy";
+  image.decoding = "async";
+  image.referrerPolicy = "no-referrer";
+  function showNextThumbnail() {
+    displayed = thumbnails.shift() || "";
+    thumbnail.classList.toggle("is-poster", Boolean(displayed && displayed === poster));
+    if (displayed) {
+      image.src = displayed;
+      thumbnail.append(image);
+    } else {
+      image.remove();
+      thumbnail.classList.add("cover-thumbnail-unavailable");
+    }
+  }
+  image.addEventListener("error", () => {
+    failed.add(displayed);
+    showNextThumbnail();
+  });
+  showNextThumbnail();
+  thumbnail.addEventListener("click", () => {
+    const coverUrl = [...covers, poster].find((url) => url && !failed.has(url)) || "";
+    openCoverViewer(item.code, coverUrl, subscriptionId);
+  });
+  return thumbnail;
+}
+
 function renderExistingVideos(errorMessage = "") {
   hideCoverPreview();
   const body = $("#existing-body");
@@ -514,7 +813,7 @@ function renderExistingVideos(errorMessage = "") {
     const row = document.createElement("tr");
     row.className = "existing-empty-row";
     const cell = document.createElement("td");
-    cell.colSpan = 3;
+    cell.colSpan = 4;
     cell.className = "empty";
     cell.textContent = errorMessage || (existingVideosLoading ? "正在加载本地影片…" : existingVideoCount > 0 ? `已扫描到 ${existingVideoCount} 个视频文件，但未能从文件名或所在文件夹识别番号。` : "暂未找到本地视频。");
     row.append(cell);
@@ -527,7 +826,7 @@ function renderExistingVideos(errorMessage = "") {
     const codeCell = document.createElement("td");
     codeCell.textContent = item.code || "";
     codeCell.className = "number-group-cell";
-    attachCoverPreview(codeCell, item.code, item.files || [], selectedSubscriptionId);
+    attachCoverPreview(codeCell, item.code, item.files || [], selectedSubscriptionId, item.cover_image);
     if ((item.files || []).length > 1) {
       const count = document.createElement("span");
       count.className = "number-file-count";
@@ -535,6 +834,15 @@ function renderExistingVideos(errorMessage = "") {
       codeCell.append(count);
     }
     row.append(codeCell);
+
+    const coverCell = document.createElement("td");
+    coverCell.className = "cover-cell";
+    if (item.poster_image || item.cover_image || item.has_screenshots) {
+      coverCell.append(galleryThumbnail(item, selectedSubscriptionId));
+    } else {
+      coverCell.textContent = "—";
+    }
+    row.append(coverCell);
 
     const versionsCell = document.createElement("td");
     versionsCell.className = "version-list-cell";
@@ -570,7 +878,7 @@ function renderExistingVideos(errorMessage = "") {
       const activeRepair = repairJobs.find((job) => job.subscription_id === subscriptionId && ["queued", "running"].includes(job.state) && (!job.path || job.path === file.path));
       if (activeRepair) {
         const phaseLabel = activeRepair.state === "queued" ? "排队中" : ({
-          scan: "扫描视频", matching: "核对 ID", details: "刷新信息", subtitles: "检查字幕", waiting_retry: "等待限流结束"
+          scan: "扫描视频", matching: "核对 ID", details: "刷新信息", subtitles: "检查字幕", images: "下载图片", waiting_retry: "等待限流结束"
         })[activeRepair.phase] || "修复中";
         videoRefreshStates.set(refresh.dataset.refreshKey, {
           state: "pending", startedAt: Date.parse(activeRepair.started_at || activeRepair.queued_at) || Date.now(),
@@ -581,13 +889,23 @@ function renderExistingVideos(errorMessage = "") {
       refresh.addEventListener("click", () => refreshVideoInformation(subscriptionId, item.code, file));
       versionRow.append(refresh);
       const subtitlePaths = file.subtitle_paths || [];
-      if (subtitlePaths.length) {
-        const marker = document.createElement("span");
-        marker.className = "subtitle-marker";
-        marker.textContent = "CC";
-        marker.title = `本地字幕路径：\n${subtitlePaths.join("\n")}`;
-        marker.setAttribute("aria-label", `存在 ${subtitlePaths.length} 个本地字幕文件`);
-        versionRow.append(marker);
+      if (subtitlePaths.length || file.has_nfo) {
+        const markers = document.createElement("span");
+        markers.className = "version-markers";
+        if (subtitlePaths.length) {
+          const marker = document.createElement("span");
+          marker.className = "subtitle-marker";
+          marker.textContent = "CC";
+          marker.title = `本地字幕路径：\n${subtitlePaths.join("\n")}`;
+          marker.setAttribute("aria-label", `存在 ${subtitlePaths.length} 个本地字幕文件`);
+          markers.append(marker);
+        }
+        if (file.has_nfo) {
+          const marker = makeButton("NFO", "nfo-marker", () => openVideoNfo(subscriptionId, item.code, file), "查看 NFO 内容");
+          marker.setAttribute("aria-label", `查看 ${file.name} 的 NFO`);
+          markers.append(marker);
+        }
+        versionRow.append(markers);
       }
       versionsCell.append(versionRow);
 
@@ -709,8 +1027,27 @@ function renderLogs(entries) {
     const category = document.createElement("span");
     category.className = "log-category";
     category.textContent = logCategory(entry.event);
-    const text = document.createElement("span");
-    text.textContent = formattedLogEntry(entry);
+    let text;
+    if (entry.event === "debug_http_response" && entry.message.includes("\n")) {
+      const newline = entry.message.indexOf("\n");
+      text = document.createElement("details");
+      text.className = "log-response";
+      text.open = expandedResponseLogs.has(entry.id);
+      text.addEventListener("toggle", () => {
+        if (text.open) expandedResponseLogs.add(entry.id);
+        else expandedResponseLogs.delete(entry.id);
+      });
+      const summary = document.createElement("summary");
+      summary.textContent = entry.message.slice(0, newline);
+      const body = document.createElement("pre");
+      body.textContent = entry.message.slice(newline + 1);
+      const copy = makeButton("复制 JSON", "text-button log-copy-json",
+        () => copyLogText(body.textContent, "接口响应 JSON 已复制"), "复制这条接口响应的 JSON");
+      text.append(summary, copy, body);
+    } else {
+      text = document.createElement("span");
+      text.textContent = formattedLogEntry(entry);
+    }
     message.append(category, text);
     row.append(time, source, message);
     list.append(row);
@@ -728,11 +1065,16 @@ const LOG_EVENT_LABELS = {
   mteam_search_started: "M-Team 搜索", mteam_search_completed: "M-Team 搜索",
   retry_waiting: "限流等待", waiting_retry: "限流等待", retry_resuming: "继续检查", rate_limited: "限流",
   debug_decision: "检查依据", debug_performance: "性能统计", release: "资源处理", duplicate_task: "已有任务",
+  debug_http_response: "接口响应",
   subtitle_download_completed: "字幕", subtitle_download_failed: "字幕",
   subtitle_not_found: "字幕", subtitle_directory_unavailable: "字幕",
   subtitle_id_missing: "字幕", subtitle_metadata_failed: "字幕",
   subtitle_collection_completed: "字幕汇总", subtitle_collection_failed: "字幕汇总",
   local_video_info_refreshed: "本地视频", mteam_id_backfill: "M-Team ID",
+  local_cover_sync: "封面", local_cover_cleanup_failed: "封面",
+  local_screenshot_sync: "截图", local_screenshot_cleanup_failed: "截图",
+  local_nfo_sync: "NFO",
+  dmm_translation_failed: "翻译",
   mteam_id_backfill_started: "开始补全", mteam_id_backfill_progress: "补全进度",
   mteam_id_backfill_completed: "补全完成", mteam_id_backfill_failed: "补全失败",
   mteam_id_backfill_corrected: "ID 修正",
@@ -750,9 +1092,14 @@ function logEventLabel(event) {
 }
 
 function logCategory(event) {
+  if (event === "debug_http_response") return "接口响应";
   if (/^repair_/.test(event)) return "修复";
   if (/^debug_/.test(event)) return "排查";
   if (/^subtitle_/.test(event)) return "字幕";
+  if (/^local_cover_/.test(event)) return "封面";
+  if (/^local_screenshot_/.test(event)) return "截图";
+  if (event === "local_nfo_sync") return "NFO";
+  if (event === "dmm_translation_failed") return "翻译";
   if (/^local_(scan|video|wash)/.test(event) || event === "orphan_sidecars_cleaned") return "本地";
   if (/^mteam_/.test(event)) return "M-Team";
   if (/^downloader_/.test(event) || /^existing_task_/.test(event) || /^duplicate_task/.test(event)) return "下载器";
@@ -867,24 +1214,39 @@ function logLine(entry) {
 async function copyLogRound(separatorId, roundId, visibleEntries) {
   const selectedRound = selectLogRound(visibleEntries, separatorId, roundId);
   const roundEntries = compactLogStages(uniqueRoundSeparators(selectedRound));
-  const text = roundEntries.map(logLine).join("\n");
+  await copyLogText(roundEntries.map(logLine).join("\n"), "本轮日志已复制");
+}
+
+async function copyLogText(text, successMessage) {
   try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-    } else {
-      const input = document.createElement("textarea");
-      input.value = text;
-      input.style.position = "fixed";
-      input.style.opacity = "0";
-      document.body.append(input);
-      input.select();
-      const copied = document.execCommand("copy");
-      input.remove();
-      if (!copied) throw new Error("浏览器未允许访问剪贴板");
-    }
-    toast("本轮日志已复制");
+    await writeClipboardText(text);
+    toast(successMessage);
   } catch (error) {
     toast(`复制日志失败：${error.message}`, true);
+  }
+}
+
+async function writeClipboardText(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // fnOS may restrict the clipboard API inside the app iframe.
+    }
+  }
+  const input = document.createElement("textarea");
+  input.value = text;
+  input.readOnly = true;
+  input.style.position = "fixed";
+  input.style.opacity = "0";
+  document.body.append(input);
+  try {
+    input.select();
+    input.setSelectionRange(0, input.value.length);
+    if (!document.execCommand("copy")) throw new Error("浏览器未允许访问剪贴板");
+  } finally {
+    input.remove();
   }
 }
 
@@ -1062,7 +1424,7 @@ async function refresh() {
     renderStatus(status);
     if (nextActivity) renderActivity();
     renderDataRepairStatus(repairs);
-    if (selectedSubscriptionId && ["completed", "failed"].includes(status.state) && ["running", "queued"].includes(lastStatusState)) {
+    if (selectedSubscriptionId && ["completed", "failed"].includes(status.state) && ["running", "queued", "waiting_retry"].includes(lastStatusState)) {
       loadExistingVideos(selectedSubscriptionId);
     }
     lastStatusState = status.state;
@@ -1093,7 +1455,7 @@ function renderDataRepairStatus(jobs) {
     renderStatus(currentStatus);
   }
   const phaseLabel = (job) => job.state === "queued" ? "排队中" : ({
-    scan: "扫描视频", matching: "核对 ID", details: "刷新信息", subtitles: "检查字幕", waiting_retry: "等待限流结束"
+    scan: "扫描视频", archive: "归档影片", matching: "核对 ID", details: "刷新信息", subtitles: "检查字幕", images: "下载图片", waiting_retry: "等待限流结束"
   })[job.phase] || "修复中";
   button.disabled = active.length > 0;
   const current = active[0];
@@ -1105,7 +1467,7 @@ function renderDataRepairStatus(jobs) {
     button.title = current.message;
   } else {
     button.textContent = "修复数据";
-    button.title = "先逐文件核对并修正 M-Team ID，再刷新影片信息和 MediaInfo；中文字幕缺少配套字幕时下载。已有字幕保留，缺 ID 或匹配冲突时跳过并记录原因。";
+    button.title = "将当前订阅已有影片归档到各自番号目录，核对 M-Team ID、刷新影片信息和 MediaInfo、补齐缺少的中文字幕，并在视频旁保存封面、海报和截图。";
   }
   button.setAttribute("aria-live", "polite");
   for (const group of existingVideos) {
@@ -1129,7 +1491,8 @@ function renderDataRepairStatus(jobs) {
         state: failed ? "error" : "success", message: outcome?.message || job.message, completedAt: Date.now()
       });
     }
-    toast(job.message, job.state === "failed" || Number(job.summary?.failed) > 0);
+    toast(job.message, job.state === "failed" || Number(job.summary?.failed) > 0
+      || Number(job.summary?.image_failed) > 0 || Number(job.summary?.archive_failed) > 0);
     if (selectedSubscriptionId === job.subscription_id) loadExistingVideos(job.subscription_id);
   }
   if (active.length || previouslyActive) renderExistingVideos();
@@ -1226,6 +1589,17 @@ async function runScan(subscriptionId = "") {
   }
 }
 
+function renderAzureSettings(settings) {
+  const configured = Boolean(settings.azure_key_configured);
+  const input = $("#azure-key");
+  input.value = "";
+  input.placeholder = configured ? "已保存，留空保留" : "粘贴 Azure 密钥";
+  $("#azure-region").value = settings.azure_region || "";
+  $("#azure-key-state").textContent = configured ? "密钥已保存" : "未配置";
+  $("#azure-key-state").dataset.state = configured ? "ok" : "";
+  $("#clear-azure-key").disabled = !configured;
+}
+
 async function loadSettings() {
   const settings = await api("/api/settings");
   const client = settings.downloader;
@@ -1239,6 +1613,7 @@ async function loadSettings() {
   $("#local-multi-disk-wash").checked = Boolean(settings.local_multi_disk_wash);
   $("#cleanup-orphan-sidecars").checked = Boolean(settings.cleanup_orphan_sidecars);
   $("#subtitle-collection-dir").value = settings.subtitle_collection_dir || "";
+  renderAzureSettings(settings);
   $("#debug-mode").checked = Boolean(settings.debug_mode);
   renderPathMappings();
   $("#downloader-state").textContent = client.url ? "已配置" : "未配置";
@@ -1306,7 +1681,7 @@ function renderPathMappings() {
   });
 }
 
-async function saveSettings(clearToken = false) {
+async function saveSettings({ clearToken = false, clearAzureKey = false } = {}) {
   const buttons = [$("#save-settings"), $("#save-settings-footer")].filter(Boolean);
   for (const button of buttons) button.disabled = true;
   const payload = {
@@ -1320,10 +1695,13 @@ async function saveSettings(clearToken = false) {
     local_multi_disk_wash: $("#local-multi-disk-wash").checked,
     cleanup_orphan_sidecars: $("#cleanup-orphan-sidecars").checked,
     subtitle_collection_dir: $("#subtitle-collection-dir").value.trim(),
+    azure_region: $("#azure-region").value.trim(),
+    clear_azure_key: clearAzureKey,
     debug_mode: $("#debug-mode").checked,
     clear_mteam_token: clearToken
   };
   if ($("#mteam-token").value) payload.mteam_token = $("#mteam-token").value;
+  if ($("#azure-key").value) payload.azure_key = $("#azure-key").value;
   try {
     const settings = await api("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     $("#mteam-token").value = "";
@@ -1335,11 +1713,12 @@ async function saveSettings(clearToken = false) {
     $("#local-multi-disk-wash").checked = Boolean(settings.local_multi_disk_wash);
     $("#cleanup-orphan-sidecars").checked = Boolean(settings.cleanup_orphan_sidecars);
     $("#subtitle-collection-dir").value = settings.subtitle_collection_dir || "";
+    renderAzureSettings(settings);
     $("#debug-mode").checked = Boolean(settings.debug_mode);
     $("#mteam-request-interval").value = settings.mteam_request_interval_seconds;
     renderPathMappings();
     renderPage();
-    toast(clearToken ? "令牌已清除" : "设置已保存");
+    toast(clearToken ? "令牌已清除" : clearAzureKey ? "Azure 密钥已清除" : "设置已保存");
   } catch (error) { toast(error.message, true); }
   finally { for (const button of buttons) button.disabled = false; }
 }
@@ -1456,7 +1835,8 @@ $("#add-path-mapping").addEventListener("click", () => {
   renderPathMappings();
   $("#path-mapping-list input:last-of-type")?.focus();
 });
-$("#clear-token").addEventListener("click", () => saveSettings(true));
+$("#clear-token").addEventListener("click", () => saveSettings({ clearToken: true }));
+$("#clear-azure-key").addEventListener("click", () => saveSettings({ clearAzureKey: true }));
 $("#test-mteam").addEventListener("click", () => testConnection("/api/mteam/test", "#mteam-state"));
 $("#test-downloader").addEventListener("click", () => testConnection("/api/downloader/test", "#downloader-state"));
 $("#toggle-token").addEventListener("click", (event) => {

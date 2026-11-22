@@ -5,6 +5,7 @@ import datetime
 import copy
 import errno
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -13,7 +14,9 @@ import re
 import shutil
 import signal
 import sqlite3
+import stat
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -24,9 +27,16 @@ import urllib.request
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from functools import wraps
 from pathlib import Path
+
+if __package__:
+    from . import azure_translator, cover_images, http_debug
+else:
+    import azure_translator
+    import cover_images
+    import http_debug
 
 try:
     import fcntl
@@ -59,9 +69,12 @@ MTEAM_API_BASE = "https://api.m-team.cc/api"
 MTEAM_API_HOST = "api.m-team.cc"
 MTEAM_DOWNLOAD_DOMAINS = ("halomt.com", "manfuz.co")
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+QB_SUBSCRIPTION_TAG = "AV订阅-馒头"
 MTEAM_MIN_REQUEST_INTERVAL = 5.0
 MTEAM_DEFAULT_COOLDOWN = 900
 MAX_SUBTITLE_BYTES = 32 * 1024 * 1024
+MAX_NFO_BYTES = 1024 * 1024
+DMM_EMPTY_GALLERY_TTL_SECONDS = 24 * 60 * 60
 SUBTITLE_CHECK_VERSION = 3
 LOCAL_MTEAM_RANK_VERSION = 3
 MTEAM_RANK_VERSION = 2
@@ -400,6 +413,18 @@ def write_json(path, value):
         temporary.unlink(missing_ok=True)
 
 
+def ensure_video_columns(connection, table, definitions):
+    columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+    if all(name in columns for name, _declaration in definitions):
+        return
+    with connection:
+        connection.execute("BEGIN IMMEDIATE")
+        columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+        for name, declaration in definitions:
+            if name not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+
 def connect_video_database():
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     os.chmod(DATA_ROOT, 0o700)
@@ -426,18 +451,64 @@ def connect_video_database():
             PRIMARY KEY (subscription_id, code, path),
             FOREIGN KEY (subscription_id, code) REFERENCES local_videos(subscription_id, code) ON DELETE CASCADE
         );
+        CREATE INDEX IF NOT EXISTS local_video_files_by_code ON local_video_files(code);
+        CREATE TABLE IF NOT EXISTS local_video_covers (
+            directory TEXT NOT NULL,
+            code TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            dmm_code TEXT NOT NULL DEFAULT '',
+            poster_filename TEXT NOT NULL DEFAULT '',
+            poster_cover_mtime_ns INTEGER NOT NULL DEFAULT 0,
+            poster_crop_version INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (directory, code)
+        );
+        CREATE TABLE IF NOT EXISTS local_video_screenshots (
+            directory TEXT NOT NULL,
+            code TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            source_url TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            large_checked INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (directory, code, position)
+        );
+        CREATE TABLE IF NOT EXISTS dmm_screenshot_catalog (
+            dmm_code TEXT PRIMARY KEY,
+            urls_json TEXT NOT NULL,
+            checked_at REAL NOT NULL,
+            base_info_json TEXT,
+            series TEXT NOT NULL DEFAULT '',
+            text_data TEXT NOT NULL DEFAULT '',
+            title TEXT,
+            base_info_zh_json TEXT,
+            series_zh TEXT,
+            text_data_zh TEXT,
+            title_zh TEXT,
+            hashtag_translation_version INTEGER NOT NULL DEFAULT 0
+        );
     """)
-    file_columns = {row[1] for row in connection.execute("PRAGMA table_info(local_video_files)")}
-    for name, declaration in (
+    ensure_video_columns(connection, "local_video_files", (
         ("mteam_id", "TEXT NOT NULL DEFAULT ''"),
         ("rank_json", "TEXT NOT NULL DEFAULT '[0,0,0]'"),
         ("rank_source", "TEXT NOT NULL DEFAULT ''"),
         ("rank_title", "TEXT NOT NULL DEFAULT ''"),
         ("subtitle", "TEXT NOT NULL DEFAULT ''"),
         ("cover_url", "TEXT NOT NULL DEFAULT ''"),
-    ):
-        if name not in file_columns:
-            connection.execute(f"ALTER TABLE local_video_files ADD COLUMN {name} {declaration}")
+    ))
+    ensure_video_columns(connection, "local_video_screenshots", (("large_checked", "INTEGER NOT NULL DEFAULT 0"),))
+    ensure_video_columns(connection, "local_video_covers", (
+        ("dmm_code", "TEXT NOT NULL DEFAULT ''"),
+        ("poster_filename", "TEXT NOT NULL DEFAULT ''"),
+        ("poster_cover_mtime_ns", "INTEGER NOT NULL DEFAULT 0"),
+        ("poster_crop_version", "INTEGER NOT NULL DEFAULT 0"),
+    ))
+    ensure_video_columns(connection, "dmm_screenshot_catalog", (
+        ("base_info_json", "TEXT"), ("series", "TEXT NOT NULL DEFAULT ''"), ("text_data", "TEXT NOT NULL DEFAULT ''"),
+        ("base_info_zh_json", "TEXT"), ("series_zh", "TEXT"), ("text_data_zh", "TEXT"),
+        ("title", "TEXT"), ("title_zh", "TEXT"),
+        ("hashtag_translation_version", "INTEGER NOT NULL DEFAULT 0"),
+    ))
     os.chmod(LOCAL_VIDEO_DATABASE, 0o600)
     return connection
 
@@ -528,7 +599,8 @@ def delete_video_database_subscription(subscription_id):
 
 def log_event(message, level="info", event="status", subscription=""):
     round_id = getattr(MTEAM_POLL_CACHE, "round_id", "")
-    entry = {"time": now_iso(), "level": level, "event": event, "subscription": subscription, "message": str(message)[:2000], "round_id": round_id}
+    limit = http_debug.MAX_MESSAGE if event == "debug_http_response" else 2000
+    entry = {"time": now_iso(), "level": level, "event": event, "subscription": subscription, "message": str(message)[:limit], "round_id": round_id}
     connection = connect_log_database()
     try:
         with connection:
@@ -544,6 +616,46 @@ def log_event(message, level="info", event="status", subscription=""):
 def log_debug(settings, message, subscription=""):
     if settings.get("debug_mode", False):
         log_event(message, level="debug", event="debug_decision", subscription=subscription)
+
+
+def log_http_json(service, endpoint, status, raw, *, secrets=(), code="", settings=None, subscription=None):
+    if not raw:
+        return
+    prefix = raw[:128]
+    if isinstance(prefix, bytes):
+        prefix = prefix.decode("utf-8-sig", errors="replace")
+    if not prefix.lstrip().startswith(("{", "[")):
+        return
+    try:
+        settings = get_settings() if settings is None else settings
+        if not settings.get("debug_mode"):
+            return
+        endpoint = endpoint.split("?", 1)[0]
+        protected = (settings.get("mteam_token"), settings.get("azure_key"), settings.get("downloader", {}).get("password"), *secrets)
+        preview = http_debug.response_preview(raw, endpoint, protected, normalize_code, code)
+        if preview is None:
+            return
+        number, body = preview
+        title = f"{service} {endpoint} · HTTP {status}" + (f" · {number}" if number else "")
+        maximum = http_debug.MAX_MESSAGE - len(title) - 1
+        suffix = "\n…（响应过长，已截断）"
+        if len(body) > maximum:
+            body = body[:maximum - len(suffix)] + suffix
+        log_event(title + "\n" + body, level="debug", event="debug_http_response",
+                  subscription=getattr(MTEAM_POLL_CACHE, "performer", "") if subscription is None else subscription)
+    except (AppError, OSError, ValueError, RecursionError, sqlite3.Error):
+        pass
+
+
+def log_http_error_json(service, endpoint, error, *, secrets=()):
+    if error.fp is None:
+        return
+    try:
+        settings = get_settings()
+        if settings.get("debug_mode"):
+            log_http_json(service, endpoint, error.code, error.read(1024 * 1024), secrets=secrets, settings=settings)
+    except (AppError, OSError, ValueError, http.client.HTTPException):
+        pass
 
 
 def log_poll_separator(phase, trigger, subscription_id=""):
@@ -685,7 +797,8 @@ def get_settings():
     downloader = {**DEFAULT_SETTINGS["downloader"], **settings.get("downloader", {})}
     # Older releases allowed Transmission; normalize persisted settings on upgrade.
     downloader["type"] = "qbittorrent"
-    return {**DEFAULT_SETTINGS, **settings, "downloader": downloader}
+    settings.pop("cover_dir", None)
+    return {**DEFAULT_SETTINGS, "azure_key": "", "azure_region": "", **settings, "downloader": downloader}
 
 
 def normalize_path_mappings(value):
@@ -736,6 +849,13 @@ def save_settings(payload):
         token = settings.get("mteam_token", "")
     if not isinstance(token, str) or len(token.strip()) > 4096 or any(ord(ch) < 32 or ord(ch) == 127 for ch in token):
         raise AppError("M-Team 令牌格式无效。")
+    azure_key = payload.get("azure_key", "")
+    if not isinstance(azure_key, str) or (azure_key.strip() and not re.fullmatch(r"[!-~]{1,512}", azure_key.strip())):
+        raise AppError("Azure 密钥格式无效。")
+    azure_key = "" if payload.get("clear_azure_key") else (azure_key.strip() or settings["azure_key"])
+    azure_region = payload.get("azure_region", settings["azure_region"])
+    if not isinstance(azure_region, str) or (azure_region.strip() and not re.fullmatch(r"[A-Za-z0-9-]{1,64}", azure_region.strip())):
+        raise AppError("Azure 区域格式无效。")
     downloader = payload.get("downloader", settings["downloader"])
     if not isinstance(downloader, dict):
         raise AppError("下载器设置无效。")
@@ -766,6 +886,8 @@ def save_settings(payload):
             raise AppError("字幕汇总目录不能为文件系统根目录。")
     result = {
         "mteam_token": token.strip(),
+        "azure_key": azure_key,
+        "azure_region": azure_region.strip().lower(),
         "downloader": {
             "type": kind,
             "url": url,
@@ -790,6 +912,8 @@ def public_settings(settings=None):
     client = settings["downloader"]
     return {
         "mteam_token_configured": bool(settings.get("mteam_token")),
+        "azure_key_configured": bool(settings.get("azure_key")),
+        "azure_region": settings.get("azure_region", ""),
         "downloader": {"type": client.get("type", "qbittorrent"), "url": client.get("url", ""), "username": client.get("username", ""), "password_configured": bool(client.get("password")), "path_mappings": client.get("path_mappings", [])},
         "poll_interval_minutes": settings.get("poll_interval_minutes", 60),
         "mteam_request_interval_seconds": settings.get("mteam_request_interval_seconds", MTEAM_MIN_REQUEST_INTERVAL),
@@ -808,10 +932,24 @@ def normalize_code(value):
     special = FC2_CODE_RE.search(text)
     if special:
         return f"{special.group(1).upper()}-{special.group(2).upper()}-{special.group(3)}"
-    match = CODE_RE.search(text)
-    if not match or not any(char.isalpha() for char in match.group(1)):
-        return ""
-    return f"{match.group(1).upper()}-{match.group(2)}"
+    for match in CODE_RE.finditer(text):
+        prefix, number = match.groups()
+        if not any(char.isalpha() for char in prefix) or re.fullmatch(r"S\d{1,2}", prefix, re.IGNORECASE):
+            continue
+        if number in {"480", "576", "720", "1080", "1440", "2160", "4320"} and re.match(r"[pi](?![A-Za-z])", text[match.end():], re.IGNORECASE):
+            continue
+        return f"{prefix.upper()}-{number}"
+    return ""
+
+
+def release_download_directory(download_dir, code):
+    if not download_dir or not code or normalize_code(code) != code:
+        return download_dir
+    root = Path(download_dir)
+    directory = root / code
+    if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+        raise AppError(f"番号目录不可用：{directory}。")
+    return posixpath.join(download_dir, code) if download_dir.startswith("/") else str(directory)
 
 
 def read_video_metadata(video_path, nfo_directory_cache=None, nfo_metadata_cache=None):
@@ -833,7 +971,7 @@ def read_video_metadata(video_path, nfo_directory_cache=None, nfo_metadata_cache
         return {}
     try:
         stat = nfo.stat()
-        if stat.st_size > 1024 * 1024:
+        if stat.st_size > MAX_NFO_BYTES:
             return {}
         cache_key = str(nfo)
         signature = (stat.st_mtime_ns, stat.st_size)
@@ -1350,6 +1488,7 @@ def _mteam_request_once(path, token, payload=None, method=None, limit=MAX_RESPON
             body = response.read(limit + 1)
             metadata = {"status": response.status, "content_type": response.headers.get_content_type(), "content_disposition": response.headers.get("Content-Disposition", ""), "url": response.geturl()}
     except urllib.error.HTTPError as error:
+        log_http_error_json("M-Team", path, error, secrets=(token,))
         if error.code in (401, 403):
             raise AppError("M-Team 令牌无效或无权访问影片区。") from error
         if error.code == 429:
@@ -1364,6 +1503,7 @@ def _mteam_request_once(path, token, payload=None, method=None, limit=MAX_RESPON
         raise AppError("连接 M-Team API 失败，请检查 NAS 网络。") from error
     if len(body) > limit:
         raise AppError("M-Team 返回内容超过允许大小。")
+    log_http_json("M-Team", path, metadata["status"], body, secrets=(token,))
     return body, metadata
 
 
@@ -1673,6 +1813,8 @@ def candidate_metadata(candidate):
         "mediainfo_checked": bool(candidate.get("mediainfo_checked", bool(candidate.get("mediainfo")))),
         "cover_url": str(candidate.get("cover_url", "") or ""),
         "cover_checked": bool(candidate.get("cover_checked", bool(candidate.get("cover_url")))),
+        **({"screenshot_urls": candidate["screenshot_urls"]} if "screenshot_urls" in candidate else {}),
+        **({"dmm_code": candidate["dmm_code"]} if "dmm_code" in candidate else {}),
         "metadata_complete": bool(candidate.get("metadata_complete", False)),
         "mteam_rank_version": MTEAM_RANK_VERSION,
     }
@@ -1686,22 +1828,88 @@ def detail_mediainfo(detail):
     return str(next((detail.get(key) for key in ("mediainfo", "mediaInfo", "media_info") if detail.get(key)), "") or "")
 
 
-def detail_cover_url(detail):
-    candidates = detail.get("imageList") or []
-    if not isinstance(candidates, list):
-        candidates = []
-    description = str(detail.get("descr") or detail.get("description") or "")
-    candidates = candidates + re.findall(r"!\[[^\]]*\]\((https?://[^\s)]+)\)", description)
+def valid_detail_image_urls(candidates):
+    urls = []
+    seen = set()
     for value in candidates:
         if not isinstance(value, str):
             continue
         try:
-            parsed = urllib.parse.urlsplit(value.strip())
-            if parsed.scheme in ("https", "http") and parsed.hostname and not parsed.username and not parsed.password and not any(ord(char) < 32 for char in value):
-                return value.strip()
+            url = value.strip()
+            parsed = urllib.parse.urlsplit(url)
+            if parsed.scheme in ("https", "http") and parsed.hostname and parsed.username is None and parsed.password is None and not any(ord(char) <= 32 or ord(char) == 127 for char in url) and url not in seen:
+                urls.append(url)
+                seen.add(url)
         except ValueError:
             continue
-    return ""
+    return urls
+
+
+def detail_description_images(detail):
+    description = str(detail.get("descr") or detail.get("description") or "")
+    images = re.finditer(
+        r'!\[[^\]]*\]\((https?://[^\s)]+)\)|\[img(?:=[^\]]*)?\]\s*(https?://[^\s\[]+)\s*\[/img\]|<img\b[^>]*?\ssrc\s*=\s*["\'](https?://[^"\']+)["\']',
+        description, re.IGNORECASE,
+    )
+    return valid_detail_image_urls(next(url for url in match.groups() if url) for match in images)
+
+
+def detail_cover_url(detail):
+    value = detail.get("imageList")
+    images = valid_detail_image_urls(value) if isinstance(value, list) else []
+    if not images:
+        images = detail_description_images(detail)
+    return images[0] if images else ""
+
+
+def dmm_screenshot_base(cover_url):
+    if not isinstance(cover_url, str):
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(cover_url)
+    except ValueError:
+        return ""
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in ("pics.dmm.co.jp", "pics.dmm.com") or parsed.username is not None or parsed.password is not None:
+        return ""
+    match = re.fullmatch(r"/(digital/video|mono/movie/adult)/([a-z0-9_]+)/\2p[ls]\.(?:jpe?g|webp|png)", parsed.path, re.IGNORECASE)
+    if match is None:
+        return ""
+    collection, product = match.groups()
+    if collection.lower() == "mono/movie/adult":
+        digital_id = re.fullmatch(r"([a-z]+)(\d{1,5})", product)
+        if digital_id is None:
+            return ""
+        prefix, number = digital_id.groups()
+        product = prefix.lower() + number.zfill(5)
+    return f"https://{parsed.hostname}/digital/video/{product}/{product}"
+
+
+def detail_screenshot_urls(detail, cover):
+    def image_key(url):
+        parsed = urllib.parse.urlsplit(url)
+        return parsed.hostname, parsed.path
+
+    lists = [detail.get(key) for key in ("screenshotList", "screenshots", "sampleImageList", "imageList")]
+    images = valid_detail_image_urls(url for values in lists if isinstance(values, list) for url in values)
+    cover_key = image_key(cover)
+    base = dmm_screenshot_base(cover)
+    shots = [url for url in images if image_key(url) != cover_key and (not base or dmm_screenshot_base(url) != base)]
+    if shots:
+        return shots
+    description_images = [url for url in detail_description_images(detail) if image_key(url) != cover_key]
+    if base:
+        # General description images may be release proofs. Use numbered DMM samples for this cover.
+        return [url for url in description_images if re.fullmatch(re.escape(base) + r"-\d+\.(?:jpe?g|png|webp)(?:\?.*)?", url, re.IGNORECASE)]
+    return description_images
+
+
+def detail_image_metadata(detail):
+    cover = detail_cover_url(detail)
+    dmm_code = detail.get("dmmCode")
+    return {
+        "cover_url": cover, "cover_checked": True, "screenshot_urls": detail_screenshot_urls(detail, cover),
+        "dmm_code": dmm_code.strip() if isinstance(dmm_code, str) else "",
+    }
 
 
 def enrich_candidate_from_detail(candidate, token, detail=None):
@@ -1749,8 +1957,7 @@ def enrich_candidate_from_detail(candidate, token, detail=None):
         "metadata_complete": metadata_complete,
         "mediainfo": mediainfo,
         "mediainfo_checked": True,
-        "cover_url": detail_cover_url(detail),
-        "cover_checked": True,
+        **detail_image_metadata(detail),
         "_mteam_detail": detail,
     }
 
@@ -1822,6 +2029,7 @@ def _mteam_download_request_once(url, limit=MAX_RESPONSE_BYTES):
             body = response.read(limit + 1)
             metadata = {"status": response.status, "content_type": response.headers.get_content_type(), "content_disposition": response.headers.get("Content-Disposition", ""), "url": response.geturl()}
     except urllib.error.HTTPError as error:
+        log_http_error_json("M-Team", "/torrent/download", error)
         if error.code in (401, 403):
             raise AppError("M-Team 种子下载授权无效或已过期。") from error
         if error.code == 429:
@@ -1836,6 +2044,7 @@ def _mteam_download_request_once(url, limit=MAX_RESPONSE_BYTES):
         raise AppError("连接 M-Team 种子下载节点失败，请检查 NAS 网络。") from error
     if len(body) > limit:
         raise AppError("M-Team 种子文件超过允许大小。")
+    log_http_json("M-Team", "/torrent/download", metadata["status"], body)
     return body, metadata
 
 
@@ -2125,6 +2334,8 @@ class Downloader:
         try:
             response = urllib.request.urlopen(request, timeout=30)
         except urllib.error.HTTPError as error:
+            if error.code not in accept_status:
+                log_http_error_json("qBittorrent", path, error, secrets=(self.config.get("password"), *self.cookies.values()))
             if error.code in (401, 403) and path != "/api/v2/auth/login" and _retry_auth:
                 rejected_sid = self.cookies.get("SID", "")
                 error.close()
@@ -2148,6 +2359,7 @@ class Downloader:
             content_type = "application/json" if body is not None else None
         response = self._request(path, body, headers, method or ("POST" if body is not None else "GET"), content_type, accept_status)
         raw = read_response_body(response, 8 * 1024 * 1024)
+        log_http_json("qBittorrent", path, response.status, raw, secrets=(self.config.get("password"), *self.cookies.values()))
         if response.status >= 400:
             raise AppError(f"下载器 API 请求失败 (HTTP {response.status})。")
         try:
@@ -2184,6 +2396,7 @@ class Downloader:
         body = urllib.parse.urlencode({"username": self.config.get("username", ""), "password": self.config.get("password", "")}).encode()
         response = self._request("/api/v2/auth/login", body, method="POST", content_type="application/x-www-form-urlencoded")
         result = read_response_body(response, 1024).decode("utf-8", errors="replace")
+        log_http_json("qBittorrent", "/api/v2/auth/login", response.status, result, secrets=(self.config.get("password"),))
         cookie_headers = response.headers.get_all("Set-Cookie", [])
         if response.status != 204 and result.strip() != "Ok.":
             content_type = response.headers.get_content_type()
@@ -2206,7 +2419,10 @@ class Downloader:
     def test(self):
         self._qb_login()
         response = self._request("/api/v2/app/version", headers=self._qb_headers())
-        if not response.read(1024).strip():
+        result = response.read(1024)
+        log_http_json("qBittorrent", "/api/v2/app/version", getattr(response, "status", 200), result,
+                      secrets=(self.config.get("password"), *self.cookies.values()))
+        if not result.strip():
             raise AppError("qBittorrent version response was empty.")
         return "qBittorrent 连接成功。"
 
@@ -2219,6 +2435,7 @@ class Downloader:
         fields = [
             ("savepath", download_dir.encode()), ("paused", b"false"), ("autoTMM", b"false"),
             ("contentLayout", b"Original"), ("rename", title.encode("utf-8")),
+            ("tags", QB_SUBSCRIPTION_TAG.encode("utf-8")),
         ]
         body = bytearray()
         for name, value in fields:
@@ -2228,6 +2445,8 @@ class Downloader:
         body.extend(torrent_data + f"\r\n--{boundary}--\r\n".encode())
         response = self._request("/api/v2/torrents/add", bytes(body), headers=self._qb_headers(), method="POST", content_type=f"multipart/form-data; boundary={boundary}", accept_status=(409,))
         message = response.read(1024).decode("utf-8", errors="replace").strip()
+        log_http_json("qBittorrent", "/api/v2/torrents/add", response.status, message,
+                      secrets=(self.config.get("password"), *self.cookies.values()), code=normalize_code(title))
         if response.status == 409:
             existing = self.list_tasks([info_hash]).get(info_hash)
             if existing:
@@ -2274,7 +2493,7 @@ class Downloader:
         task_path = content_path or task_save_path
         if desired_save_path and task_save_path:
             try:
-                wrong_directory = Path(task_save_path).resolve() != Path(desired_save_path).resolve()
+                wrong_directory = posixpath.normpath(self._to_downloader_path(task_save_path)) != posixpath.normpath(desired_save_path)
             except (OSError, ValueError):
                 wrong_directory = True
         if missing_data or wrong_directory:
@@ -2301,18 +2520,25 @@ class Downloader:
             "recheck_location": task.get("recheck_location", ""),
         }
 
+    def set_location(self, info_hash, download_dir):
+        self._qb_login()
+        location = self._to_downloader_path(download_dir)
+        payload = urllib.parse.urlencode({"hashes": str(info_hash).lower(), "location": location}).encode()
+        self._request(
+            "/api/v2/torrents/setLocation", payload, headers=self._qb_headers(),
+            method="POST", content_type="application/x-www-form-urlencoded",
+        )
+        return location
+
     def recheck(self, info_hash, download_dir=""):
         if self.config.get("type") != "qbittorrent":
             raise AppError("当前下载器不支持对已有任务执行强制校验。")
-        self._qb_login()
-        location = self._to_downloader_path(download_dir) if download_dir else ""
-        if location:
-            location_payload = urllib.parse.urlencode({"hashes": str(info_hash).lower(), "location": location}).encode()
-            self._request(
-                "/api/v2/torrents/setLocation", location_payload, headers=self._qb_headers(),
-                method="POST", content_type="application/x-www-form-urlencoded",
-            )
+        if download_dir:
+            location = self.set_location(info_hash, download_dir)
             self._progress(f"已将已有种子的保存目录切换为下载器路径：{location}。", "downloader_location_changed")
+        else:
+            self._qb_login()
+            location = ""
         payload = urllib.parse.urlencode({"hashes": str(info_hash).lower()}).encode()
         self._request(
             "/api/v2/torrents/recheck", payload, headers=self._qb_headers(),
@@ -2332,6 +2558,7 @@ class Downloader:
         validation_states = {"checkingDL", "checkingUP", "checkingResumeData", "moving", "allocating"}
         return {str(item.get("hash", "")).lower(): {
             "name": item.get("name", ""), "progress": float(item.get("progress", 0)),
+            "tags": item.get("tags") or "",
             "complete": item.get("state") not in validation_states and (
                 float(item.get("progress", 0)) >= 0.999999
                 or item.get("state") in ("uploading", "stalledUP", "queuedUP", "pausedUP")
@@ -2616,20 +2843,11 @@ def get_activity():
     subscriptions = {item["id"]: item for item in list_subscriptions()}
     records = read_json(RECORDS_FILE, {})
     associations = {}
-    code_associations = {}
     for subscription_id, entries in records.items():
-        subscription = subscriptions.get(subscription_id, {})
+        subscription = subscriptions.get(subscription_id)
+        if not subscription:
+            continue
         for code, item in entries.items():
-            normalized_code = normalize_code(code)
-            if normalized_code and subscription:
-                metadata = item.get("mteam_metadata") or {}
-                code_associations.setdefault(normalized_code, {
-                    "subscription_id": subscription_id,
-                    "subscription": subscription.get("performer", "其他"),
-                    "code": normalized_code,
-                    "rank": (item.get("mteam_metadata") or {}).get("rank", [0, 0, 0]),
-                    "mteam_id": str(metadata.get("id", "")),
-                })
             for key in ("current", "pending"):
                 release = item.get(key)
                 info_hash = str(release.get("hash", "")).lower() if release else ""
@@ -2648,14 +2866,14 @@ def get_activity():
 
     output = []
     for info_hash, task in tasks.items():
+        tags = (task.get("tags") or "").split(",")
+        if QB_SUBSCRIPTION_TAG not in {tag.strip() for tag in tags}:
+            continue
         complete = bool(task.get("complete"))
         failed = bool(task.get("failed"))
         if complete and not failed:
             continue
-        associated = associations.get(info_hash)
-        if associated is None:
-            associated = code_associations.get(normalize_code(task.get("name", "")), {})
-        associated = associated or {}
+        associated = associations.get(info_hash, {})
         code = associated.get("code") or normalize_code(task.get("name", ""))
         if not code:
             continue
@@ -2714,6 +2932,7 @@ def index_subscription_videos(subscription_id, videos, records):
                         ]
                     except OSError:
                         directory_entries[path.parent] = []
+                sidecars = matching_video_sidecars(path, directory_entries[path.parent])
                 file_row = {
                     "path": str(path), "name": path.name, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
                     "mteam_id": str(per_file.get("id", "")), "rank": file_rank,
@@ -2723,7 +2942,8 @@ def index_subscription_videos(subscription_id, videos, records):
                     "mediainfo_checked": bool(per_file.get("mediainfo_checked", False)),
                     "cover_url": str(per_file.get("cover_url", "") or ""),
                     "cover_checked": bool(per_file.get("cover_checked", False)),
-                    "subtitle_paths": [str(sidecar) for sidecar in matching_video_sidecars(path, directory_entries[path.parent]) if sidecar.suffix.casefold() in SUBTITLE_EXTENSIONS],
+                    "subtitle_paths": [str(sidecar) for sidecar in sidecars if sidecar.suffix.casefold() in SUBTITLE_EXTENSIONS],
+                    "has_nfo": any(sidecar in (path.with_suffix(".nfo"), path.with_suffix(".NFO")) for sidecar in sidecars),
                 }
                 file_rows.append(file_row)
             except OSError:
@@ -2749,6 +2969,895 @@ def subtitle_display_text(subtitle, title):
     return subtitle if len(subtitle) >= 6 else (title or subtitle)
 
 
+def registered_image_path(directory, filename, *stems):
+    if any(filename == stem + extension for stem in stems for extension in cover_images.IMAGE_TYPES):
+        return directory / filename
+    return None
+
+
+def cover_file_stat(path):
+    if path is None or path.parent.is_symlink():
+        return None
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    return info if stat.S_ISREG(info.st_mode) and 0 < info.st_size <= cover_images.MAX_BYTES else None
+
+
+def indexed_video_path(path, size, mtime_ns):
+    path = Path(path)
+    try:
+        signature = path.lstat()
+    except OSError:
+        return None
+    if (not stat.S_ISREG(signature.st_mode) or path.parent.is_symlink()
+            or (signature.st_size, signature.st_mtime_ns) != (size, mtime_ns)):
+        return None
+    return path
+
+
+def local_media_directories(connection, subscription_id, code=None):
+    sql = """SELECT code, path, size, mtime_ns FROM local_video_files
+             WHERE subscription_id = ?"""
+    params = (subscription_id,)
+    if code is not None:
+        sql += " AND code = ?"
+        params += (code,)
+    directories = {}
+    for number, path, size, mtime_ns in connection.execute(sql + " ORDER BY path", params):
+        parent = Path(path).parent
+        if parent not in directories.setdefault(number, []) and indexed_video_path(path, size, mtime_ns):
+            directories[number].append(parent)
+    return directories
+
+
+def local_fanart_path(directory, code, filename):
+    return registered_image_path(directory, filename, "fansrt", f"{code}-fansrt")
+
+
+def local_poster_path(directory, code, filename):
+    return registered_image_path(directory, filename, "poster", f"{code}-poster")
+
+
+def local_cover_records(connection, directories, code):
+    for directory in directories:
+        cover = connection.execute(
+            "SELECT filename, dmm_code, poster_filename FROM local_video_covers WHERE directory=? AND code=?",
+            (str(directory), code),
+        ).fetchone()
+        if cover:
+            yield directory, cover
+
+
+def local_screenshot_path(directory, code, position, filename):
+    return registered_image_path(
+        directory, filename, f"screenshot-{position}", f"{code}-screenshot-{position}", f"{code}-{position}",
+    )
+
+
+def local_screenshot_files(connection, directory, code):
+    for position, filename in connection.execute(
+        """SELECT position, filename FROM local_video_screenshots
+           WHERE directory=? AND code=? AND filename <> '' ORDER BY position""",
+        (str(directory), code),
+    ):
+        path = local_screenshot_path(directory, code, position, filename)
+        stamp = cover_file_stat(path)
+        if stamp:
+            yield position, path, stamp
+
+
+def iter_local_screenshot_addresses(connection, directories, subscription_id, code):
+    prefix = f"/api/subscriptions/{urllib.parse.quote(subscription_id, safe='')}/videos/{urllib.parse.quote(code, safe='')}"
+    screenshots = {}
+    for directory in directories:
+        for position, _path, stamp in local_screenshot_files(connection, directory, code):
+            screenshots.setdefault(position, f"{prefix}/screenshots/{position}?v={stamp.st_mtime_ns}")
+    for position, url in sorted(screenshots.items()):
+        yield {"position": position, "url": url}
+
+
+def attach_local_cover_addresses(subscription_id, rows):
+    if not rows:
+        return
+    connection = connect_video_database()
+    try:
+        directories = local_media_directories(connection, subscription_id)
+        subscription_segment = urllib.parse.quote(subscription_id, safe="")
+        for row in rows:
+            code = row["code"]
+            media_dirs = directories.get(code, ())
+            prefix = f"/api/subscriptions/{subscription_segment}/videos/{urllib.parse.quote(code, safe='')}"
+            for directory, (cover, _dmm_code, poster) in local_cover_records(connection, media_dirs, code):
+                if "cover_image" not in row:
+                    stamp = cover_file_stat(local_fanart_path(directory, code, cover))
+                    if stamp:
+                        row["cover_image"] = f"{prefix}/cover-image?v={stamp.st_mtime_ns}"
+                if "poster_image" not in row:
+                    stamp = cover_file_stat(local_poster_path(directory, code, poster))
+                    if stamp:
+                        row["poster_image"] = f"{prefix}/poster-image?v={stamp.st_mtime_ns}"
+                if "cover_image" in row and "poster_image" in row:
+                    break
+            preview = next(iter_local_screenshot_addresses(connection, media_dirs, subscription_id, code), None)
+            row["has_screenshots"] = preview is not None
+            if preview and not row.get("cover_image"):
+                row["screenshot_thumbnail"] = preview["url"]
+    finally:
+        connection.close()
+
+
+def get_local_cover_image(subscription_id, code, *, poster=False):
+    connection = connect_video_database()
+    try:
+        directories = local_media_directories(connection, subscription_id, code).get(code, ())
+        for directory, (cover, _dmm_code, poster_filename) in local_cover_records(connection, directories, code):
+            path = local_poster_path(directory, code, poster_filename) if poster else local_fanart_path(directory, code, cover)
+            if path is not None:
+                try:
+                    return cover_images.IMAGE_TYPES[path.suffix], cover_images.read_file(path)
+                except (OSError, ValueError):
+                    continue
+    finally:
+        connection.close()
+    return None
+
+
+def get_local_screenshots(subscription_id, code):
+    connection = connect_video_database()
+    try:
+        directories = local_media_directories(connection, subscription_id, code).get(code, ())
+        return list(iter_local_screenshot_addresses(connection, directories, subscription_id, code))
+    finally:
+        connection.close()
+
+
+def get_local_gallery(subscription_id, code):
+    connection = connect_video_database()
+    try:
+        directories = local_media_directories(connection, subscription_id, code).get(code, ())
+        metadata = {}
+        for _directory, (_filename, dmm_code, _poster) in local_cover_records(connection, directories, code):
+            if not dmm_code:
+                continue
+            row = connection.execute(
+                """SELECT base_info_json, series, text_data, base_info_zh_json, series_zh, text_data_zh, title, title_zh
+                   FROM dmm_screenshot_catalog WHERE dmm_code=?""", (dmm_code,),
+            ).fetchone()
+            if row:
+                base_info, series, text_data, base_info_zh, series_zh, text_data_zh, title, title_zh = row
+                metadata = {"base_info": json.loads(base_info_zh or base_info or "{}"),
+                            "series": series_zh or series, "text_data": text_data_zh or text_data,
+                            "title": title_zh or title or ""}
+                break
+        return {"metadata": metadata,
+                "screenshots": list(iter_local_screenshot_addresses(connection, directories, subscription_id, code))}
+    finally:
+        connection.close()
+
+
+def get_local_screenshot_image(subscription_id, code, position):
+    connection = connect_video_database()
+    try:
+        directories = local_media_directories(connection, subscription_id, code).get(code, ())
+        for directory in directories:
+            for index, path, _stamp in local_screenshot_files(connection, directory, code):
+                if index == position:
+                    try:
+                        return cover_images.IMAGE_TYPES[path.suffix], cover_images.read_file(path)
+                    except (OSError, ValueError):
+                        break
+    finally:
+        connection.close()
+    return None
+
+
+def cover_sources(connection, subscription_id, all_records, allowed_sources=None):
+    sources = {}
+    candidates = connection.execute(
+        """SELECT f.code, f.subscription_id, f.mteam_id, f.path, f.rank_json, f.size, f.mtime_ns
+           FROM local_video_files AS f JOIN local_videos AS v USING (code)
+           WHERE v.subscription_id = ? AND f.mteam_id <> ''""", (subscription_id,),
+    )
+    for code, owner_id, identifier, path, rank, size, mtime_ns in candidates:
+        if allowed_sources is not None and (owner_id, path) not in allowed_sources:
+            continue
+        record = all_records.get(owner_id, {}).get(code, {})
+        metadata = (record.get("local_files") or {}).get(path)
+        # Group-level search metadata can describe a different version.
+        if not metadata or not identifier.isascii() or not identifier.isdecimal() or str(metadata.get("id")) != identifier:
+            continue
+        sources.setdefault(code, []).append((tuple(json.loads(rank)), int(identifier), owner_id, path, metadata, size, mtime_ns))
+    for items in sources.values():
+        items.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
+    return sources
+
+
+def local_image_metadata(items, performers):
+    for _rank, _identifier, owner_id, filename, metadata, size, mtime_ns in items:
+        performer = performers.get(owner_id)
+        if not performer:
+            continue
+        path = Path(filename)
+        try:
+            signature = path.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(signature.st_mode) or (signature.st_size, signature.st_mtime_ns) != (size, mtime_ns):
+            continue
+        yield metadata, performer
+
+
+def read_image_detail(metadata, performer, token, details):
+    identifier = str(metadata["id"])
+    if identifier not in details:
+        try:
+            details[identifier] = mteam_detail(identifier, token)
+        except (MTeamRateLimitError, MTeamRequestInterrupted):
+            raise
+        except AppError as error:
+            details[identifier] = error
+    detail = details[identifier]
+    if isinstance(detail, AppError):
+        raise detail
+    if detail_contains_performer(detail, performer):
+        metadata.update(detail_image_metadata(detail))
+
+
+def select_cover_source(sources, token, details):
+    for metadata, performer in sources:
+        url = metadata.get("cover_url")
+        if not url and not metadata.get("cover_checked") and token:
+            read_image_detail(metadata, performer, token, details)
+            url = metadata.get("cover_url")
+        if url:
+            return str(metadata["id"]), url
+    return None
+
+
+def replace_local_image(connection, path, image, old_path, register):
+    if path.parent.is_symlink():
+        raise ValueError("视频目录不能是符号链接。")
+    if path.is_symlink() or (path.exists() and path != old_path):
+        raise FileExistsError("已存在同名图片。")
+    backup = None
+    if path == old_path:
+        try:
+            backup = cover_images.read_file(path)
+        except (OSError, ValueError):
+            pass
+    replaced = False
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".cover-", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(image)
+        original = cover_file_stat(path) if old_path == path else None
+        os.chmod(temporary, stat.S_IMODE(original.st_mode) if original is not None else 0o644)
+        with connection:
+            register(path.name)
+            temporary.replace(path)
+            replaced = True
+    except sqlite3.Error:
+        if replaced and backup is not None:
+            temporary.write_bytes(backup)
+            temporary.replace(path)
+        elif replaced:
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    if old_path is not None and old_path != path and cover_file_stat(old_path):
+        try:
+            old_path.unlink()
+        except OSError as error:
+            return str(error)
+    return ""
+
+
+def install_local_cover(connection, directory, code, stem, source, previous, downloaded):
+    extension, image = downloaded
+    path = directory / (stem + extension)
+    old_path = local_fanart_path(directory, code, previous[2]) if previous else None
+
+    def register(filename):
+        connection.execute(
+            """INSERT INTO local_video_covers(directory, code, source_id, source_url, filename)
+               VALUES (?, ?, ?, ?, ?) ON CONFLICT(directory, code) DO UPDATE SET
+               source_id=excluded.source_id, source_url=excluded.source_url, filename=excluded.filename,
+               poster_cover_mtime_ns=0""",
+            (str(directory), code, *source, filename),
+        )
+
+    cleanup_error = replace_local_image(connection, path, image, old_path, register)
+    return path, cleanup_error
+
+
+def sync_local_poster(connection, directory, code, stem, cover):
+    stamp = cover_file_stat(cover)
+    if stamp is None:
+        return None
+    previous, cover_mtime, crop_version = connection.execute(
+        "SELECT poster_filename, poster_cover_mtime_ns, poster_crop_version FROM local_video_covers WHERE directory=? AND code=?",
+        (str(directory), code),
+    ).fetchone()
+    old_path = local_poster_path(directory, code, previous)
+    path = directory / (stem + cover.suffix)
+    if (old_path == path and stamp.st_mtime_ns == cover_mtime
+            and crop_version == cover_images.POSTER_CROP_VERSION and cover_file_stat(path)):
+        return path
+    poster = cover_images.crop_poster(cover_images.read_file(cover), cover.suffix)
+
+    def register(filename):
+        connection.execute(
+            """UPDATE local_video_covers SET poster_filename=?, poster_cover_mtime_ns=?, poster_crop_version=?
+               WHERE directory=? AND code=?""",
+            (filename, stamp.st_mtime_ns, cover_images.POSTER_CROP_VERSION, str(directory), code),
+        )
+
+    # A conventional poster already present for this title can be refreshed.
+    replace_local_image(connection, path, poster, old_path or (path if cover_file_stat(path) else None), register)
+    return path
+
+
+def translate_dmm_catalog(connection, dmm_code, translate):
+    originals_and_translations = connection.execute(
+        """SELECT base_info_json, series, text_data, base_info_zh_json, series_zh, text_data_zh, hashtag_translation_version,
+                  title, title_zh
+           FROM dmm_screenshot_catalog WHERE dmm_code=?""", (dmm_code,),
+    ).fetchone()
+    base_info, series, text_data, base_info_zh, series_zh, text_data_zh, hashtag_version, title, title_zh = originals_and_translations
+    fields = {
+        "base_info": (json.loads(base_info or "{}"), base_info_zh),
+        "series": (series, series_zh),
+        "text_data": (text_data, text_data_zh),
+        "title": (title, title_zh),
+    }
+    pending = {
+        field: original for field, (original, translated) in fields.items()
+        if original and (translated is None or (hashtag_version < azure_translator.HASHTAG_TRANSLATION_VERSION
+                                                and azure_translator.contains_hashtags(original)))
+    }
+    if not pending:
+        return
+    translated = translate(pending)
+    if not translated:
+        return
+    if "base_info" in translated:
+        base_info_zh = json.dumps(translated["base_info"], ensure_ascii=False)
+    with connection:
+        connection.execute(
+            """UPDATE dmm_screenshot_catalog SET base_info_zh_json=?, series_zh=?, text_data_zh=?, title_zh=?, hashtag_translation_version=?
+               WHERE dmm_code=?""",
+            (base_info_zh, translated.get("series", series_zh), translated.get("text_data", text_data_zh), translated.get("title", title_zh),
+             azure_translator.HASHTAG_TRANSLATION_VERSION, dmm_code),
+        )
+
+
+def dmm_screenshot_urls(connection, dmm_code, token, refresh=False, translate=None):
+    cached = connection.execute(
+        "SELECT urls_json, checked_at, base_info_json IS NOT NULL AND title IS NOT NULL FROM dmm_screenshot_catalog WHERE dmm_code = ?", (dmm_code,),
+    ).fetchone()
+    urls = json.loads(cached[0]) if cached else []
+    if refresh or not cached or not cached[2] or (not urls and time.time() - cached[1] >= DMM_EMPTY_GALLERY_TTL_SECONDS):
+        data = result_data(mteam_json("/dmm/dmmInfo", token, {"dmmCode": dmm_code}, multipart=True))
+        if not isinstance(data, dict) or not isinstance(data.get("picData"), (str, type(None))):
+            raise AppError("DMM 截图清单格式无效。")
+        urls = valid_detail_image_urls((data.get("picData") or "").split(","))
+        base_info = data.get("baseInfo")
+        base_info = json.dumps(base_info if isinstance(base_info, dict) else {}, ensure_ascii=False, sort_keys=True)
+        series, text_data, title = (value if isinstance(value, str) else "" for value in (data.get("series"), data.get("textData"), data.get("title")))
+        with connection:
+            connection.execute(
+                """INSERT INTO dmm_screenshot_catalog(dmm_code, urls_json, checked_at, base_info_json, series, text_data, title)
+                   VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(dmm_code) DO UPDATE SET
+                   urls_json=excluded.urls_json, checked_at=excluded.checked_at,
+                   base_info_zh_json=CASE WHEN base_info_json=excluded.base_info_json THEN base_info_zh_json END,
+                   series_zh=CASE WHEN series=excluded.series THEN series_zh END,
+                   text_data_zh=CASE WHEN text_data=excluded.text_data THEN text_data_zh END,
+                   title_zh=CASE WHEN title=excluded.title THEN title_zh END,
+                   base_info_json=excluded.base_info_json, series=excluded.series, text_data=excluded.text_data, title=excluded.title""",
+                (dmm_code, json.dumps(urls), time.time(), base_info, series, text_data, title),
+            )
+    if translate:
+        translate_dmm_catalog(connection, dmm_code, translate)
+    return urls
+
+
+def select_screenshot_urls(sources, token, details, catalog_urls):
+    gallery_code = ""
+    for metadata, performer in sources:
+        if token and ("dmm_code" not in metadata or "screenshot_urls" not in metadata):
+            read_image_detail(metadata, performer, token, details)
+        explicit = metadata.get("screenshot_urls")
+        dmm_code = metadata.get("dmm_code")
+        if dmm_code and token:
+            try:
+                urls = catalog_urls(dmm_code)
+            except (MTeamRateLimitError, MTeamRequestInterrupted):
+                raise
+            except AppError:
+                if not explicit:
+                    raise
+            else:
+                if urls:
+                    return urls, dmm_code
+                gallery_code = gallery_code or dmm_code
+        if isinstance(explicit, list) and explicit:
+            return explicit, gallery_code
+    return [], gallery_code
+
+
+def dmm_large_screenshot_url(url):
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("https", "http") or parsed.hostname not in ("pics.dmm.co.jp", "pics.dmm.com"):
+        return ""
+    match = re.fullmatch(r"(/digital/video/([a-z0-9_]+)/\2)(-[0-9]+\.jpe?g)", parsed.path, re.IGNORECASE)
+    if not match:
+        return ""
+    return parsed._replace(path=match[1] + "jp" + match[3]).geturl()
+
+
+def fetch_screenshot_image(url, large_url, reusable, refresh=False):
+    if not large_url:
+        return cover_images.fetch(url), True
+    try:
+        return cover_images.fetch(large_url), True
+    except (OSError, ValueError, http.client.HTTPException) as error:
+        unavailable = isinstance(error, cover_images.ImageHTTPError) and error.status in (404, 410)
+        if reusable and not unavailable:
+            raise
+        if reusable and not refresh:
+            return None, True
+        return cover_images.fetch(url), unavailable
+
+
+def sync_video_screenshots(connection, directory, code, urls, settings, performer, refresh=False, *, prefix=""):
+    known = {
+        position: (url, filename, large_checked) for position, url, filename, large_checked in connection.execute(
+            "SELECT position, source_url, filename, large_checked FROM local_video_screenshots WHERE directory = ? AND code = ?",
+            (str(directory), code),
+        )
+    }
+    saved = reused = failed = 0
+    requested = dict(enumerate(urls, 1))
+    for position in sorted(known.keys() | requested.keys()):
+        url = requested.get(position)
+        old_url, old_filename, large_checked = known.get(position, ("", "", False))
+        stem = f"{prefix}screenshot-{position}"
+        old_path = local_screenshot_path(directory, code, position, old_filename)
+
+        def register(filename, source_url, checked):
+            connection.execute(
+                """INSERT INTO local_video_screenshots(directory, code, position, source_url, filename, large_checked)
+                   VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(directory, code, position) DO UPDATE SET
+                   source_url=excluded.source_url, filename=excluded.filename, large_checked=excluded.large_checked""",
+                (str(directory), code, position, source_url, filename, int(checked)),
+            )
+
+        try:
+            cached = cover_file_stat(old_path) is not None
+            if cached and old_path.stem != stem:
+                path = directory / (stem + old_path.suffix)
+                cleanup_error = replace_local_image(
+                    connection, path, cover_images.read_file(old_path), old_path,
+                    lambda filename: register(filename, old_url, large_checked),
+                )
+                old_path = path
+                if cleanup_error:
+                    log_event(f"{code} 已迁移截图 {position}，旧文件清理失败。", level="warning",
+                              event="local_screenshot_cleanup_failed", subscription=performer)
+            if not url:
+                reused += int(cached)
+                continue
+            reusable = old_url == url and cached
+            large_url = dmm_large_screenshot_url(url)
+            if not refresh and reusable and (large_checked or not large_url):
+                reused += 1
+                continue
+            downloaded, checked = fetch_screenshot_image(url, large_url, reusable, refresh)
+            if downloaded is None:
+                with connection:
+                    register(old_path.name, url, True)
+                reused += 1
+                continue
+            extension, image = downloaded
+            path = directory / (stem + extension)
+
+            cleanup_error = replace_local_image(connection, path, image, old_path, lambda filename: register(filename, url, checked))
+            saved += 1
+            if cleanup_error:
+                log_event(f"{code} 已保存截图 {position}，旧截图清理失败。", level="warning", event="local_screenshot_cleanup_failed", subscription=performer)
+        except FileExistsError:
+            failed += 1
+            log_event(f"{code} 截图 {position} 的目标文件已存在，已保留现有文件。", level="warning",
+                      event="local_screenshot_conflict", subscription=performer)
+        except (OSError, ValueError, sqlite3.Error, http.client.HTTPException) as error:
+            failed += 1
+            log_debug(settings, f"{code} 截图 {position} 处理失败（{type(error).__name__}）。", performer)
+    return saved, reused, failed
+
+
+def video_nfo_path(video_path):
+    path = video_path.with_suffix(".nfo")
+    if not path.exists() and not path.is_symlink() and video_path.with_suffix(".NFO").exists():
+        return video_path.with_suffix(".NFO")
+    return path
+
+
+def nfo_text(element, name, value):
+    value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(value or "")).strip()
+    if value:
+        ET.SubElement(element, name).text = value
+
+
+def movie_nfo(metadata, catalog_row):
+    original_title, title, original_plot, plot, original_series, series, base_json, translated_json = catalog_row or (None,) * 8
+    original_title = original_title or metadata.get("title")
+    if not (title or original_title or plot or original_plot):
+        return None
+    base = json.loads(base_json or "{}")
+    translated_base = json.loads(translated_json or "{}")
+    root = ET.Element("movie")
+    nfo_text(root, "title", title or original_title)
+    nfo_text(root, "originaltitle", original_title)
+    nfo_text(root, "plot", plot or original_plot)
+    if series or original_series:
+        nfo_text(ET.SubElement(root, "set"), "name", series or original_series)
+    nfo_text(root, "studio", translated_base.get("制作商") or base.get("メーカー"))
+    nfo_text(root, "director", base.get("監督"))
+    for genre in re.split(r"[,，、]", str(translated_base.get("类型") or base.get("ジャンル") or "")):
+        nfo_text(root, "genre", genre)
+    for actor in re.split(r"[,，、]", str(base.get("出演者") or "")):
+        if actor.strip():
+            nfo_text(ET.SubElement(root, "actor"), "name", actor)
+    try:
+        released = datetime.date.fromisoformat(str(base.get("発売日", "")).replace("/", "-"))
+    except ValueError:
+        pass
+    else:
+        nfo_text(root, "premiered", released.isoformat())
+        nfo_text(root, "year", released.year)
+    runtime = re.fullmatch(r"(\d+)\s*(?:分(?:钟)?|min(?:utes?)?)?", str(base.get("収録時間") or "").strip(), re.IGNORECASE)
+    if runtime:
+        nfo_text(root, "runtime", runtime[1])
+    if metadata.get("id"):
+        ET.SubElement(root, "uniqueid", {"type": "mteam", "default": "true"}).text = str(metadata["id"])
+    if base.get("品番"):
+        ET.SubElement(root, "uniqueid", {"type": "dmm"}).text = str(base["品番"])
+    stream = mediainfo_video_stream(metadata.get("mediainfo", ""))
+    codec_type = release_rank("", {"codec": stream["codec"]})[2]
+    if stream["width"] or stream["height"] or codec_type:
+        video = ET.SubElement(ET.SubElement(ET.SubElement(root, "fileinfo"), "streamdetails"), "video")
+        nfo_text(video, "width", stream["width"])
+        nfo_text(video, "height", stream["height"])
+        nfo_text(video, "codec", {1: "h264", 2: "hevc"}.get(codec_type))
+    return root
+
+
+def nfo_signature(path):
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(current.st_mode):
+        raise AppError("NFO 路径不是普通文件。")
+    return current
+
+
+def read_nfo(path, original):
+    if original is None:
+        return None
+    if original.st_size > MAX_NFO_BYTES:
+        raise AppError("NFO 文件超过允许处理的大小。")
+    parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True, insert_pis=True))
+    return ET.parse(path, parser=parser).getroot()
+
+
+def nfo_has_mteam_id(root):
+    return root is not None and any(
+        isinstance(node.tag, str) and node.tag.rsplit("}", 1)[-1] == "uniqueid"
+        and node.get("type", "").strip().casefold() in ("mteam", "m-team")
+        and re.fullmatch(r"[0-9]+", (node.text or "").strip())
+        for node in root
+    )
+
+
+def write_dmm_nfo(path, original, root, title, plot, artwork, *, rebuild):
+    changed = rebuild
+    namespace = root.tag.rpartition("}")[0] + "}" if root.tag.startswith("{") else ""
+    images = artwork or {}
+    for name, value in (("title", title), ("plot", plot), ("fansrt", images.get("fansrt")), ("poster", images.get("poster"))):
+        if not value:
+            continue
+        value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", value)
+        element = root.find(namespace + name)
+        if element is None:
+            element = ET.SubElement(root, namespace + name)
+        if element.text != value:
+            element.text = value
+            changed = True
+    if "screenshots" in images:
+        tag = namespace + "screenshots"
+        # Only replace the screenshot list produced by this application.
+        gallery = root.find(f"{tag}[@source='AVSubscribe']")
+        screenshot_tag = namespace + "screenshot"
+        filenames = images["screenshots"]
+        existing = [node.text for node in gallery.findall(screenshot_tag)] if gallery is not None else []
+        if existing != filenames:
+            if gallery is not None:
+                root.remove(gallery)
+            if filenames:
+                gallery = ET.SubElement(root, tag, {"source": "AVSubscribe"})
+                for filename in filenames:
+                    ET.SubElement(gallery, screenshot_tag).text = filename
+            changed = True
+    if not changed:
+        return False
+
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".nfo-", delete=False) as stream:
+            temporary = Path(stream.name)
+            ET.ElementTree(root).write(stream, encoding="utf-8", xml_declaration=True)
+        os.chmod(temporary, stat.S_IMODE(original.st_mode) if original else 0o644)
+        current = nfo_signature(path)
+        if (current is None) != (original is None) or (original is not None and
+                (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) !=
+                (original.st_dev, original.st_ino, original.st_size, original.st_mtime_ns)):
+            raise AppError("NFO 在更新期间已变化。")
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return True
+
+
+def sync_dmm_nfos(connection, row, records, subscription, settings, details, catalog_urls, allowed_sources, artwork):
+    files = (records.get(row["code"], {}).get("local_files") or {})
+    performer = subscription["performer"]
+    token = settings.get("mteam_token", "")
+    updated = failed = 0
+    for file in row["files"]:
+        path = file["path"]
+        if allowed_sources is not None and (subscription["id"], path) not in allowed_sources:
+            continue
+        try:
+            video = indexed_video_path(path, file["size"], file["mtime_ns"])
+            if video is None:
+                continue
+            metadata = files.get(path)
+            if not metadata or not re.fullmatch(r"[0-9]+", file["mteam_id"]) or str(metadata.get("id")) != file["mteam_id"]:
+                continue
+            nfo = video_nfo_path(video)
+            original = nfo_signature(nfo)
+            root = read_nfo(nfo, original)
+            rebuild = not nfo_has_mteam_id(root)
+            replacing = rebuild and original is not None
+            if settings.get("azure_key") and token and "dmm_code" not in metadata:
+                try:
+                    read_image_detail(metadata, performer, token, details)
+                except (MTeamRateLimitError, MTeamRequestInterrupted):
+                    raise
+                except AppError as error:
+                    log_debug(settings, f"{row['code']} M-Team 封面资料读取失败：{error}", performer)
+                    if replacing:
+                        raise
+            dmm_code = metadata.get("dmm_code")
+            catalog_error = None
+            if dmm_code and token and (rebuild or settings.get("azure_key")):
+                try:
+                    catalog_urls(dmm_code)
+                except (MTeamRateLimitError, MTeamRequestInterrupted):
+                    raise
+                except AppError as error:
+                    catalog_error = error
+                    log_debug(settings, f"{row['code']} DMM 资料获取失败：{error}", performer)
+            catalog_row = connection.execute(
+                """SELECT title, title_zh, text_data, text_data_zh, series, series_zh, base_info_json, base_info_zh_json
+                   FROM dmm_screenshot_catalog WHERE dmm_code=?""", (dmm_code,),
+            ).fetchone() if dmm_code else None
+            title, plot = (catalog_row[1], catalog_row[3]) if catalog_row else (None, None)
+            if rebuild:
+                if replacing and catalog_error is not None and catalog_row is None:
+                    raise catalog_error
+                root = movie_nfo(metadata, catalog_row)
+                if root is None:
+                    continue
+            updated += write_dmm_nfo(nfo, original, root, title, plot, artwork.get(video.parent), rebuild=rebuild)
+        except (MTeamRateLimitError, MTeamRequestInterrupted):
+            raise
+        except (AppError, OSError, ValueError, ET.ParseError, sqlite3.Error) as error:
+            failed += 1
+            log_debug(settings, f"{Path(path).name} NFO 同步失败：{error}", performer)
+    return updated, failed
+
+
+def sync_subscription_covers(subscription, rows, all_records, settings, *, refresh=False, allowed_sources=None, on_number=None):
+    if not rows:
+        return
+    performer = subscription["performer"]
+    downloaded = reused = unavailable = failed = 0
+    screenshot_saved = screenshot_reused = screenshot_failed = 0
+    nfo_updated = nfo_failed = 0
+    translation_unavailable = translation_reported = False
+
+    def translate(fields):
+        nonlocal translation_unavailable, translation_reported
+        if translation_unavailable:
+            return None
+        try:
+            if settings.get("debug_mode"):
+                return azure_translator.translate_metadata(
+                    fields, settings["azure_key"], settings.get("azure_region", ""),
+                    on_response=lambda status, raw: log_http_json("Azure", "/translate", status, raw, code=code,
+                                                                 settings=settings, subscription=performer),
+                )
+            return azure_translator.translate_metadata(fields, settings["azure_key"], settings.get("azure_region", ""))
+        except azure_translator.TranslationError as error:
+            if not translation_reported:
+                log_event(str(error), level="warning", event="dmm_translation_failed", subscription=performer)
+            translation_reported = True
+            translation_unavailable = error.unavailable
+            return None
+
+    translate_fields = translate if settings.get("azure_key") else None
+    try:
+        performers = {item["id"]: item["performer"] for item in list_subscriptions()}
+        connection = connect_video_database()
+        try:
+            sources = cover_sources(connection, subscription["id"], all_records, allowed_sources)
+            details = {}
+            token = settings.get("mteam_token", "")
+            catalog = {}
+
+            def catalog_urls(dmm_code):
+                if dmm_code not in catalog:
+                    try:
+                        catalog[dmm_code] = dmm_screenshot_urls(
+                            connection, dmm_code, token, refresh=refresh, translate=translate_fields,
+                        )
+                    except (MTeamRateLimitError, MTeamRequestInterrupted):
+                        raise
+                    except AppError as error:
+                        catalog[dmm_code] = error
+                result = catalog[dmm_code]
+                if isinstance(result, AppError):
+                    raise result
+                return result
+
+            indexed_codes = dict(connection.execute(
+                "SELECT path, code FROM local_video_files WHERE subscription_id=?",
+                (subscription["id"],),
+            ))
+            directory_numbers = {}
+            for row in rows:
+                before = (downloaded, screenshot_saved, failed + screenshot_failed + nfo_failed)
+                code = row["code"]
+                if not re.fullmatch(r"[A-Z0-9]+(?:-[A-Z0-9]+)+", code):
+                    continue
+                media_dirs = set()
+                for file in row["files"]:
+                    path = file["path"]
+                    if allowed_sources is not None and (subscription["id"], path) not in allowed_sources:
+                        continue
+                    video = indexed_video_path(path, file["size"], file["mtime_ns"])
+                    if video is not None:
+                        media_dirs.add(video.parent)
+                if not media_dirs:
+                    continue
+                image_sources = list(local_image_metadata(sources.get(code, []), performers))
+                source, urls, dmm_code = None, [], ""
+                try:
+                    source = select_cover_source(image_sources, token, details)
+                except (MTeamRateLimitError, MTeamRequestInterrupted):
+                    raise
+                except (AppError, OSError, ValueError) as error:
+                    failed += 1
+                    log_debug(settings, f"{code} 封面资料读取失败：{error}", performer)
+                try:
+                    urls, dmm_code = select_screenshot_urls(image_sources, token, details, catalog_urls)
+                except (MTeamRateLimitError, MTeamRequestInterrupted):
+                    raise
+                except (AppError, OSError, ValueError, sqlite3.Error) as error:
+                    screenshot_failed += 1
+                    log_debug(settings, f"{code} 截图资料读取失败：{error}", performer)
+
+                artwork = {}
+                downloaded_cover = None
+                for directory in sorted(media_dirs):
+                    images = {}
+                    artwork[directory] = images
+                    prefix = f"{code}-"
+                    previous = connection.execute(
+                        "SELECT source_id, source_url, filename FROM local_video_covers WHERE directory=? AND code=?",
+                        (str(directory), code),
+                    ).fetchone()
+                    cover = local_fanart_path(directory, code, previous[2]) if previous else None
+                    if not cover_file_stat(cover):
+                        cover = None
+                    try:
+                        if directory not in directory_numbers:
+                            directory_numbers[directory] = {
+                                indexed_codes.get(str(path)) or normalize_code(path.stem) or normalize_code(directory.name)
+                                for path in directory.iterdir()
+                                if path.suffix.casefold() in VIDEO_EXTENSIONS and path.is_file() and not path.is_symlink()
+                            }
+                        prefix = "" if directory_numbers[directory] == {code} else f"{code}-"
+                        cover_stem = prefix + "fansrt"
+                        if source and (not cover or refresh or previous[:2] != source):
+                            if downloaded_cover is None:
+                                downloaded_cover = cover_images.fetch(source[1])
+                            cover, cleanup_error = install_local_cover(
+                                connection, directory, code, cover_stem, source, previous, downloaded_cover,
+                            )
+                            downloaded += 1
+                            if cleanup_error:
+                                log_debug(settings, f"{code} 旧封面清理失败：{cleanup_error}", performer)
+                        elif cover:
+                            if cover.stem != cover_stem:
+                                cover, _cleanup_error = install_local_cover(
+                                    connection, directory, code, cover_stem, previous[:2], previous,
+                                    (cover.suffix, cover_images.read_file(cover)),
+                                )
+                            reused += 1
+                        else:
+                            unavailable += 1
+                        if cover:
+                            images["fansrt"] = cover.name
+                            poster = sync_local_poster(connection, directory, code, prefix + "poster", cover)
+                            if poster:
+                                images["poster"] = poster.name
+                    except (OSError, ValueError, sqlite3.Error, http.client.HTTPException) as error:
+                        failed += 1
+                        log_event(f"{code} 同目录封面或海报处理失败：{error}", level="warning",
+                                  event="local_cover_write_failed", subscription=performer)
+                        if cover:
+                            images["fansrt"] = cover.name
+                    try:
+                        if dmm_code:
+                            with connection:
+                                connection.execute(
+                                    """INSERT INTO local_video_covers(directory, code, source_id, source_url, filename, dmm_code)
+                                       VALUES (?, ?, '', '', '', ?) ON CONFLICT(directory, code) DO UPDATE SET dmm_code=excluded.dmm_code
+                                       WHERE dmm_code <> excluded.dmm_code""",
+                                    (str(directory), code, dmm_code),
+                                )
+                        saved, cached, errors = sync_video_screenshots(
+                            connection, directory, code, urls, settings, performer, refresh, prefix=prefix,
+                        )
+                        screenshot_saved += saved
+                        screenshot_reused += cached
+                        screenshot_failed += errors
+                        images["screenshots"] = [path.name for _position, path, _stamp in local_screenshot_files(connection, directory, code)]
+                    except (OSError, ValueError, sqlite3.Error) as error:
+                        screenshot_failed += 1
+                        log_debug(settings, f"{code} 截图处理失败：{error}", performer)
+                saved_nfos, errors = sync_dmm_nfos(
+                    connection, row, all_records.get(subscription["id"], {}), subscription, settings, details, catalog_urls, allowed_sources, artwork,
+                )
+                nfo_updated += saved_nfos
+                nfo_failed += errors
+                if on_number:
+                    on_number(code, downloaded - before[0], screenshot_saved - before[1], failed + screenshot_failed + nfo_failed - before[2])
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, RuntimeError) as error:
+        log_event(f"封面检查失败：{error}", level="warning", event="local_cover_sync", subscription=performer)
+        return False
+    log_event(f"封面检查：保存 {downloaded} 张，复用 {reused} 张，暂无 {unavailable} 张，失败 {failed} 张。",
+              level="warning" if failed else "info", event="local_cover_sync", subscription=performer)
+    if screenshot_saved or screenshot_reused or screenshot_failed:
+        log_event(f"截图检查：保存 {screenshot_saved} 张，复用 {screenshot_reused} 张，失败 {screenshot_failed} 张。",
+                  level="warning" if screenshot_failed else "info", event="local_screenshot_sync", subscription=performer)
+    if nfo_updated or nfo_failed:
+        log_event(f"NFO 同步更新 {nfo_updated} 个，失败 {nfo_failed} 个。",
+                  level="warning" if nfo_failed else "info", event="local_nfo_sync", subscription=performer)
+    return True
+
+
 def get_subscription_videos(subscription_id):
     started_at = time.perf_counter()
     subscription = next((item for item in list_subscriptions() if item.get("id") == subscription_id), None)
@@ -2760,6 +3869,10 @@ def get_subscription_videos(subscription_id):
     records = read_json(RECORDS_FILE, {}).get(subscription_id, {})
     rows = index_subscription_videos(subscription_id, videos, records)
     settings = get_settings()
+    try:
+        attach_local_cover_addresses(subscription_id, rows)
+    except (OSError, sqlite3.Error, RuntimeError):
+        pass
     if settings.get("debug_mode"):
         elapsed_ms = (time.perf_counter() - started_at) * 1000
         log_event(f"本地影片扫描与索引耗时 {elapsed_ms:.1f} ms，共识别 {video_count} 个视频。", level="debug", event="debug_decision", subscription=subscription.get("performer", ""))
@@ -3088,7 +4201,8 @@ def save_repair_job(job):
 
 
 def public_repair_job(job):
-    result = {key: value for key, value in job.items() if key not in ("targets", "detail_cache", "detail_errors")}
+    result = {key: value for key, value in job.items()
+              if key not in ("targets", "detail_cache", "detail_errors", "image_results", "archive_plans")}
     cooldown = read_json(MTEAM_LIMIT_FILE, {})
     if job.get("state") == "running" and cooldown.get("repair_job_id") == job["job_id"] and cooldown.get("retry_at", 0) > time.time():
         result.update({"phase": "waiting_retry", "retry_at": cooldown["retry_at"],
@@ -3144,6 +4258,244 @@ def queue_data_repair(subscription_id, file_path="", code=""):
     return public_repair_job(job)
 
 
+def plan_video_archive(root, videos, downloader, task_cache):
+    targets = {}
+    ancestors = {}
+    for code, items in videos.items():
+        destination = Path(release_download_directory(str(root), code))
+        for item in items:
+            video = Path(item["path"])
+            if video.is_symlink() or not video.is_file():
+                continue
+            video = video.resolve()
+            if not video.is_relative_to(root) or video.is_relative_to(destination):
+                continue
+            signature = video.stat()
+            targets[video] = {"code": code, "size": signature.st_size, "mtime_ns": signature.st_mtime_ns}
+            for parent in video.parents:
+                ancestors.setdefault(parent, set()).add(video)
+    if not targets:
+        return [], []
+
+    tasks = check_task_snapshot(downloader, task_cache)
+    file_lists = task_cache.setdefault("id_file_lists", {})
+    owners = {}
+    task_destinations = {}
+    for info_hash, task in tasks.items():
+        content_value = task.get("content_path")
+        if not content_value:
+            # An incomplete qBittorrent response cannot safely identify a matching path.
+            save_value = task.get("save_path")
+            if save_value:
+                for video in ancestors.get(Path(save_value).resolve(), ()):
+                    if normalize_code(task.get("name", "")) == targets[video]["code"]:
+                        owners.setdefault(video, set()).add(info_hash)
+            continue
+        content = Path(content_value).resolve()
+        covered = {content} if content in targets else ancestors.get(content)
+        if not covered:
+            continue
+        matched = covered
+        relative_files = []
+        save_value = task.get("save_path")
+        save = Path(save_value).resolve() if save_value else None
+        if save is not None:
+            try:
+                if content in targets and content.parent == save:
+                    relative_files = [Path(content.name)]
+                else:
+                    if info_hash not in file_lists:
+                        file_lists[info_hash] = downloader.list_task_files(info_hash)
+                    relative_files = [Path(str(file["name"]).replace("\\", "/")) for file in file_lists[info_hash]]
+                    if any(path.is_absolute() or not path.parts or ".." in path.parts for path in relative_files):
+                        raise ValueError("种子文件路径无效。")
+                    matched = {(save / path).resolve() for path in relative_files}.intersection(covered)
+            except (AppError, OSError, TypeError, KeyError, ValueError):
+                relative_files = []
+        for video in matched:
+            owners.setdefault(video, set()).add(info_hash)
+        if not matched or not task.get("complete") or save is None or not save.is_relative_to(root):
+            continue
+        task_videos = {(save / path).resolve() for path in relative_files if path.suffix.casefold() in VIDEO_EXTENSIONS}
+        codes = {targets[video]["code"] for video in matched}
+        if task_videos == matched and len(codes) == 1:
+            code = codes.pop()
+            destination = root / code
+            if destination.is_relative_to(content):
+                continue
+            task_destinations[info_hash] = (save, destination, relative_files, matched)
+
+    plans, skipped = [], []
+
+    def relocation(video, destination):
+        return {**targets[video], "old": str(video), "new": str(destination),
+                "sidecars": [str(path) for path in local_video_sidecars(video)]}
+
+    for video, target in sorted(targets.items()):
+        if video not in owners:
+            plans.append({"entries": [relocation(video, root / target["code"] / video.name)]})
+    for info_hash, (save, destination, files, matched) in task_destinations.items():
+        if any(owners[video] != {info_hash} for video in matched):
+            continue
+        plans.append({"hash": info_hash, "save_path": str(save), "location": str(destination),
+                      "files": [str(destination / path) for path in files],
+                      "entries": [relocation(video, destination / video.relative_to(save)) for video in sorted(matched)]})
+    planned = {entry["old"] for plan in plans for entry in plan["entries"]}
+    for video in owners:
+        if str(video) not in planned:
+            skipped.append(f"{video.name}：关联的 qBittorrent 任务未完成、路径冲突或包含其他番号，已保留原位置。")
+    return plans, skipped
+
+
+def archive_local_files(pairs):
+    linked = []
+    try:
+        for source, target in pairs:
+            if source.is_symlink() or target.is_symlink():
+                raise AppError(f"文件路径是符号链接：{source.name}。")
+            if target.exists():
+                if not source.samefile(target):
+                    raise AppError(f"目标已存在同名文件：{target.name}。")
+            else:
+                os.link(source, target)
+                linked.append(target)
+    except (AppError, OSError):
+        for target in linked:
+            target.unlink(missing_ok=True)
+        raise
+    for source, _target in pairs:
+        source.unlink(missing_ok=True)
+
+
+def apply_video_archive_plan(plan, subscription, downloader, job):
+    root = Path(subscription["download_dir"]).resolve()
+    entries = plan["entries"]
+    for entry in entries:
+        old, new = Path(entry["old"]), Path(entry["new"])
+        if new.resolve() != new or not new.is_relative_to(root / entry["code"]):
+            raise AppError("番号目录路径无效。")
+        if not (indexed_video_path(old, entry["size"], entry["mtime_ns"])
+                or indexed_video_path(new, entry["size"], entry["mtime_ns"])):
+            raise AppError(f"影片已变化或消失：{old.name}。")
+        for sidecar in map(Path, entry["sidecars"]):
+            target = new.with_name(sidecar.name)
+            if sidecar.is_symlink() or target.is_symlink():
+                raise AppError(f"配套文件路径是符号链接：{sidecar.name}。")
+            if sidecar.exists() and target.exists() and not sidecar.samefile(target):
+                raise AppError(f"目标已存在同名配套文件：{target.name}。")
+        if new.exists() and old.exists() and not new.samefile(old):
+            raise AppError(f"目标已存在同名影片：{new.name}。")
+
+    info_hash = plan.get("hash")
+    if info_hash:
+        location = Path(plan["location"])
+        task = downloader.list_tasks([info_hash]).get(info_hash)
+        if not task or task.get("failed") or not task.get("save_path"):
+            raise AppError("无法核对 qBittorrent 任务当前的保存路径。")
+        current_location = Path(task["save_path"]).resolve()
+        original_location = Path(plan["save_path"])
+        # A restarted job can safely resend a request if the task is still at its original location.
+        if plan.get("requested") and task.get("complete") and current_location == original_location:
+            plan["requested"] = False
+        if not plan.get("requested"):
+            if not task.get("complete") or current_location != original_location:
+                raise AppError("qBittorrent 任务状态或保存路径已变化，请重新检查。")
+            for target in map(Path, plan["files"]):
+                if target.exists() or target.is_symlink() or target.resolve() != target or not target.is_relative_to(location):
+                    raise AppError(f"种子目标文件冲突：{target.name}。")
+            # Persist intent before calling qBittorrent so an interrupted job can recover.
+            plan["requested"] = True
+            save_repair_job(job)
+            downloader.set_location(info_hash, plan["location"])
+        started = time.monotonic()
+        while True:
+            task = downloader.list_tasks([info_hash]).get(info_hash)
+            if not task or task.get("failed"):
+                raise AppError("qBittorrent 任务消失或报告移动失败。")
+            moving = task.get("state") == "moving"
+            if not moving and task.get("save_path") and Path(task["save_path"]).resolve() == location:
+                if all(not Path(entry["old"]).exists() and
+                       indexed_video_path(entry["new"], entry["size"], entry["mtime_ns"]) for entry in entries):
+                    break
+            if STOP_SCHEDULER:
+                raise MTeamRequestInterrupted("后台调度器正在停止，影片归档等待恢复。")
+            if time.monotonic() >= started + (120 if moving else 15):
+                raise AppError("qBittorrent 尚未完成移动，请等待下载器完成后再修复。")
+            time.sleep(0.5)
+    for entry in entries:
+        old, new = Path(entry["old"]), Path(entry["new"])
+        if not info_hash:
+            new.parent.mkdir(parents=True, exist_ok=True)
+        pairs = [(sidecar, new.with_name(sidecar.name)) for sidecar in map(Path, entry["sidecars"]) if sidecar.exists()]
+        if not info_hash and old.exists():
+            pairs.append((old, new))
+        archive_local_files(pairs)
+
+
+def update_archived_video_records(all_records, entry):
+    old, new = entry["old"], entry["new"]
+    for subscription_records in all_records.values():
+        record = subscription_records.get(entry["code"], {})
+        files = record.get("local_files", {})
+        old_key = next((path for path in files if str(Path(path).resolve()) == old), None)
+        if old_key:
+            files.setdefault(new, files[old_key])
+            del files[old_key]
+        for release in (record.get("current"), record.get("pending")):
+            if not release:
+                continue
+            if "local_paths" in release:
+                release["local_paths"] = [new if str(Path(path).resolve()) == old else path for path in release["local_paths"]]
+            if release.get("verified_local_path") and str(Path(release["verified_local_path"]).resolve()) == old:
+                release["verified_local_path"] = new
+
+
+def archive_subscription_videos(subscription, videos, downloader, task_cache, all_records, job, progress):
+    performer = subscription["performer"]
+    root = Path(subscription["download_dir"]).resolve()
+    if "archive_plans" not in job:
+        try:
+            plans, warnings = plan_video_archive(root, videos, downloader, task_cache)
+        except (AppError, OSError) as error:
+            plans, warnings = [], [f"无法核对影片归档路径：{error}"]
+        job["archive_plans"] = plans
+        job["archive_failed"] = len(warnings)
+        for message in warnings:
+            log_event(message, level="warning", event="repair_archive_skipped", subscription=performer)
+        save_repair_job(job)
+    plans = job["archive_plans"]
+    if not plans:
+        return False
+    progress("archive", 0, len(plans), "正在将已有影片归档到番号目录。")
+    with closing(connect_video_database()) as database:
+        for index, plan in enumerate(plans, 1):
+            if not plan.get("done"):
+                if STOP_SCHEDULER:
+                    raise MTeamRequestInterrupted("后台调度器正在停止，影片归档等待恢复。")
+                try:
+                    apply_video_archive_plan(plan, subscription, downloader, job)
+                    with database:
+                        for entry in plan["entries"]:
+                            update_archived_video_records(all_records, entry)
+                            database.execute("UPDATE OR IGNORE local_video_files SET path=? WHERE code=? AND path=?",
+                                             (entry["new"], entry["code"], entry["old"]))
+                    write_json(RECORDS_FILE, all_records)
+                    job["archived"] = job.get("archived", 0) + len(plan["entries"])
+                except MTeamRequestInterrupted:
+                    raise
+                except (AppError, OSError, sqlite3.Error) as error:
+                    job["archive_failed"] += len(plan["entries"])
+                    log_event(f"{plan['entries'][0]['code']} 归档未完成：{error}", level="warning",
+                              event="repair_archive_failed", subscription=performer)
+                plan["done"] = True
+            progress("archive", index, len(plans), f"已处理 {index}/{len(plans)} 组影片归档。")
+    # Discard the pre-move task paths and cached local scan.
+    if any(plan.get("hash") for plan in plans):
+        task_cache.clear()
+    invalidate_local_scans(str(root))
+    return True
+
+
 def repair_subscription_data(job, downloader=None):
     subscription = next((item for item in list_subscriptions() if item.get("id") == job["subscription_id"]), None)
     if subscription is None:
@@ -3177,6 +4529,11 @@ def repair_subscription_data(job, downloader=None):
     videos = scan_local_releases(subscription["download_dir"])
     all_records = read_json(RECORDS_FILE, {})
     records = all_records.setdefault(subscription["id"], {})
+    downloader = downloader or Downloader(settings["downloader"])
+    task_cache = {}
+    if not job.get("path") and "targets" not in job:
+        if archive_subscription_videos(subscription, videos, downloader, task_cache, all_records, job, progress):
+            videos = scan_local_releases(subscription["download_dir"])
     scanned = {str(Path(item["path"]).resolve()): {"code": code, "item": item} for code, items in videos.items() for item in items}
     log_event(
         f"修复阶段完成：目录扫描识别 {len(scanned)} 个视频、{len(videos)} 个番号，耗时 {time.perf_counter() - scan_started:.2f} 秒。",
@@ -3200,7 +4557,7 @@ def repair_subscription_data(job, downloader=None):
         query_targets = {path: {"path": Path(path), "code": value["code"]} for path, value in targets.items()}
         try:
             matches, hashes, ambiguous, _checked, _errors = match_qbittorrent_file_ids(
-                query_targets, downloader or Downloader(settings["downloader"]), task_cache={}, progress_callback=progress,
+                query_targets, downloader, task_cache=task_cache, progress_callback=progress,
                 settings=settings, performer=performer,
             ) if query_targets else ({}, {}, set(), 0, 0)
         except (AppError, OSError) as error:
@@ -3329,13 +4686,41 @@ def repair_subscription_data(job, downloader=None):
     rows = index_subscription_videos(subscription["id"], videos, records)
     write_json(RECORDS_FILE, all_records)
     collect_subscription_subtitles(rows, settings.get("subtitle_collection_dir", ""), performer)
+    image_results = job.setdefault("image_results", {})
+    image_targets = {
+        path: target for path, target in targets.items()
+        if path in scanned and job["outcomes"].get(path, {}).get("details_done")
+        and job["outcomes"][path].get("state") in ("completed", "partial")
+    }
+    image_codes = {target["code"] for target in image_targets.values()}
+    image_rows = [row for row in rows if row["code"] in image_codes and row["code"] not in image_results]
+    image_failed = 0
+    if image_rows:
+        total_images = len(image_results) + len(image_rows)
+        progress("images", len(image_results), total_images, "正在重新下载封面和截图。")
+
+        def finish_images(code, covers, screenshots, errors):
+            image_results[code] = {"covers": covers, "screenshots": screenshots, "errors": errors}
+            progress("images", len(image_results), total_images, f"已检查 {len(image_results)}/{total_images} 个番号的封面和截图。")
+
+        try:
+            allowed_sources = {(subscription["id"], str(Path(scanned[path]["item"]["path"]))) for path in image_targets}
+            if not sync_subscription_covers(subscription, image_rows, all_records, settings, refresh=True,
+                                            allowed_sources=allowed_sources, on_number=finish_images):
+                image_failed = 1
+        finally:
+            write_json(RECORDS_FILE, all_records)
     outcomes = list(job["outcomes"].values())
     return {"total": len(targets), "filled": sum(bool(value.get("filled")) for value in outcomes),
+        "archived": job.get("archived", 0), "archive_failed": job.get("archive_failed", 0),
         "corrected": sum(bool(value.get("corrected")) for value in outcomes),
         "refreshed": sum(bool(value.get("details_done")) for value in outcomes),
         "skipped": sum(value.get("state") == "skipped" for value in outcomes),
         "failed": sum(value.get("state") in ("failed", "partial") for value in outcomes),
-        "subtitles_downloaded": sum(bool(value.get("subtitle_downloaded")) for value in outcomes)}
+        "subtitles_downloaded": sum(bool(value.get("subtitle_downloaded")) for value in outcomes),
+        "covers_downloaded": sum(value["covers"] for value in image_results.values()),
+        "screenshots_downloaded": sum(value["screenshots"] for value in image_results.values()),
+        "image_failed": image_failed + sum(value["errors"] for value in image_results.values())}
 
 
 def local_video_sidecars_subtitles(path):
@@ -3378,9 +4763,10 @@ def run_data_repair_request(request, downloader=None):
         summary = repair_subscription_data(job, downloader)
         job.update({"state": "completed", "phase": "completed", "summary": summary, "completed": summary["total"],
             "total": summary["total"], "completed_at": now_iso(),
-            "message": f"数据修复完成：新增 ID {summary['filled']} 个，修正 {summary['corrected']} 个，刷新 {summary['refreshed']} 个，字幕下载 {summary['subtitles_downloaded']} 个，跳过 {summary['skipped']} 个，失败 {summary['failed']} 个。"})
+            "message": f"数据修复完成：归档 {summary['archived']} 个，未归档 {summary['archive_failed']} 个。新增 ID {summary['filled']} 个，修正 {summary['corrected']} 个，刷新 {summary['refreshed']} 个，字幕下载 {summary['subtitles_downloaded']} 个，跳过 {summary['skipped']} 个，失败 {summary['failed']} 个。封面 {summary['covers_downloaded']} 张，截图 {summary['screenshots_downloaded']} 张，图片失败 {summary['image_failed']} 项。"})
         job.pop("detail_cache", None)
         job.pop("detail_errors", None)
+        job.pop("archive_plans", None)
         log_event(job["message"], event="repair_completed", subscription=job["performer"])
     except MTeamRequestInterrupted as error:
         job.update({"state": "queued", "message": str(error)})
@@ -3437,7 +4823,8 @@ def get_subscription_video_cover(subscription_id, code, file_path):
     detail = mteam_detail(identifier, token)
     if not detail_contains_performer(detail, subscription["performer"]):
         raise AppError("M-Team 详情中未找到对应女优关键字。")
-    cover = detail_cover_url(detail)
+    image_metadata = detail_image_metadata(detail)
+    cover = image_metadata["cover_url"]
     with file_lock():
         all_records = read_json(RECORDS_FILE, {})
         record = all_records.get(subscription_id, {}).get(code, {})
@@ -3446,10 +4833,50 @@ def get_subscription_video_cover(subscription_id, code, file_path):
         actual = target.stat()
         if str(current.get("id", "")) != identifier or (actual.st_size, actual.st_mtime_ns) != (signature.st_size, signature.st_mtime_ns):
             raise AppError("视频记录已变化，请重新加载后查看封面。")
-        files[key] = {**current, "cover_url": cover, "cover_checked": True}
+        files[key] = {**current, **image_metadata}
         write_json(RECORDS_FILE, all_records)
         index_subscription_videos(subscription_id, videos, all_records.get(subscription_id, {}))
     return {"cover_url": cover, "cover_checked": True}
+
+
+def get_subscription_video_nfo(subscription_id, code, file_path):
+    subscription = next((item for item in list_subscriptions() if item.get("id") == subscription_id), None)
+    if subscription is None:
+        raise AppError("订阅不存在。")
+    if not isinstance(file_path, str) or "\x00" in file_path:
+        raise AppError("视频路径格式无效。")
+    target = Path(file_path)
+    if not target.is_absolute() or target.suffix.casefold() not in VIDEO_EXTENSIONS:
+        raise AppError("视频路径格式无效。")
+    root = Path(subscription["download_dir"]).resolve()
+    resolved = target.resolve()
+    if not resolved.is_relative_to(root):
+        raise AppError("视频路径不在当前订阅目录内。")
+    with closing(connect_video_database()) as connection:
+        indexed = connection.execute(
+            "SELECT size, mtime_ns FROM local_video_files WHERE subscription_id=? AND code=? AND path=?",
+            (subscription_id, code, str(target)),
+        ).fetchone()
+    if indexed is None or indexed_video_path(target, *indexed) is None:
+        raise AppError("未找到当前版本的视频，请刷新列表后重试。")
+    nfo = video_nfo_path(resolved)
+    original = nfo_signature(nfo)
+    if original is None:
+        raise AppError("该视频的同名 NFO 文件不存在。")
+    if original.st_size > MAX_NFO_BYTES:
+        raise AppError("NFO 文件超过 1 MiB，无法预览。")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    with os.fdopen(os.open(nfo, flags), "rb") as stream:
+        current = os.fstat(stream.fileno())
+        if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
+            raise AppError("NFO 文件已变化，请重新打开。")
+        if current.st_size > MAX_NFO_BYTES:
+            raise AppError("NFO 文件超过 1 MiB，无法预览。")
+        raw = stream.read(MAX_NFO_BYTES + 1)
+    if len(raw) > MAX_NFO_BYTES:
+        raise AppError("NFO 文件超过 1 MiB，无法预览。")
+    encoding = "utf-16" if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+    return {"name": nfo.name, "content": raw.decode(encoding, errors="replace")}
 
 
 def get_subscription_video_file_info(subscription_id, code, file_path):
@@ -4154,7 +5581,7 @@ def link_local_release_to_subscription(source, download_dir, code):
     source_path = Path(source)
     if source_path.is_symlink() or not source_path.is_file() or source_path.suffix.casefold() not in VIDEO_EXTENSIONS:
         raise AppError("数据库中的来源影片已不存在或不是有效视频文件。")
-    target_root = Path(download_dir)
+    target_root = Path(release_download_directory(download_dir, code))
     target_root.mkdir(parents=True, exist_ok=True)
     target_root = target_root.resolve()
     sources = [source_path]
@@ -4260,7 +5687,7 @@ def poll_downloader_records(downloader, records, results, all_records=None, perf
                     if task:
                         if not active.get("completed_missing_recheck_requested"):
                             try:
-                                location = downloader.recheck(active["hash"], active["download_dir"])
+                                location = downloader.recheck(active["hash"], release_download_directory(active["download_dir"], code))
                                 active["completed_missing_recheck_requested"] = True
                                 active["state"] = "downloading"
                                 active["message"] = f"qBittorrent 中仍有该任务，但订阅目录缺少视频；已切换到订阅目录并执行强制校验。{f'下载器路径：{location}。' if location else ''}"
@@ -4293,7 +5720,7 @@ def poll_downloader_records(downloader, records, results, all_records=None, perf
         if task.get("state") == "missingFiles":
             recheck_now = not active.get("missing_files_recheck_requested")
             if recheck_now:
-                location = downloader.recheck(active["hash"], active.get("download_dir", ""))
+                location = downloader.recheck(active["hash"], release_download_directory(active.get("download_dir", ""), code))
                 active["missing_files_recheck_requested"] = True
             active["state"] = "downloading"
             active["message"] = "qBittorrent 报告任务数据缺失，已触发强制校验并请求补下载缺失数据。" if recheck_now else "qBittorrent 任务数据仍在校验或等待补下载。"
@@ -4338,7 +5765,7 @@ def poll_downloader_records(downloader, records, results, all_records=None, perf
                     active["directory_warning_logged"] = True
                 if not active.get("directory_recheck_requested") and not active.get("existing_task_recheck_requested") and not active.get("existing_task_recheck_skipped_paused"):
                     try:
-                        location = downloader.recheck(active["hash"], active.get("download_dir", ""))
+                        location = downloader.recheck(active["hash"], release_download_directory(active.get("download_dir", ""), code))
                         active["directory_recheck_requested"] = True
                         active["state"] = "downloading"
                         active["message"] += " 已切换到女优订阅对应的下载器目录并执行强制校验。"
@@ -4561,7 +5988,8 @@ def submit_candidate(subscription, candidate, token, downloader, item):
         clean_candidate["subtitle"] = str(next((detail.get(key) for key in ("smallDescr", "small_descr", "subtitle", "subTitle") if detail.get(key)), "") or "")
     clean_candidate["subtitle_checked"] = True
     torrent_data = fetch_torrent(candidate["id"], token)
-    added = downloader.add(torrent_data, candidate["title"], subscription["download_dir"])
+    download_dir = release_download_directory(subscription["download_dir"], candidate["code"])
+    added = downloader.add(torrent_data, candidate["title"], download_dir)
     if isinstance(added, dict):
         info_hash = added["hash"]
         owns_task = bool(added.get("owned", False))
@@ -5168,6 +6596,7 @@ def process_subscription(subscription, records, settings, downloader, results, r
         own_local_releases = scan_local_releases(subscription["download_dir"])
     rows = index_subscription_videos(subscription["id"], own_local_releases, subscription_records)
     collect_subscription_subtitles(rows, settings.get("subtitle_collection_dir", ""), subscription["performer"])
+    sync_subscription_covers(subscription, rows, records, settings)
 
 
 def _run_poll_once(trigger, subscription_id="", refresh_existing_info=False, completed_subscription_ids=None):
@@ -5640,6 +7069,29 @@ def handle_request():
         elif path.startswith("/api/subscriptions/") and "/videos/" in path and path.endswith("/cover") and method == "POST":
             subscription_id, code = path.removeprefix("/api/subscriptions/").removesuffix("/cover").split("/videos/", 1)
             result = get_subscription_video_cover(subscription_id, code, read_body().get("path", ""))
+        elif method == "GET" and (artwork := re.fullmatch(r"/api/subscriptions/([^/]+)/videos/([^/]+)/(cover|poster)-image", path)):
+            subscription_id, code, image_type = artwork.groups()
+            image = get_local_cover_image(subscription_id, code, poster=image_type == "poster")
+            if image is None:
+                emit_json("404 Not Found", {"error": "暂无本地海报。" if image_type == "poster" else "暂无本地封面。"})
+            else:
+                emit("200 OK", *image)
+            return
+        elif method == "GET" and (gallery := re.fullmatch(r"/api/subscriptions/([^/]+)/videos/([^/]+)/screenshots(?:/([0-9]{1,9}))?", path)):
+            subscription_id, code, position = gallery.groups()
+            if position is None:
+                result = get_local_screenshots(subscription_id, code)
+            else:
+                image = get_local_screenshot_image(subscription_id, code, int(position))
+                if image is None:
+                    emit_json("404 Not Found", {"error": "找不到这张本地截图。"})
+                else:
+                    emit("200 OK", *image)
+                return
+        elif method == "GET" and (gallery := re.fullmatch(r"/api/subscriptions/([^/]+)/videos/([^/]+)/gallery", path)):
+            result = get_local_gallery(*gallery.groups())
+        elif method == "POST" and (nfo_request := re.fullmatch(r"/api/subscriptions/([^/]+)/videos/([^/]+)/nfo", path)):
+            result = get_subscription_video_nfo(*nfo_request.groups(), read_body().get("path", ""))
         elif path.startswith("/api/subscriptions/") and "/videos/" in path and path.endswith("/file-info") and method == "POST":
             subscription_id, code = path.removeprefix("/api/subscriptions/").removesuffix("/file-info").split("/videos/", 1)
             payload = read_body()

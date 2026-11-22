@@ -1262,6 +1262,52 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
         self.assertEqual(saved["mediainfo"], mediainfo)
         self.assertTrue(saved["mediainfo_checked"])
 
+    def test_reads_only_the_selected_versions_same_name_nfo_without_rescanning(self):
+        root = Path(app.DATA_ROOT) / "nfo-preview"
+        root.mkdir()
+        first, second = (root / name for name in ("ABC-123 first.mkv", "ABC-123 second.mp4"))
+        first.touch()
+        second.touch()
+        nfo = first.with_suffix(".NFO")
+        raw = "<movie>\n  <title>第一版</title>\n</movie>\n"
+        nfo.write_bytes(raw.encode("utf-8-sig"))
+        (root / "movie.nfo").write_text("<movie><title>共享 NFO</title></movie>", encoding="utf-8")
+        app.write_json(app.SUBSCRIPTIONS_FILE, [{"id": "nfo-preview", "performer": "Actress", "download_dir": str(root)}])
+        files = app.get_subscription_videos("nfo-preview")["videos"][0]["files"]
+        self.assertEqual({file["name"]: file["has_nfo"] for file in files}, {first.name: True, second.name: False})
+        endpoint = "/api/subscriptions/nfo-preview/videos/ABC-123/nfo"
+        with patch.object(app, "scan_local_releases", side_effect=AssertionError("preview must reuse the index")), \
+             patch.dict(os.environ, {"PATH_INFO": endpoint, "REQUEST_METHOD": "POST", "REQUEST_URI": ""}), \
+             patch.object(app, "read_body", return_value={"path": str(first)}), patch.object(app, "emit_json") as emit:
+            app.handle_request()
+        emit.assert_called_once()
+        status, result = emit.call_args.args
+        self.assertEqual((status, result["name"].casefold(), result["content"]), ("200 OK", nfo.name.casefold(), raw))
+        with self.assertRaisesRegex(app.AppError, "同名 NFO"):
+            app.get_subscription_video_nfo("nfo-preview", "ABC-123", str(second))
+
+    def test_nfo_preview_rejects_out_of_scope_and_oversize_files(self):
+        root = Path(app.DATA_ROOT) / "nfo-scope"
+        root.mkdir()
+        video = root / "ABC-123.mp4"
+        video.touch()
+        outside = root.parent / "ABC-123.mp4"
+        outside.touch()
+        nfo = video.with_suffix(".nfo")
+        nfo.write_bytes(b"x" * (app.MAX_NFO_BYTES + 1))
+        app.write_json(app.SUBSCRIPTIONS_FILE, [{"id": "nfo-scope", "performer": "Actress", "download_dir": str(root)}])
+        app.get_subscription_videos("nfo-scope")
+        for code, path, reason in (
+            ("ABC-123", outside, "订阅目录"), ("DEF-456", video, "当前版本"), ("ABC-123", video, "1 MiB"),
+        ):
+            with self.subTest(code=code, path=path):
+                with self.assertRaisesRegex(app.AppError, reason):
+                    app.get_subscription_video_nfo("nfo-scope", code, str(path))
+        nfo.unlink()
+        nfo.mkdir()
+        with self.assertRaisesRegex(app.AppError, "普通文件"):
+            app.get_subscription_video_nfo("nfo-scope", "ABC-123", str(video))
+
     def test_single_video_refresh_replaces_cached_mediainfo_and_keeps_other_file_metadata(self):
         root = Path(app.DATA_ROOT) / "refresh-mediainfo"
         root.mkdir()
@@ -1337,6 +1383,7 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
         app.write_json(app.SETTINGS_FILE, {"mteam_token": "token", "downloader": {"type": "qbittorrent", "url": "http://nas:8080", "username": "user", "password": "secret"}})
         app.write_json(app.RECORDS_FILE, {subscription["id"]: {
             "SSNI-618": {"current": {"id": "1289514", "hash": "livehash", "rank": [2, 1, 2]}},
+            "IPX-813": {"current": {"hash": "untaggedhash"}},
             "FAILED-001": {"last_error": "M-Team 参数错误"},
         }})
 
@@ -1346,11 +1393,14 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
 
             def list_tasks(self, hashes=None):
                 return {
-                    "livehash": {"name": "SSNI-618 4K", "progress": .42, "complete": False, "state": "downloading", "failed": False},
-                    "otherhash": {"name": "Other active torrent", "progress": .25, "complete": False, "state": "stalledDL", "failed": False},
-                    "numberedhash": {"name": "IPX-811 1080p x264", "progress": .25, "complete": False, "state": "stalledDL", "failed": False},
-                    "queuedhash": {"name": "IPX-812 1080p x264", "progress": 0, "complete": False, "state": "queuedDL", "failed": False},
-                    "donehash": {"name": "Completed torrent", "progress": 1, "complete": True, "state": "uploading", "failed": False},
+                    "livehash": {"name": "SSNI-618 4K", "progress": .42, "state": "downloading", "tags": "其他, AV订阅-馒头"},
+                    "otherhash": {"name": "Other active torrent", "progress": .25, "state": "stalledDL", "tags": "AV订阅-馒头"},
+                    "numberedhash": {"name": "IPX-811 1080p x264", "progress": .25, "state": "stalledDL", "tags": "AV订阅-馒头"},
+                    "queuedhash": {"name": "IPX-812 1080p x264", "progress": 0, "state": "queuedDL", "tags": "AV订阅-馒头"},
+                    "donehash": {"name": "IPX-814", "progress": 1, "complete": True, "state": "uploading", "tags": "AV订阅-馒头"},
+                    "untaggedhash": {"name": "IPX-813", "progress": .25, "state": "downloading"},
+                    "similartaghash": {"name": "IPX-815", "progress": .25, "state": "downloading", "tags": "旧AV订阅-馒头, AV订阅-馒头备份"},
+                    "sportshash": {"name": "2026 T20I Australia V England 1080p KAYO WEBRiP 50FPS H265 AAC-THECiG.mkv", "state": "downloading"},
                 }
 
         with patch.object(app, "Downloader", LiveDownloader):
@@ -1380,34 +1430,40 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
                 self.config = config
 
             def list_tasks(self, hashes=None):
-                return {"sharedhash": {"name": "SSNI-618 4K", "progress": .42, "complete": False, "state": "downloading", "failed": False}}
+                return {"sharedhash": {"name": "SSNI-618 4K", "progress": .42, "state": "downloading", "tags": "AV订阅-馒头"}}
 
         with patch.object(app, "Downloader", LiveDownloader):
             rows = app.get_activity()
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0]["subscription"], rows[0]["state"], rows[0]["pending"]), ("Upgrading", "upgrading", True))
 
-    def test_activity_joins_untracked_task_by_number_to_failed_subscription_record(self):
+    def test_activity_does_not_assign_untracked_tasks_to_a_subscription_by_title(self):
         subscription = app.create_subscription({"performer": "三上悠亚", "download_dir": "/vol1/video"})
         app.write_json(app.SETTINGS_FILE, {"mteam_token": "token", "downloader": {"type": "qbittorrent", "url": "http://nas:8080", "username": "user", "password": "secret"}})
         app.write_json(app.RECORDS_FILE, {subscription["id"]: {
             "SSIS-663": {
                 "last_error": "下载器 API 请求失败 (HTTP 409)",
-                "mteam_metadata": {"title": "SSIS-663 引退発表 126日後にAV女優をやめる三上悠亜", "rank": [1, 2, 2]},
+                "mteam_metadata": {"id": "1234567", "rank": [1, 2, 2]},
             },
+            "S01-2026": {"mteam_metadata": {"id": "2345678"}},
         }})
 
-        class LiveDownloader:
-            def __init__(self, config):
-                self.config = config
+        task_titles = {
+            "orphanhash": "SSIS-663 1080p",
+            "season1": "20th Century Electric Catalogue S01 2026 1080p NF WEB-DL H.264",
+            "season2": "Great Pretender S02 2024 1080p NF WEB-DL H.264",
+            "sports1": "2026 T20I Australia V England 1080p KAYO WEBRip",
+            "sports2": "20261121 tottenham-ipswich USA eng 1080p",
+        }
 
-            def list_tasks(self, hashes=None):
-                return {"orphanhash": {"name": "SSIS-663 引退発表 126日後にAV女優をやめる三上悠亜", "progress": .06, "complete": False, "state": "downloading", "failed": False}}
-
-        with patch.object(app, "Downloader", LiveDownloader):
+        with patch.object(app.Downloader, "list_tasks", return_value={
+            info_hash: {"name": title, "progress": .06, "state": "downloading", "tags": "AV订阅-馒头"}
+            for info_hash, title in task_titles.items()
+        }):
             rows = app.get_activity()
-        self.assertEqual(len(rows), 1)
-        self.assertEqual((rows[0]["subscription_id"], rows[0]["subscription"], rows[0]["code"]), (subscription["id"], "三上悠亚", "SSIS-663"))
+        self.assertEqual([row["hash"] for row in rows], ["orphanhash"])
+        self.assertEqual((rows[0]["subscription_id"], rows[0]["subscription"], rows[0]["code"], rows[0]["mteam_id"]),
+                         ("", "qBittorrent", "SSIS-663", ""))
 
     def test_activity_surfaces_downloader_read_errors(self):
         app.write_json(app.SETTINGS_FILE, {"downloader": {"type": "qbittorrent", "url": "http://nas:8080"}})
@@ -1734,7 +1790,7 @@ class DownloaderTests(unittest.TestCase):
             if path.endswith("/torrents/add"):
                 return FakeResponse(b"Ok.")
             if "/torrents/info" in path:
-                return FakeResponse(json.dumps([{"hash": info_hash, "name": "demo", "progress": 1, "state": "uploading", "save_path": "/video"}]).encode())
+                return FakeResponse(json.dumps([{"hash": info_hash, "name": "demo", "progress": 1, "state": "uploading", "save_path": "/video", "tags": "AV订阅-馒头"}]).encode())
             if path.endswith("/torrents/delete"):
                 return FakeResponse(b"")
             raise AssertionError(path)
@@ -1743,11 +1799,14 @@ class DownloaderTests(unittest.TestCase):
         with patch.object(app.urllib.request, "urlopen", side_effect=fake_open):
             self.assertEqual(client.test(), "qBittorrent 连接成功。")
             self.assertEqual(client.add(raw_torrent, "demo", "/video"), info_hash)
-            self.assertTrue(client.list_tasks()[info_hash]["complete"])
+            task = client.list_tasks()[info_hash]
+            self.assertTrue(task["complete"])
+            self.assertEqual(task["tags"], "AV订阅-馒头")
             client.remove(info_hash, True)
         add_request = next(item for item in calls if item.full_url.endswith("/torrents/add"))
         self.assertIn(b"savepath", add_request.data)
         self.assertIn(b"/video", add_request.data)
+        self.assertIn('name="tags"\r\n\r\nAV订阅-馒头\r\n'.encode("utf-8"), add_request.data)
         delete_request = next(item for item in calls if item.full_url.endswith("/torrents/delete"))
         self.assertIn(b"deleteFiles=true", delete_request.data)
         self.assertEqual(sum(item.full_url.endswith("/auth/login") for item in calls), 1)
@@ -2104,7 +2163,7 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(captured, ["三上悠亚 ltx"])
         self.assertEqual(records["sub"]["SSNI-618"]["current"]["state"], "downloading")
         self.assertEqual(records["sub"]["SSNI-618"]["mteam_metadata"]["id"], "1")
-        self.assertEqual(downloader.added[0][2], "/video")
+        self.assertEqual(downloader.added[0][2], "/video/SSNI-618")
 
     def test_multi_directory_local_wash_is_opt_in_and_cleans_only_after_upgrade(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2327,7 +2386,7 @@ class UpgradeTests(unittest.TestCase):
 
         app.poll_downloader_records(downloader, records, results)
 
-        self.assertEqual(downloader.rechecked, [("old-task", str(root))])
+        self.assertEqual(downloader.rechecked, [("old-task", str(root / "SSIS-419"))])
         self.assertEqual(records["SSIS-419"]["current"]["state"], "downloading")
         self.assertTrue(records["SSIS-419"]["current"]["completed_missing_recheck_requested"])
         self.assertEqual(results[-1]["state"], "downloading")
@@ -2845,7 +2904,7 @@ class UpgradeTests(unittest.TestCase):
         self.assertFalse(new_video.exists())
         self.assertIn("pending", record)
         self.assertEqual(record["pending"]["state"], "downloading")
-        self.assertEqual(downloader.removed, [("recheck", "existinghash", str(root))])
+        self.assertEqual(downloader.removed, [("recheck", "existinghash", str(root / "ABF-017"))])
         self.assertEqual(results[-1]["state"], "downloading")
 
     def test_existing_local_number_is_not_downloaded_twice(self):
@@ -3265,11 +3324,11 @@ class UpgradeTests(unittest.TestCase):
             app.process_subscription(app.list_subscriptions()[1], records, {"mteam_token": "token"}, downloader, [])
         fetch.assert_not_called()
         self.assertEqual(downloader.added, [])
-        target_video = target_dir / source.name
+        target_video = target_dir / "IPX-811" / source.name
         self.assertTrue(target_video.exists())
         self.assertEqual(source.stat().st_ino, target_video.stat().st_ino)
-        self.assertEqual((target_dir / subtitle.name).stat().st_ino, subtitle.stat().st_ino)
-        self.assertEqual((target_dir / nfo.name).stat().st_ino, nfo.stat().st_ino)
+        self.assertEqual((target_video.parent / subtitle.name).stat().st_ino, subtitle.stat().st_ino)
+        self.assertEqual((target_video.parent / nfo.name).stat().st_ino, nfo.stat().st_ino)
         target_record = records["target"]["IPX-811"]
         self.assertTrue(target_record["shared_local"])
         self.assertTrue(target_record["current"]["local_existing"])
@@ -3590,8 +3649,8 @@ class UpgradeTests(unittest.TestCase):
         downloader.progress_callback = lambda message, event: app.log_event(message, event=event, subscription="Actress")
         app.poll_downloader_records(downloader, records, results)
         self.assertEqual(downloader.rechecked, ["existinghash"])
-        target.mkdir()
-        target_video = target / "SSNI-229.mp4"
+        target_video = target / "SSNI-229" / "SSNI-229.mp4"
+        target_video.parent.mkdir(parents=True)
         target_video.write_bytes(b"restored video")
         app.poll_downloader_records(downloader, records, results)
         self.assertNotIn("directory_recheck_requested", release)
