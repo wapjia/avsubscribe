@@ -61,6 +61,80 @@ class CheckPerformanceTests(unittest.TestCase):
         self.assertEqual(sorted(map(len, source.queries)), [5, 100, 100])
         self.assertEqual(set().union(*source.queries), hashes)
 
+    def test_downloader_cache_logs_real_json_fields_without_exposing_secrets(self):
+        app.write_json(app.SETTINGS_FILE, {"debug_mode": True})
+        source = app.Downloader({"url": "http://qb.test", "type": "qbittorrent"})
+        source.cookies["SID"] = "private-session"
+        downloader = app.CheckDownloader(source, self.context)
+        tasks = [{"hash": "one", "name": "ABC-123", "size": 100, "magnet_uri": "private-magnet"}]
+        files = [{"name": "ABC-123.mp4", "size": 100}]
+        properties = {"comment": "Copied private-session"}
+        trackers = [{"url": "https://tracker.test/passkey", "status": 2}]
+        with patch.object(source, "_json", side_effect=[(value, None) for value in (tasks, files, properties, trackers)]) as request:
+            for _ in range(2):
+                self.assertIn("one", downloader.list_tasks(["one"]))
+                self.assertEqual(downloader.list_task_files("one"), files)
+                self.assertEqual(downloader.task_mteam_metadata("one"), (properties, trackers))
+        self.assertEqual(request.call_count, 4)
+        logs = [entry["message"] for entry in app.get_logs() if entry["event"] == "debug_http_response"]
+        self.assertEqual(len(logs), 4)
+        self.assertEqual([json.loads(message.split("\n", 2)[2]) for message in logs], [
+            [{**tasks[0], "magnet_uri": "[已隐藏]"}], files, {"comment": "Copied [已隐藏]"},
+            [{"url": "[已隐藏]", "status": 2}],
+        ])
+
+    def test_sync_processes_large_batch_from_one_snapshot(self):
+        hashes = {f"{index:040x}" for index in range(205)}
+        source = SnapshotDownloader({key: {"progress": .25} for key in hashes})
+        downloader = app.CheckDownloader(source, self.context, hashes)
+        records = {key: {"current": {"hash": key, "state": "downloading"}} for key in hashes}
+        with patch.object(downloader, "list_tasks", wraps=downloader.list_tasks) as snapshots:
+            results = []
+            app.poll_downloader_records(downloader, records, results)
+        snapshots.assert_called_once_with(hashes)
+        self.assertEqual(len(results), 205)
+        self.assertEqual(sorted(map(len, source.queries)), [5, 100, 100])
+
+    def test_submission_checks_local_file_changes_during_request_cooldown(self):
+        folder = self.root / "videos"
+        folder.mkdir()
+        app.scan_local_releases(str(folder))
+        subscription = {"performer": "Actress", "download_dir": str(folder)}
+        candidate = {"id": "10001", "code": "ABC-123", "title": "ABC-123", "rank": [1, 2, 1]}
+        downloader = SnapshotDownloader()
+
+        def download_after_wait(*_):
+            (folder / "ABC-123.mp4").touch()
+            self.context.resume_after_wait()
+            return b"torrent"
+
+        with patch.object(app, "mteam_detail", return_value={"performer": "Actress"}), \
+             patch.object(app, "fetch_torrent", side_effect=download_after_wait):
+            with self.assertRaisesRegex(app.AppError, "限流等待期间发生变化"):
+                app.submit_candidate(subscription, candidate, "token", downloader, None)
+        self.assertEqual(downloader.mutations, [])
+
+    def test_clean_scan_and_unchanged_index_share_enumeration_and_skip_writes(self):
+        directory = self.root / "videos"
+        directory.mkdir()
+        video = directory / "ABC-123.mp4"
+        video.touch()
+        (directory / "ABC-123.srt").touch()
+        app.write_json(app.SUBSCRIPTIONS_FILE, [{"id": "sub", "download_dir": str(directory)}])
+        releases = app.scan_local_releases(str(directory))
+        self.assertEqual(app.cleanup_orphan_sidecars(str(directory)), ([], []))
+        app.index_subscription_videos("sub", releases, {})
+        self.assertEqual(self.context.metrics["directory_walks"], 1)
+        self.assertEqual(self.context.metrics["index_writes"], 2)
+        app.index_subscription_videos("sub", releases, {})
+        self.assertEqual(self.context.metrics["index_writes"], 2)
+        video.write_bytes(b"new signature")
+        app.index_subscription_videos("sub", releases, {})
+        self.assertEqual(self.context.metrics["index_writes"], 3)
+        video.unlink()
+        app.index_subscription_videos("sub", {}, {})
+        self.assertEqual(self.context.metrics["index_writes"], 5)
+
     def test_snapshot_ttl_refreshes_existing_and_missing_hashes(self):
         source = SnapshotDownloader({"one": {"progress": .1}})
         downloader = app.CheckDownloader(source, self.context, {"one", "missing"})
@@ -174,6 +248,28 @@ class CheckPerformanceTests(unittest.TestCase):
             app.poll_downloader_records(downloader, records["one"], [], records)
             app.process_subscription(subscription, records, {"mteam_token": "token"}, downloader, [])
         self.assertEqual(scan.call_count, 1)
+
+    def test_single_number_lookup_copies_only_the_requested_scan_items(self):
+        directory = self.root / "videos"
+        key = str(directory.resolve())
+        items = [{"path": str(directory / "ABC-123.mp4"), "rank": [1, 0, 1]}]
+        self.context.scans[key] = {"ABC-123": items, "DEF-456": [{"rank": [2, 1, 2]}]}
+        with patch.object(app.copy, "deepcopy", wraps=app.copy.deepcopy) as clone:
+            result = app.find_local_releases(str(directory), "ABC-123")
+        clone.assert_called_once_with(items)
+        result[0]["rank"][0] = 99
+        self.assertEqual(items[0]["rank"], [1, 0, 1])
+
+    def test_subtitle_listing_is_reused_per_round_but_refetched_next_round(self):
+        listing = {"code": 0, "data": {"data": []}}
+        with patch.object(app, "mteam_json", return_value=listing) as request:
+            for _ in range(2):
+                app.MTEAM_POLL_CACHE.active = {}
+                for name in ("ABC-123 one.mp4", "ABC-123 two.mp4"):
+                    result = app.mteam_subtitle_download("ABC-123", "123456", [self.root / name], "token")
+                    self.assertEqual(result["status"], "not_found")
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(self.context.metrics["subtitle_list_hits"], 2)
 
     def test_large_path_matching_uses_one_overlap_lookup_per_task(self):
         targets = {}

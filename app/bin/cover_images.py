@@ -1,9 +1,12 @@
 """Fetch public cover images and read the app's local image files."""
 
+from __future__ import annotations
+
 import http.client
 import io
 import ipaddress
 import os
+import re
 import shutil
 import socket
 import stat
@@ -11,6 +14,8 @@ import subprocess
 import tempfile
 import time
 import urllib.parse
+from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 
@@ -28,6 +33,26 @@ class ImageHTTPError(ValueError):
     def __init__(self, status):
         super().__init__(f"图片下载失败（HTTP {status}）。")
         self.status = status
+
+
+@dataclass(frozen=True)
+class ImageResponse:
+    image: tuple[str, bytes] | None
+    validator: dict | None = None
+
+
+def conditional_image_headers(validator):
+    etag = validator.get("etag", "")
+    if isinstance(etag, str) and len(etag) <= 512 and re.fullmatch(r'(?:W/)?"[\x21\x23-\x7e]*"', etag):
+        return {"If-None-Match": etag}
+    modified = validator.get("last_modified", "")
+    if isinstance(modified, str) and len(modified) <= 80 and modified.isascii() and modified.isprintable():
+        try:
+            if parsedate_to_datetime(modified).tzinfo is not None:
+                return {"If-Modified-Since": modified}
+        except (ValueError, OverflowError):
+            pass
+    return {}
 
 
 def image_extension(data):
@@ -126,6 +151,12 @@ def public_image_address(url):
 
 
 def fetch(url):
+    return fetch_image(url).image
+
+
+def fetch_image(url, validator=None):
+    original_url = url
+    validator = validator or {}
     deadline = time.monotonic() + 15
     for _ in range(5):
         parsed, host, port, addresses = public_image_address(url)
@@ -147,8 +178,12 @@ def fetch(url):
         target = urllib.parse.quote(parsed.path or "/", safe="/%:@!$&'()*+,;=-._~")
         if parsed.query:
             target += "?" + urllib.parse.quote(parsed.query, safe="/?%:@!$&'()*+,;=-._~")
+        # Validators apply to the exact resource that sent them, including after a redirect.
+        headers = {"Accept": "image/jpeg, image/png, image/webp, image/gif"}
+        conditional = (conditional_image_headers(validator)
+                       if validator.get("url") == original_url and validator.get("target") == url else {})
         try:
-            connection.request("GET", target, headers={"Accept": "image/jpeg, image/png, image/webp, image/gif"})
+            connection.request("GET", target, headers={**headers, **conditional})
             with connection.getresponse() as response:
                 if response.status in (301, 302, 303, 307, 308):
                     location = response.getheader("Location")
@@ -156,6 +191,8 @@ def fetch(url):
                         raise ValueError("封面跳转缺少地址。")
                     url = urllib.parse.urljoin(url, location)
                     continue
+                if response.status == 304 and conditional:
+                    return ImageResponse(None, validator)
                 if response.status != 200:
                     raise ImageHTTPError(response.status)
                 length = response.getheader("Content-Length", "")
@@ -172,7 +209,9 @@ def fetch(url):
                     if len(data) > MAX_BYTES:
                         raise ValueError("封面超过 12 MiB。")
                 image = bytes(data)
-                return image_extension(image), image
+                received = {"url": original_url, "target": url, "etag": response.getheader("ETag", ""),
+                            "last_modified": response.getheader("Last-Modified", "")}
+                return ImageResponse((image_extension(image), image), received if conditional_image_headers(received) else None)
         finally:
             connection.close()
     raise ValueError("封面跳转次数过多。")

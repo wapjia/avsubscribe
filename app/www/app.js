@@ -1,6 +1,7 @@
 import { TrimApp } from "./vendor/trim-web-app.js";
 import { APP_VERSION } from "./version.js";
-import { selectLogRound } from "./log-utils.mjs";
+import { filterLogEntries, matchesKeywords, selectLogRound, splitHttpLog } from "./log-utils.mjs";
+import { activeRepairForVideo, repairPhaseLabel, videoRepairStatus } from "./repair-status.mjs";
 
 const $ = (selector) => document.querySelector(selector);
 const fnosApp = new TrimApp();
@@ -18,28 +19,70 @@ let existingVideos = [];
 let existingForId = "";
 let existingVideoCount = 0;
 let existingVideosLoading = false;
+let existingVideosError = "";
+let existingVideosRequest = 0;
+let actresses = [];
+let actressesLoading = null;
+let actressRequestRevision = 0;
+let lastActressesRefresh = 0;
+const actressDrafts = new Map();
+const actressProfileQueue = new Map();
+const subscriptionActressProfiles = new Map();
+const subscriptionAvatarObserver = typeof IntersectionObserver === "function" ? new IntersectionObserver((entries, observer) => {
+  for (const { target, isIntersecting } of entries) {
+    if (!isIntersecting || !target.isConnected) continue;
+    preloadCover(target.actress.profile?.avatar_url);
+    observer.unobserve(target);
+  }
+}) : null;
+let actressProfileLoading = false;
+let actressProfileRetryAt = 0;
+let actressProfileRetryTimer = 0;
+let actressProfileAnchor = null;
+const actressProfilePopup = document.createElement("div");
+actressProfilePopup.className = "actress-profile-popup";
+actressProfilePopup.id = "actress-profile-popup";
+actressProfilePopup.setAttribute("role", "tooltip");
+actressProfilePopup.hidden = true;
+document.body.append(actressProfilePopup);
+const actressProfileObserver = typeof IntersectionObserver === "function" ? new IntersectionObserver((entries) => {
+  for (const entry of entries) {
+    const button = entry.target;
+    if (entry.isIntersecting) queueActressProfile(button);
+    else if (actressProfileQueue.get(button.actress.source_name) === button) actressProfileQueue.delete(button.actress.source_name);
+  }
+}) : null;
 let lastStatusState = "";
 let currentStatus = {};
 let repairJobs = [];
 const awaitedRepairJobs = new Set();
 let refreshInFlight = false;
-let subscriptionsLoaded = false;
+let activityRefreshInFlight = false;
+let subscriptionRefreshInFlight = false;
+let subscriptionRevision = 0;
 let logsLoaded = false;
 let lastSubscriptionRefresh = 0;
 let lastActivityRefresh = 0;
 let lastLogId = 0;
 let blacklistNumbers = [];
+let searchKeywords = [];
 let pathMappings = [];
 const videoSubtitleRequests = new Map();
 const videoFileInfoRequests = new Map();
-const videoCoverRequests = new Map();
-const coverPreview = document.createElement("div");
-coverPreview.className = "cover-preview";
-coverPreview.id = "video-cover-preview";
-coverPreview.setAttribute("role", "tooltip");
-coverPreview.hidden = true;
-document.body.append(coverPreview);
-let coverAnchor = null;
+const videoHardlinkRequests = new Map();
+const coverPreloads = new Map();
+const coverHoverPreview = document.createElement("div");
+coverHoverPreview.className = "cover-hover-preview";
+coverHoverPreview.setAttribute("aria-hidden", "true");
+coverHoverPreview.hidden = true;
+document.body.append(coverHoverPreview);
+const hardlinkPreview = document.createElement("div");
+hardlinkPreview.className = "hardlink-preview";
+hardlinkPreview.id = "video-hardlink-preview";
+hardlinkPreview.setAttribute("role", "tooltip");
+hardlinkPreview.hidden = true;
+document.body.append(hardlinkPreview);
+let hardlinkAnchor = null;
 let nfoLoad = 0;
 const videoRefreshStates = new Map();
 const appBase = window.location.pathname.replace(/\/$/, "");
@@ -88,13 +131,74 @@ function makeButton(label, className, action, title = "") {
   return button;
 }
 
+function subscriptionSearchKeyword(subscription) {
+  return subscriptionSearchKeywords(subscription).join("，");
+}
+
+function subscriptionSearchKeywords(subscription) {
+  const savedKeywords = Array.isArray(subscription?.search_keywords)
+    ? subscription.search_keywords.map((value) => String(value || "").trim()).filter(Boolean)
+    : [];
+  if (savedKeywords.length) return savedKeywords;
+  if (String(subscription?.search_keyword || "").trim()) return [String(subscription.search_keyword).trim()];
+  const performer = String(subscription?.performer || "").trim();
+  const legacyKeyword = String(subscription?.keywords || "").trim();
+  return [[performer, legacyKeyword || "ltx"].filter(Boolean).join(" ")];
+}
+
+function renderSearchKeywordTags() {
+  const container = $("#search-keyword-tags");
+  const input = $("#search-keyword");
+  container.replaceChildren();
+  for (const keyword of searchKeywords) {
+    const tag = document.createElement("span");
+    tag.className = "blacklist-tag search-keyword-tag";
+    const text = document.createElement("span");
+    text.textContent = keyword;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "blacklist-remove";
+    remove.textContent = "×";
+    remove.title = `移除搜索关键字 ${keyword}`;
+    remove.setAttribute("aria-label", `移除搜索关键字 ${keyword}`);
+    remove.addEventListener("click", () => {
+      searchKeywords = searchKeywords.filter((value) => value !== keyword);
+      renderSearchKeywordTags();
+      input.focus();
+    });
+    tag.append(text, remove);
+    container.append(tag);
+  }
+  container.append(input);
+}
+
+function addSearchKeywords(value) {
+  const keywords = String(value || "").split(/[，,]/).map((item) => item.trim()).filter(Boolean);
+  for (const keyword of keywords) {
+    if (keyword.length > 200) {
+      toast("每组搜索关键字不能超过 200 个字符。", true);
+      return false;
+    }
+    if (!searchKeywords.includes(keyword)) {
+      if (searchKeywords.length >= 30) {
+        toast("搜索关键字最多添加 30 组。", true);
+        return false;
+      }
+      searchKeywords.push(keyword);
+    }
+  }
+  $("#search-keyword").value = "";
+  renderSearchKeywordTags();
+  return true;
+}
+
 function useSystemBrowser(link) {
   link.target = "_blank";
   link.rel = "noopener noreferrer";
   let opening = false;
   link.addEventListener("click", async (event) => {
     // Native fnOS WebViews need the host bridge; target=_blank can replace the app.
-    if (fnosApp.isWeb !== false) return;
+    if (!link.hasAttribute("href") || fnosApp.isWeb !== false) return;
     event.preventDefault();
     if (opening) return;
     opening = true;
@@ -187,22 +291,118 @@ function videoRefreshKey(subscriptionId, path) {
   return JSON.stringify([subscriptionId, path]);
 }
 
-function hideCoverPreview() {
-  coverAnchor?.removeAttribute("aria-describedby");
-  coverAnchor = null;
-  coverPreview.hidden = true;
-  coverPreview.replaceChildren();
+function hideHardlinkPreview() {
+  hardlinkAnchor?.removeAttribute("aria-describedby");
+  hardlinkAnchor = null;
+  hardlinkPreview.hidden = true;
+  hardlinkPreview.replaceChildren();
 }
 
-function positionCoverPreview() {
-  if (!coverAnchor?.isConnected) return hideCoverPreview();
-  const bounds = coverAnchor.getBoundingClientRect();
-  const box = coverPreview.getBoundingClientRect();
+function hideCoverHoverPreview() {
+  coverHoverPreview.hidden = true;
+  coverHoverPreview.replaceChildren();
+}
+
+function showCoverHoverPreview(thumbnail, urls) {
+  if (window.matchMedia("(max-width: 600px)").matches || !urls.length) return;
+  hideCoverHoverPreview();
+  const currentImage = thumbnail.querySelector("img");
+  if (currentImage?.complete && currentImage.naturalWidth > 0) {
+    const immediate = currentImage.cloneNode(true);
+    immediate.alt = "";
+    immediate.removeAttribute("loading");
+    immediate.removeAttribute("decoding");
+    coverHoverPreview.append(immediate);
+    coverHoverPreview.hidden = false;
+    const anchor = thumbnail.getBoundingClientRect();
+    const { width, height } = coverHoverPreview.getBoundingClientRect();
+    const rightEdge = document.documentElement.clientWidth - width - 8;
+    const left = anchor.right + 8 <= rightEdge ? anchor.right + 8 : anchor.left - width - 8;
+    coverHoverPreview.style.left = `${Math.max(8, Math.min(left, rightEdge))}px`;
+    coverHoverPreview.style.top = `${Math.max(8, Math.min(anchor.top, window.innerHeight - height - 8))}px`;
+    return;
+  }
+  const preview = document.createElement("img");
+  preview.alt = "";
+  preview.loading = "eager";
+  preview.decoding = "sync";
+  preview.referrerPolicy = "no-referrer";
+  preview.addEventListener("load", () => {
+    if (preview.parentElement !== coverHoverPreview || !thumbnail.isConnected) return;
+    coverHoverPreview.hidden = false;
+    const anchor = thumbnail.getBoundingClientRect();
+    const { width, height } = coverHoverPreview.getBoundingClientRect();
+    const rightEdge = document.documentElement.clientWidth - width - 8;
+    const left = anchor.right + 8 <= rightEdge ? anchor.right + 8 : anchor.left - width - 8;
+    coverHoverPreview.style.left = `${Math.max(8, Math.min(left, rightEdge))}px`;
+    coverHoverPreview.style.top = `${Math.max(8, Math.min(anchor.top, window.innerHeight - height - 8))}px`;
+  });
+  const alternatives = [...new Set(urls)].values();
+  const loadNext = () => {
+    if (preview.parentElement !== coverHoverPreview) return;
+    const next = alternatives.next();
+    if (next.done) hideCoverHoverPreview();
+    else preview.src = next.value;
+  };
+  preview.addEventListener("error", loadNext);
+  coverHoverPreview.append(preview);
+  loadNext();
+}
+
+function preloadCover(url) {
+  if (!url || coverPreloads.has(url) || window.matchMedia("(max-width: 600px)").matches) return;
+  const image = new Image();
+  image.decoding = "async";
+  image.referrerPolicy = "no-referrer";
+  image.src = url;
+  coverPreloads.set(url, image);
+}
+
+function positionHardlinkPreview() {
+  if (!hardlinkAnchor?.isConnected) return hideHardlinkPreview();
+  const bounds = hardlinkAnchor.getBoundingClientRect();
+  const box = hardlinkPreview.getBoundingClientRect();
   const width = document.documentElement.clientWidth;
   const height = window.innerHeight;
-  const left = bounds.right + 10 + box.width <= width - 8 ? bounds.right + 10 : Math.max(8, bounds.left - box.width - 10);
-  coverPreview.style.left = `${Math.min(left, Math.max(8, width - box.width - 8))}px`;
-  coverPreview.style.top = `${Math.max(8, Math.min(bounds.top, height - box.height - 8))}px`;
+  const left = bounds.left + box.width <= width - 8 ? bounds.left : Math.max(8, width - box.width - 8);
+  hardlinkPreview.style.left = `${Math.min(left, Math.max(8, width - box.width - 8))}px`;
+  const below = bounds.bottom + 8 + box.height <= height - 8;
+  hardlinkPreview.style.top = `${Math.max(8, Math.min(below ? bounds.bottom + 8 : bounds.top - box.height - 8, height - box.height - 8))}px`;
+}
+
+async function showHardlinkPreview(anchor, subscriptionId, code, file) {
+  hideHardlinkPreview();
+  hardlinkAnchor = anchor;
+  anchor.setAttribute("aria-describedby", hardlinkPreview.id);
+  hardlinkPreview.hidden = false;
+  const heading = document.createElement("strong");
+  heading.className = "hardlink-preview-title";
+  heading.textContent = "硬链接路径";
+  const paths = document.createElement("pre");
+  paths.className = "hardlink-preview-paths";
+  paths.textContent = "正在读取路径…";
+  hardlinkPreview.replaceChildren(heading, paths);
+  positionHardlinkPreview();
+  const key = `${subscriptionId}:${file.path}`;
+  if (!videoHardlinkRequests.has(key)) {
+    const request = api(`/api/subscriptions/${encodeURIComponent(subscriptionId)}/videos/${encodeURIComponent(code)}/hardlinks`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: file.path })
+    }).catch((error) => {
+      videoHardlinkRequests.delete(key);
+      throw error;
+    });
+    videoHardlinkRequests.set(key, request);
+  }
+  try {
+    const result = await videoHardlinkRequests.get(key);
+    if (hardlinkAnchor !== anchor) return;
+    paths.textContent = (result.paths || []).join("\n") || "没有找到已索引的硬链接路径。";
+    positionHardlinkPreview();
+  } catch (error) {
+    if (hardlinkAnchor !== anchor) return;
+    paths.textContent = `读取硬链接路径失败：${error.message}`;
+    positionHardlinkPreview();
+  }
 }
 
 function sortCoverFiles(files) {
@@ -215,134 +415,40 @@ function sortCoverFiles(files) {
   });
 }
 
-function attachCoverPreview(anchor, code, files, subscriptionId, localImage) {
-  anchor.tabIndex = 0;
-  const show = async () => {
-    hideCoverPreview();
-    coverAnchor = anchor;
-    anchor.setAttribute("aria-describedby", coverPreview.id);
-    coverPreview.hidden = false;
-    const file = sortCoverFiles(files).find((item) => item.mteam_id);
-    const caption = document.createElement("div");
-    caption.className = "cover-caption";
-    caption.textContent = file?.subtitle || file?.rank_title || code;
-    const message = document.createElement("div");
-    message.className = "cover-message";
-    message.textContent = file || localImage ? "正在加载封面…" : "暂无关联 M-Team ID，请先修复数据。";
-    coverPreview.replaceChildren(caption, message);
-    positionCoverPreview();
-    if (!file && !localImage) return;
-    try {
-      let url = localImage ? appUrl(localImage) : file.cover_url || "";
-      if (!url && !file.cover_checked) {
-        const key = `${subscriptionId}:${file.path}:${file.mteam_id}`;
-        if (!videoCoverRequests.has(key)) {
-          const request = api(`/api/subscriptions/${encodeURIComponent(subscriptionId)}/videos/${encodeURIComponent(code)}/cover`, {
-            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: file.path })
-          }).catch((error) => { videoCoverRequests.delete(key); throw error; });
-          videoCoverRequests.set(key, request);
-        }
-        const result = await videoCoverRequests.get(key);
-        file.cover_url = result.cover_url || "";
-        file.cover_checked = Boolean(result.cover_checked);
-        url = file.cover_url;
-      }
-      if (coverAnchor !== anchor) return;
-      if (!url || (!localImage && !/^https?:\/\//i.test(url))) {
-        message.textContent = "M-Team 详情暂无封面。";
-        return;
-      }
-      const image = document.createElement("img");
-      image.alt = `${code} 封面`;
-      image.referrerPolicy = "no-referrer";
-      image.addEventListener("load", () => {
-        if (coverAnchor !== anchor) return;
-        message.remove();
-        positionCoverPreview();
-      });
-      image.addEventListener("error", () => {
-        if (coverAnchor !== anchor) return;
-        image.remove();
-        message.textContent = "封面图片加载失败。";
-        positionCoverPreview();
-      });
-      coverPreview.insertBefore(image, caption);
-      image.src = url;
-      positionCoverPreview();
-    } catch (error) {
-      if (coverAnchor === anchor) message.textContent = `封面读取失败：${error.message}`;
-    }
-  };
-  anchor.addEventListener("mouseenter", show);
-  anchor.addEventListener("focus", show);
-  anchor.addEventListener("mouseleave", hideCoverPreview);
-  anchor.addEventListener("blur", hideCoverPreview);
-}
-window.addEventListener("resize", hideCoverPreview);
+window.addEventListener("resize", hideHardlinkPreview);
+window.addEventListener("resize", hideCoverHoverPreview);
+window.addEventListener("scroll", hideCoverHoverPreview, true);
 
 const coverDialog = $("#cover-dialog");
-const coverViewer = $("#cover-viewer");
 const coverGallery = $("#cover-gallery");
 const coverGalleryImages = $("#cover-gallery-images");
 const coverGalleryMessage = $("#cover-gallery-message");
-const coverBack = $("#cover-back");
-const coverStage = $("#cover-stage");
-const coverLarge = $("#cover-large");
-const coverMessage = $("#cover-viewer-message");
-const coverPointers = new Map();
-let coverZoom = 1;
-let coverOffset = { x: 0, y: 0 };
+const coverOpenMessage = $("#cover-open-message");
 let coverGalleryLoad = 0;
-let coverGalleryScroll = 0;
-let coverZoomTrigger = null;
 
-function applyCoverTransform() {
-  const { clientWidth: width, clientHeight: height } = coverStage;
-  const { naturalWidth, naturalHeight } = coverLarge;
-  if (!width || !height || !naturalWidth || !naturalHeight) return;
-  const fit = Math.min(1, width / naturalWidth, height / naturalHeight);
-  const clamp = (offset, image, viewport) => {
-    const limit = Math.max(0, (image * fit * coverZoom - viewport) / 2);
-    return Math.min(limit, Math.max(-limit, offset));
-  };
-  coverOffset.x = clamp(coverOffset.x, naturalWidth, width);
-  coverOffset.y = clamp(coverOffset.y, naturalHeight, height);
-  coverLarge.style.transform = `translate(${coverOffset.x}px, ${coverOffset.y}px) scale(${coverZoom})`;
+async function openGalleryImage(button, localPath) {
+  const load = coverGalleryLoad;
+  coverOpenMessage.hidden = true;
+  button.disabled = true;
+  try {
+    if (fnosApp.isWeb && (fnosApp.isStandaloneWeb || window.parent === window)) {
+      throw new Error("请在飞牛客户端中打开原图。");
+    }
+    const path = await localPath;
+    if (!coverDialog.open || load !== coverGalleryLoad) return;
+    if (!path) throw new Error("图片尚未保存到飞牛，请先检查订阅或修复数据。");
+    await fnosApp.openFile(path);
+  } catch (error) {
+    if (coverDialog.open && load === coverGalleryLoad) {
+      coverOpenMessage.textContent = `无法用飞牛打开图片：${error.message || error}`;
+      coverOpenMessage.hidden = false;
+    }
+  } finally {
+    button.disabled = false;
+  }
 }
 
-function resetCoverZoom() {
-  coverPointers.clear();
-  coverZoom = 1;
-  coverOffset = { x: 0, y: 0 };
-  coverLarge.style.transform = "";
-  coverLarge.removeAttribute("src");
-}
-
-function zoomGalleryImage(trigger, label, url) {
-  coverGalleryScroll = coverGallery.scrollTop;
-  coverZoomTrigger = trigger;
-  coverGallery.hidden = true;
-  coverStage.hidden = false;
-  coverBack.hidden = false;
-  coverLarge.alt = label;
-  coverLarge.hidden = true;
-  coverMessage.textContent = "正在加载图片…";
-  coverMessage.hidden = false;
-  coverLarge.src = url;
-  coverBack.focus({ preventScroll: true });
-}
-
-function showCoverGallery() {
-  resetCoverZoom();
-  coverStage.hidden = true;
-  coverBack.hidden = true;
-  coverGallery.hidden = false;
-  coverGallery.scrollTop = coverGalleryScroll;
-  coverZoomTrigger?.focus({ preventScroll: true });
-  coverZoomTrigger = null;
-}
-
-function appendGalleryImage(label, url, lazy) {
+function appendGalleryImage(label, url, lazy, localPath) {
   const figure = document.createElement("figure");
   const caption = document.createElement("figcaption");
   if (!url) {
@@ -352,9 +458,8 @@ function appendGalleryImage(label, url, lazy) {
     coverGalleryImages.append(figure);
     return;
   }
-  const button = document.createElement("button");
-  button.type = "button";
-  button.setAttribute("aria-label", `放大${label}`);
+  const button = makeButton("", "gallery-image", (event) => openGalleryImage(event.currentTarget, localPath), `用飞牛打开${label}`);
+  button.setAttribute("aria-label", button.title);
   const image = document.createElement("img");
   image.alt = "";
   image.loading = lazy ? "lazy" : "eager";
@@ -362,12 +467,10 @@ function appendGalleryImage(label, url, lazy) {
   image.referrerPolicy = "no-referrer";
   caption.textContent = label;
   image.addEventListener("error", () => {
-    button.disabled = true;
     caption.textContent = `${label}加载失败`;
   });
   image.src = url;
   button.append(image);
-  button.addEventListener("click", () => zoomGalleryImage(button, label, url));
   figure.append(button, caption);
   coverGalleryImages.append(figure);
 }
@@ -407,30 +510,32 @@ function appendGalleryMetadata(metadata) {
   coverGalleryImages.append(details);
 }
 
-async function openCoverViewer(code, url, subscriptionId) {
-  hideCoverPreview();
+async function openCoverViewer(code, url, subscriptionId, coverPathKey) {
   const load = ++coverGalleryLoad;
   $("#cover-title").textContent = code;
-  coverGalleryScroll = 0;
-  showCoverGallery();
+  coverOpenMessage.hidden = true;
   coverGalleryImages.replaceChildren();
-  appendGalleryImage("封面", url, false);
   coverGalleryMessage.textContent = "正在加载截图…";
   coverGalleryMessage.hidden = false;
-  coverDialog.showModal();
+  if (fnosApp.isWeb === false) {
+    coverDialog.classList.add("native-gallery");
+    coverDialog.show();
+  } else {
+    coverDialog.classList.remove("native-gallery");
+    coverDialog.showModal();
+  }
   coverGallery.scrollTop = 0;
   coverGallery.focus({ preventScroll: true });
-  if (window.matchMedia("(pointer: coarse)").matches && document.fullscreenEnabled && coverViewer.requestFullscreen) {
-    coverViewer.requestFullscreen().then(() => {
-      if (!coverDialog.open && document.fullscreenElement === coverViewer) return document.exitFullscreen();
-    }).catch(() => {});
-  }
+
+  const galleryRequest = api(`/api/subscriptions/${encodeURIComponent(subscriptionId)}/videos/${encodeURIComponent(code)}/gallery`);
+  const coverPath = coverPathKey ? galleryRequest.then((gallery) => gallery[coverPathKey], () => "") : "";
+  appendGalleryImage("封面", url, false, coverPath);
   try {
-    const { screenshots, metadata } = await api(`/api/subscriptions/${encodeURIComponent(subscriptionId)}/videos/${encodeURIComponent(code)}/gallery`);
+    const { screenshots, metadata } = await galleryRequest;
     if (!coverDialog.open || load !== coverGalleryLoad) return;
     appendGalleryMetadata(metadata);
     for (const screenshot of screenshots) {
-      appendGalleryImage(`截图 ${screenshot.position}`, appUrl(screenshot.url), true);
+      appendGalleryImage(`截图 ${screenshot.position}`, appUrl(screenshot.url), true, screenshot.path);
     }
     coverGalleryMessage.textContent = "暂无已保存的截图。";
     coverGalleryMessage.hidden = screenshots.length > 0;
@@ -441,87 +546,33 @@ async function openCoverViewer(code, url, subscriptionId) {
 }
 
 $("#cover-close").addEventListener("click", () => coverDialog.close());
-coverBack.addEventListener("click", showCoverGallery);
-coverDialog.addEventListener("cancel", (event) => {
-  if (!coverStage.hidden) {
-    event.preventDefault();
-    showCoverGallery();
-  }
-});
 coverDialog.addEventListener("click", (event) => {
   if (event.target === coverDialog) coverDialog.close();
 });
 coverDialog.addEventListener("close", () => {
   coverGalleryLoad++;
-  if (document.fullscreenElement === coverViewer) document.exitFullscreen().catch(() => {});
-  resetCoverZoom();
-  coverZoomTrigger = null;
   coverGalleryImages.replaceChildren();
 });
-coverLarge.addEventListener("load", () => {
-  if (!coverDialog.open || coverStage.hidden) return;
-  coverLarge.hidden = false;
-  coverMessage.hidden = true;
-  applyCoverTransform();
-});
-coverLarge.addEventListener("error", () => {
-  if (!coverDialog.open || coverStage.hidden) return;
-  coverLarge.hidden = true;
-  coverMessage.textContent = "图片加载失败。";
-  coverMessage.hidden = false;
-});
-coverStage.addEventListener("pointerdown", (event) => {
-  if (coverLarge.hidden || event.button !== 0 || coverPointers.size >= 2) return;
-  coverPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-  coverStage.setPointerCapture(event.pointerId);
-});
-coverStage.addEventListener("pointermove", (event) => {
-  if (!coverPointers.has(event.pointerId)) return;
-  const before = [...coverPointers.values()];
-  coverPointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-  const after = [...coverPointers.values()];
-  if (after.length === 2) {
-    const distance = ([a, b]) => Math.hypot(a.x - b.x, a.y - b.y);
-    const priorDistance = distance(before);
-    if (priorDistance < 1) return;
-    const nextZoom = Math.min(5, Math.max(1, coverZoom * distance(after) / priorDistance));
-    const rect = coverStage.getBoundingClientRect();
-    for (const axis of ["x", "y"]) {
-      const center = axis === "x" ? rect.left + rect.width / 2 : rect.top + rect.height / 2;
-      const previous = (before[0][axis] + before[1][axis]) / 2 - center;
-      const next = (after[0][axis] + after[1][axis]) / 2 - center;
-      coverOffset[axis] = next - (previous - coverOffset[axis]) * nextZoom / coverZoom;
-    }
-    coverZoom = nextZoom;
-  } else if (coverZoom > 1) {
-    coverOffset.x += after[0].x - before[0].x;
-    coverOffset.y += after[0].y - before[0].y;
-  }
-  applyCoverTransform();
-});
-for (const event of ["pointerup", "pointercancel", "lostpointercapture"]) {
-  coverStage.addEventListener(event, ({ pointerId }) => coverPointers.delete(pointerId));
-}
-window.addEventListener("resize", applyCoverTransform);
-window.addEventListener("scroll", hideCoverPreview, true);
-document.addEventListener("keydown", (event) => { if (event.key === "Escape") hideCoverPreview(); });
 
 function updateVideoRefreshButton(button, state) {
   const pending = state?.state === "pending";
   const success = state?.state === "success";
   const failed = state?.state === "error";
-  button.disabled = Boolean(pending);
+  const waiting = state?.state === "waiting";
+  const skipped = state?.state === "skipped";
+  button.disabled = Boolean(pending || state?.locked);
   button.classList.toggle("is-refreshing", Boolean(pending));
   button.classList.toggle("refresh-success", Boolean(success));
   button.classList.toggle("refresh-error", Boolean(failed));
+  button.classList.toggle("refresh-waiting", Boolean(waiting || skipped));
   button.setAttribute("aria-busy", String(Boolean(pending)));
-  const seconds = pending ? Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000)) : 0;
+  const seconds = pending && state.showElapsed !== false ? Math.max(0, Math.floor((Date.now() - state.startedAt) / 1000)) : 0;
   const label = pending ? `${state.phaseLabel || "修复中"}${seconds ? ` ${formatLogDuration(seconds)}` : "…"}`
-    : success ? "已修复" : failed ? "重试" : "";
+    : state?.phaseLabel || (success ? "已修复" : failed ? "重试" : "");
   button.replaceChildren();
   const icon = document.createElement("span");
   icon.className = "video-refresh-icon";
-  icon.textContent = success ? "✓" : failed ? "!" : "↻";
+  icon.textContent = success ? "✓" : failed ? "!" : waiting || skipped ? "·" : "↻";
   icon.setAttribute("aria-hidden", "true");
   button.append(icon);
   if (label) {
@@ -530,22 +581,28 @@ function updateVideoRefreshButton(button, state) {
     button.append(text);
   }
   button.title = pending ? (state.message || "正在核对 ID、刷新信息、检查字幕和图片，请稍候。")
-    : success ? state.message
+    : success || state?.locked ? (state.message || "")
     : failed ? `${state.message}\n点击重试修复此视频数据。`
-    : "修复此视频数据：核对 M-Team ID、刷新影片信息和 MediaInfo、补齐缺少的中文字幕，并重新下载封面和截图。";
+    : "修复此视频数据：归档到番号目录，核对 M-Team ID 和 MediaInfo，补齐字幕、封面和截图。";
   button.setAttribute("aria-label", `${button.dataset.filename}：${label || "修复此视频数据"}${failed ? `，${state.message}` : ""}`);
+}
+
+function currentVideoRepairStatus(button) {
+  const { subscriptionId, code, path, refreshKey } = button.dataset;
+  const job = activeRepairForVideo(repairJobs, subscriptionId, path);
+  return job ? videoRepairStatus(job, code, path) : videoRefreshStates.get(refreshKey);
 }
 
 async function refreshVideoInformation(subscriptionId, code, file) {
   const key = videoRefreshKey(subscriptionId, file.path);
-  if (videoRefreshStates.get(key)?.state === "pending" || repairJobs.some((job) =>
-    job.subscription_id === subscriptionId && ["queued", "running"].includes(job.state) && (!job.path || job.path === file.path))) return;
+  if (videoRefreshStates.get(key)?.state === "pending" || activeRepairForVideo(repairJobs, subscriptionId, file.path)) return;
   videoRefreshStates.set(key, { state: "pending", startedAt: Date.now(), phaseLabel: "正在排队" });
   renderExistingVideos();
   try {
     const result = await api(`/api/subscriptions/${encodeURIComponent(subscriptionId)}/repair`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: file.path, code })
     });
+    videoRefreshStates.delete(key);
     awaitedRepairJobs.add(result.job_id);
     repairJobs = [...repairJobs.filter((job) => job.job_id !== result.job_id), result];
     renderDataRepairStatus(repairJobs);
@@ -602,6 +659,8 @@ function addBlacklistNumber() {
 function renderSubscriptions() {
   const list = $("#subscription-menu");
   const mobilePicker = $("#mobile-subscription-picker");
+  subscriptionAvatarObserver?.disconnect();
+  if (list.contains(actressProfileAnchor)) hideActressProfile();
   list.replaceChildren();
   mobilePicker.replaceChildren();
   const placeholder = document.createElement("option");
@@ -627,16 +686,16 @@ function renderSubscriptions() {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "subscription-nav";
-      button.title = [item.performer, item.keywords].filter(Boolean).join(" ");
       const dot = document.createElement("span");
       dot.className = "subscription-dot";
       const label = document.createElement("span");
       label.className = "subscription-nav-label";
       label.dataset.subscriptionId = item.id;
       label.textContent = `${item.performer}(${Number(item.video_count) || 0})`;
-      label.title = `本地影片 ${Number(item.video_count) || 0} 个（按视频文件统计）`;
       button.append(dot, label);
       button.addEventListener("click", () => showSubscription(item.id));
+      bindSubscriptionActressProfile(button, item, true);
+      if (button.actress.profile?.avatar_url) subscriptionAvatarObserver?.observe(button);
       const actions = document.createElement("div");
       actions.className = "subscription-nav-actions";
       const edit = document.createElement("button");
@@ -663,15 +722,486 @@ function renderSubscriptions() {
   renderPage();
 }
 
+function hideActressProfile() {
+  actressProfileAnchor?.removeAttribute("aria-describedby");
+  actressProfileAnchor = null;
+  actressProfilePopup.hidden = true;
+}
+
+function showActressProfile(button) {
+  hideActressProfile();
+  actressProfileAnchor = button;
+  button.setAttribute("aria-describedby", actressProfilePopup.id);
+  const actress = button.actress;
+  const profile = actress.profile;
+  const title = [...new Set([actress.chinese_name || actress.display_name, profile?.name || actress.source_name, profile?.romanized_name]
+    .map((name) => name?.trim()).filter(Boolean))].join(" / ");
+  const years = profile?.active_start
+    ? `${profile.active_start}${profile.active_end ? `–${profile.active_end}` : " 起"}`
+    : profile?.active_end || "";
+  const fields = [["名称", title], ["日文读音", profile?.reading], ["生日", profile?.birthday],
+    ["身高", profile?.height_cm ? `${profile.height_cm} cm` : ""], ["出身", profile?.origin],
+    ["血型", profile?.blood_type], ["活跃年份", years]];
+  const list = document.createElement("dl");
+  for (const [key, value] of fields) {
+    if (!profile && key !== "名称") continue;
+    const row = document.createElement("div");
+    const label = document.createElement("dt");
+    const data = document.createElement("dd");
+    label.textContent = key;
+    data.textContent = value || "—";
+    row.append(label, data);
+    list.append(row);
+  }
+  const content = [list];
+  if (!profile) {
+    const status = document.createElement("p");
+    status.textContent = button.profileError || (actress.profile_pending ? "正在读取资料…" : "暂无资料");
+    content.push(status);
+  }
+  const thumbnail = button.querySelector("img");
+  const url = profile?.avatar_url;
+  const photo = url ? (thumbnail?.getAttribute("src") === url ? thumbnail.cloneNode(false) : createActressImage(url)) : null;
+  actressProfilePopup.classList.toggle("has-photo", Boolean(photo));
+  if (photo) {
+    photo.className = "actress-profile-photo";
+    photo.loading = "eager";
+    photo.addEventListener("error", () => {
+      if (photo.parentNode !== actressProfilePopup) return;
+      photo.remove();
+      actressProfilePopup.classList.remove("has-photo");
+    }, { once: true });
+    content.unshift(photo);
+  }
+  actressProfilePopup.replaceChildren(...content);
+  actressProfilePopup.hidden = false;
+  positionActressProfile();
+}
+
+function positionActressProfile() {
+  if (!actressProfileAnchor) return;
+  const anchor = actressProfileAnchor.getBoundingClientRect();
+  if (anchor.bottom <= 0 || anchor.top >= window.innerHeight || anchor.right <= 0 || anchor.left >= window.innerWidth) {
+    hideActressProfile();
+    return;
+  }
+  const panel = actressProfilePopup.getBoundingClientRect();
+  const left = anchor.right + panel.width + 8 <= window.innerWidth ? anchor.right + 8
+    : anchor.left - panel.width - 8 >= 8 ? anchor.left - panel.width - 8
+    : anchor.left;
+  const top = left === anchor.left ? anchor.bottom + 6 : anchor.top;
+  actressProfilePopup.style.left = `${Math.max(8, Math.min(left, window.innerWidth - panel.width - 8))}px`;
+  actressProfilePopup.style.top = `${Math.max(8, Math.min(top, window.innerHeight - panel.height - 8))}px`;
+}
+
+function createActressImage(url, loading = "eager") {
+  const image = document.createElement("img");
+  image.alt = "";
+  image.loading = loading;
+  image.decoding = "async";
+  image.referrerPolicy = "no-referrer";
+  image.src = url;
+  return image;
+}
+
+function paintActressAvatar(button) {
+  const url = button.actress.profile?.avatar_url;
+  if (!url || button.dataset.avatarUrl === url) return;
+  button.dataset.avatarUrl = url;
+  const image = createActressImage(url, "lazy");
+  image.addEventListener("load", () => button.replaceChildren(image), { once: true });
+  button.append(image);
+}
+
+function queueActressProfile(button) {
+  if (!button.actress.profile_pending) return;
+  actressProfileQueue.set(button.actress.source_name, button);
+  void loadQueuedActressProfile();
+}
+
+async function loadQueuedActressProfile() {
+  if (actressProfileLoading || activeView !== "actresses" || !actressProfileQueue.size) return;
+  if (Date.now() < actressProfileRetryAt) {
+    if (!actressProfileRetryTimer) actressProfileRetryTimer = window.setTimeout(() => {
+      actressProfileRetryTimer = 0;
+      void loadQueuedActressProfile();
+    }, actressProfileRetryAt - Date.now());
+    return;
+  }
+  const [sourceName, button] = actressProfileQueue.entries().next().value;
+  actressProfileQueue.delete(sourceName);
+  if (!button.isConnected || !button.actress.profile_pending) {
+    void loadQueuedActressProfile();
+    return;
+  }
+  actressProfileLoading = true;
+  try {
+    const result = await api("/api/actresses/profile", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source_name: sourceName }),
+    });
+    const current = actresses.find((actress) => actress.source_name === sourceName);
+    if (current) Object.assign(current, result);
+    Object.assign(button.actress, result);
+    for (const avatar of $("#actress-body").querySelectorAll(".actress-avatar")) {
+      if (avatar.actress.source_name !== sourceName) continue;
+      Object.assign(avatar.actress, result);
+      avatar.profileError = result.profile_pending ? "未配置 M-Team 令牌" : "";
+      paintActressAvatar(avatar);
+      updateActressShowcaseLink(avatar.closest("tr")?.querySelector(".actress-showcase-link"), result.profile);
+      if (actressProfileAnchor === avatar) showActressProfile(avatar);
+    }
+    if (result.profile_pending) actressProfileRetryAt = Date.now() + 60000;
+  } catch (error) {
+    button.profileError = error.message;
+    if (actressProfileAnchor === button) showActressProfile(button);
+    actressProfileRetryAt = Date.now() + 60000;
+  } finally {
+    actressProfileLoading = false;
+    void loadQueuedActressProfile();
+  }
+}
+
+function makeActressAvatar(actress) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "actress-avatar";
+  button.actress = actress;
+  button.setAttribute("aria-label", `${actress.source_name}的资料`);
+  const fallback = document.createElement("span");
+  fallback.setAttribute("aria-hidden", "true");
+  fallback.textContent = Array.from(actress.source_name)[0] || "·";
+  button.append(fallback);
+  paintActressAvatar(button);
+  bindActressProfileTrigger(button, () => queueActressProfile(button));
+  if (actress.profile_pending) actressProfileObserver?.observe(button);
+  return button;
+}
+
+function bindActressProfileTrigger(button, loadProfile, hoverOnly = false) {
+  const reveal = () => {
+    showActressProfile(button);
+    loadProfile();
+  };
+  button.addEventListener("pointerenter", (event) => { if (event.pointerType === "mouse") reveal(); });
+  button.addEventListener("pointerleave", (event) => {
+    if (event.pointerType === "mouse" && actressProfileAnchor === button && (hoverOnly || !button.matches(":focus-visible"))) hideActressProfile();
+  });
+  if (hoverOnly) return;
+  button.addEventListener("focus", () => { if (button.matches(":focus-visible")) reveal(); });
+  button.addEventListener("blur", () => { if (actressProfileAnchor === button) hideActressProfile(); });
+  button.addEventListener("click", () => { if (actressProfileAnchor === button) hideActressProfile(); else reveal(); });
+}
+
+function subscriptionActressProfileState(subscription) {
+  let state = subscriptionActressProfiles.get(subscription.id);
+  if (!state || state.actress.source_name !== subscription.performer) {
+    state = { actress: { source_name: subscription.performer, display_name: subscription.performer, profile_pending: true }, cached: null };
+    subscriptionActressProfiles.set(subscription.id, state);
+  }
+  const cached = subscription.actress_profile;
+  if (cached && state.cached !== cached) {
+    if (JSON.stringify(cached) !== JSON.stringify(state.cached)) Object.assign(state.actress, cached);
+    state.cached = cached;
+  }
+  return state;
+}
+
+function bindSubscriptionActressProfile(button, subscription, hoverOnly = false) {
+  const state = subscriptionActressProfileState(subscription);
+  button.actress = state.actress;
+  bindActressProfileTrigger(button, async () => {
+    if (!state.actress.profile_pending) return;
+    button.profileError = "";
+    if (!state.request) {
+      const path = `/api/subscriptions/${encodeURIComponent(subscription.id)}/actress-profile`;
+      state.request = api(path, { method: "POST" }).then((result) => {
+        Object.assign(state.actress, result);
+      }).finally(() => { state.request = null; });
+    }
+    try {
+      await state.request;
+      if (state.actress.profile_pending) button.profileError = "未配置 M-Team 令牌";
+    } catch (error) {
+      button.profileError = error.message;
+    }
+    if (actressProfileAnchor === button) showActressProfile(button);
+  }, hoverOnly);
+}
+
+function renderSubscriptionTitle(subscription) {
+  const title = $("#selected-title");
+  const existing = title.firstElementChild;
+  if (existing && existing.dataset.subscriptionId === subscription?.id && existing.textContent === subscription.performer) {
+    subscriptionActressProfileState(subscription);
+    return;
+  }
+  if (actressProfileAnchor === existing) hideActressProfile();
+  if (!subscription) {
+    title.textContent = "订阅已删除";
+    return;
+  }
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "subscription-actress-name";
+  button.dataset.subscriptionId = subscription.id;
+  button.textContent = subscription.performer;
+  bindSubscriptionActressProfile(button, subscription);
+  title.replaceChildren(button);
+}
+
+document.addEventListener("pointerdown", (event) => {
+  if (actressProfileAnchor && !actressProfileAnchor.contains(event.target) && !actressProfilePopup.contains(event.target)) hideActressProfile();
+});
+document.addEventListener("keydown", (event) => { if (event.key === "Escape") hideActressProfile(); });
+window.addEventListener("scroll", (event) => {
+  if (!(event.target instanceof Node && actressProfilePopup.contains(event.target))) positionActressProfile();
+}, true);
+window.addEventListener("resize", hideActressProfile);
+
+function updateActressShowcaseLink(link, profile) {
+  if (!link) return;
+  const id = String(profile?.showcase_id ?? "");
+  if (/^\d+$/.test(id)) {
+    link.href = `https://kp.m-team.cc/showcaseDetail?id=${id}`;
+    link.title = "在 M-Team 查看女优资料";
+  } else {
+    link.removeAttribute("href");
+    link.removeAttribute("title");
+  }
+}
+
+function renderActresses(message = "") {
+  const body = $("#actress-body");
+  hideActressProfile();
+  actressProfileObserver?.disconnect();
+  actressProfileQueue.clear();
+  body.replaceChildren();
+  renderActressMergeOptions();
+  const groups = new Map();
+  for (const actress of actresses) {
+    const canonicalName = actress.canonical_name || actress.source_name;
+    if (!groups.has(canonicalName)) groups.set(canonicalName, []);
+    groups.get(canonicalName).push(actress);
+  }
+  const count = $("#actress-count");
+  count.textContent = `${groups.size} 位`;
+  if (!groups.size) {
+    const row = document.createElement("tr");
+    row.className = "actress-empty-row";
+    const cell = document.createElement("td");
+    cell.colSpan = 3;
+    cell.className = "empty";
+    cell.textContent = message || "暂无女优";
+    row.append(cell);
+    body.append(row);
+    return;
+  }
+  const orderedGroups = [...groups].map(([canonicalName, members]) => {
+    const actress = members.find((member) => member.source_name === canonicalName) || members[0];
+    return { canonicalName, members, actress, hasChineseName: Boolean(actress.chinese_name?.trim()) };
+  }).sort((a, b) => Number(a.hasChineseName) - Number(b.hasChineseName));
+  for (const { canonicalName, members, actress } of orderedGroups) {
+    const aliases = members.filter((member) => member.source_name !== canonicalName);
+    const row = document.createElement("tr");
+    const source = document.createElement("td");
+    source.className = "actress-name actress-name-cell";
+    const identity = document.createElement("div");
+    identity.className = "actress-identity";
+    const names = document.createElement("div");
+    const name = document.createElement("strong");
+    const showcase = document.createElement("a");
+    showcase.className = "actress-showcase-link";
+    showcase.textContent = canonicalName;
+    updateActressShowcaseLink(showcase, actress.profile);
+    useSystemBrowser(showcase);
+    name.append(showcase);
+    names.append(name);
+    if (aliases.length) {
+      const aliasList = document.createElement("span");
+      aliasList.className = "actress-aliases";
+      aliasList.textContent = `别名：${aliases.map((alias) => alias.source_name).join("、")}`;
+      names.append(aliasList);
+    }
+    identity.append(makeActressAvatar(actress), names);
+    source.append(identity);
+    const translationCell = document.createElement("td");
+    translationCell.className = "actress-translation-cell";
+    const translationRow = document.createElement("div");
+    translationRow.className = "actress-translation-row";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.maxLength = 120;
+    input.value = actressDrafts.has(actress.source_name)
+      ? actressDrafts.get(actress.source_name)
+      : actress.chinese_name || "";
+    input.placeholder = "填写中文名";
+    input.setAttribute("aria-label", `${actress.source_name} 的中文名`);
+    input.addEventListener("input", () => actressDrafts.set(actress.source_name, input.value));
+    const state = document.createElement("span");
+    state.className = "actress-save-state";
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "secondary";
+    save.textContent = "保存";
+    save.addEventListener("click", () => saveActressTranslation(actress.source_name, input.value, save, state));
+    translationRow.append(input, state);
+    translationCell.append(translationRow);
+    const action = document.createElement("td");
+    action.className = "actress-action-cell";
+    const subscribe = document.createElement("button");
+    subscribe.type = "button";
+    subscribe.className = "secondary actress-action-button actress-subscribe";
+    const chineseName = actressDrafts.has(actress.source_name) ? actressDrafts.get(actress.source_name).trim() : (actress.chinese_name || "").trim();
+    const sourceNames = new Set(members.map((member) => member.source_name));
+    const alreadySubscribed = subscriptions.some((subscription) =>
+      sourceNames.has(subscription.performer) || subscription.performer === chineseName
+    );
+    subscribe.textContent = alreadySubscribed ? "已添加" : "添加订阅";
+    subscribe.classList.toggle("is-added", alreadySubscribed);
+    subscribe.disabled = !chineseName || alreadySubscribed;
+    subscribe.title = alreadySubscribed ? "该女优已添加订阅" : chineseName ? "添加此女优订阅" : "请先填写并保存中文名，再添加订阅";
+    subscribe.addEventListener("click", () => openSubscription(null, chineseName));
+    const subscribeWrap = document.createElement("span");
+    subscribeWrap.className = "actress-subscribe-wrap";
+    subscribeWrap.title = subscribe.title;
+    subscribeWrap.append(subscribe);
+    const search = document.createElement("a");
+    search.className = "secondary actress-action-button actress-mteam-search";
+    search.textContent = "M-Team 搜索";
+    search.href = `https://kp.m-team.cc/browse/adult?keyword=${encodeURIComponent(`${chineseName} ltx`)}`;
+    search.target = "_blank";
+    search.rel = "noopener noreferrer";
+    search.setAttribute("aria-label", `在 M-Team 搜索 ${chineseName} ltx`);
+    useSystemBrowser(search);
+    search.setAttribute("aria-disabled", String(!chineseName));
+    if (!chineseName) search.removeAttribute("href");
+    save.classList.add("actress-action-button", "actress-save");
+    action.append(save, subscribeWrap, search);
+    row.append(source, translationCell, action);
+    body.append(row);
+  }
+}
+
+function renderActressMergeOptions() {
+  const sourceSelect = $("#actress-merge-source");
+  const targetSelect = $("#actress-merge-target");
+  const previousSource = sourceSelect.value;
+  const previousTarget = targetSelect.value;
+  const actressesByName = new Map(actresses.map((actress) => [actress.source_name, actress]));
+  const displayName = (actress) => {
+    const canonicalName = actress.canonical_name || actress.source_name;
+    const canonical = actressesByName.get(canonicalName);
+    const chineseName = (canonical?.chinese_name || actress.chinese_name || "").trim();
+    return chineseName ? `${actress.source_name}（${chineseName}）` : actress.source_name;
+  };
+  sourceSelect.replaceChildren();
+  targetSelect.replaceChildren();
+  const targetEmpty = document.createElement("option");
+  targetEmpty.value = "";
+  targetEmpty.textContent = "不归并（独立名称）";
+  targetSelect.append(targetEmpty);
+  for (const actress of actresses) {
+    const sourceOption = document.createElement("option");
+    sourceOption.value = actress.source_name;
+    sourceOption.textContent = displayName(actress);
+    sourceSelect.append(sourceOption);
+    if (!actress.canonical_name) {
+      const targetOption = document.createElement("option");
+      targetOption.value = actress.source_name;
+      targetOption.textContent = displayName(actress);
+      targetSelect.append(targetOption);
+    }
+  }
+  if ([...sourceSelect.options].some((option) => option.value === previousSource)) sourceSelect.value = previousSource;
+  if ([...targetSelect.options].some((option) => option.value === previousTarget)) targetSelect.value = previousTarget;
+}
+
+async function loadActresses() {
+  if (actressesLoading) return actressesLoading;
+  const revision = actressRequestRevision;
+  lastActressesRefresh = Date.now();
+  actressesLoading = api("/api/actresses").then((result) => {
+    if (revision !== actressRequestRevision) return;
+    actresses = result;
+    if (activeView === "actresses" && !actressEditorIsActive()) renderActresses();
+  }).catch((error) => {
+    toast(`读取女优列表失败：${error.message}`, true);
+  }).finally(() => {
+    actressesLoading = null;
+  });
+  return actressesLoading;
+}
+
+function actressEditorIsActive() {
+  return Boolean(actressProfileAnchor || document.querySelector("#actress-body input:focus, #actress-body .actress-save:disabled"));
+}
+
+async function saveActressTranslation(sourceName, chineseName, button, state) {
+  if (button.disabled) return;
+  chineseName = chineseName.trim();
+  actressRequestRevision++;
+  button.disabled = true;
+  button.textContent = "保存中";
+  state.textContent = "";
+  try {
+    const result = await api("/api/actresses", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source_name: sourceName, chinese_name: chineseName })
+    });
+    actresses = actresses.map((actress) => actress.source_name === sourceName ? { ...actress, chinese_name: result.chinese_name } : actress);
+    actressDrafts.delete(sourceName);
+    const input = button.closest("tr")?.querySelector("input");
+    if (input) input.value = result.chinese_name || "";
+    state.textContent = result.chinese_name ? "已保存" : "已清除";
+    if (activeView === "actresses") renderActresses();
+    toast(result.chinese_name ? `${sourceName} 的中文名已保存。` : `${sourceName} 的手动译名已清除。`);
+  } catch (error) {
+    state.textContent = "保存失败";
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = "保存";
+  }
+}
+
+async function mergeActress(sourceName, canonicalName, button, state) {
+  if (button.disabled) return;
+  button.disabled = true;
+  state.textContent = "保存中…";
+  try {
+    await api("/api/actresses/merge", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source_name: sourceName, canonical_name: canonicalName }),
+    });
+    actressRequestRevision++;
+    if (actressesLoading) await actressesLoading;
+    await loadActresses();
+    state.textContent = "归并已保存";
+  } catch (error) {
+    state.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function renderPage() {
   const settings = activeView === "settings";
   const all = activeView === "all";
+  const actressPage = activeView === "actresses";
+  if (!actressPage) actressProfileQueue.clear();
+  const profileView = actressPage ? "#actresses-view" : activeView === "subscription" ? "#subscription-view" : null;
+  if (actressProfileAnchor && !actressProfileAnchor.closest("#subscription-menu")
+    && (!profileView || !actressProfileAnchor.closest(profileView))) hideActressProfile();
   $("#settings-view").hidden = !settings;
-  $("#subscription-view").hidden = settings || all;
+  $("#actresses-view").hidden = !actressPage;
+  $("#subscription-view").hidden = settings || all || actressPage;
   $("#dashboard-activity").hidden = !all;
-  $("#mobile-subscription-bar").hidden = settings;
-  $("#log-section").hidden = settings;
-  $("#clear-logs").hidden = settings || (activeView === "subscription" && !subscriptions.some((item) => item.id === selectedSubscriptionId));
+  $("#mobile-subscription-bar").hidden = settings || actressPage;
+  $("#log-section").hidden = settings || actressPage;
+  $("#clear-logs").hidden = settings || actressPage || (activeView === "subscription" && !subscriptions.some((item) => item.id === selectedSubscriptionId));
   $("#clear-logs").textContent = activeView === "subscription" ? "清理当前女优日志" : "清理全部日志";
   for (const button of document.querySelectorAll(".nav-item")) {
     const active = button.dataset.view === activeView;
@@ -680,22 +1210,10 @@ function renderPage() {
     else button.removeAttribute("aria-current");
   }
   const selected = subscriptions.find((item) => item.id === selectedSubscriptionId);
-  $("#selected-title").textContent = selected?.performer || "订阅已删除";
+  renderSubscriptionTitle(selected);
   const description = $("#selected-description");
   description.replaceChildren();
-  if (selected) {
-    const searchTerms = [selected.performer, selected.keywords].map((value) => String(value || "").trim()).filter(Boolean);
-    const searchLink = document.createElement("a");
-    searchLink.className = "subscription-search-link";
-    searchLink.textContent = searchTerms.join(" · ");
-    searchLink.href = `https://kp.m-team.cc/browse/adult?keyword=${encodeURIComponent(searchTerms.join(" "))}`;
-    useSystemBrowser(searchLink);
-    searchLink.title = `在 M-Team 搜索：${searchTerms.join(" ")}`;
-    searchLink.setAttribute("aria-label", searchLink.title);
-    description.append(searchLink);
-  } else {
-    description.textContent = "查看订阅设置";
-  }
+  if (!selected) description.textContent = "查看订阅设置";
   $("#selected-scan").hidden = all;
   $("#selected-repair-data").hidden = all || !selected;
   $("#selected-edit").hidden = all || !selected;
@@ -704,7 +1222,7 @@ function renderPage() {
   summary.replaceChildren();
   if (selected) {
     const downloadPath = mapDownloaderPath(selected.download_dir).replace(/\/$/, "");
-    const details = [["搜索词", [selected.performer, selected.keywords].filter(Boolean).join(" ")], ["飞牛目录", selected.download_dir], ["下载器路径", `${downloadPath}/〈番号〉`], ["自动洗版", selected.wash_enabled ? "开启" : "关闭"]];
+    const details = [["搜索关键字", subscriptionSearchKeywords(selected)], ["飞牛目录", selected.download_dir], ["下载器路径", `${downloadPath}/〈番号〉`], ["自动洗版", selected.wash_enabled ? "开启" : "关闭"]];
     for (const [labelText, valueText] of details) {
       const item = document.createElement("div");
       item.className = "detail-item";
@@ -713,8 +1231,23 @@ function renderPage() {
       const label = document.createElement("span");
       label.textContent = labelText;
       const value = document.createElement("strong");
-      value.textContent = valueText;
-      value.title = valueText;
+      if (labelText === "搜索关键字") {
+        value.className = "search-keyword-links";
+        for (const [index, keyword] of valueText.entries()) {
+          const link = document.createElement("a");
+          link.className = "subscription-search-link";
+          link.textContent = keyword;
+          link.href = "https://kp.m-team.cc/browse/adult?keyword=" + encodeURIComponent(keyword);
+          link.title = "在 M-Team 搜索：" + keyword;
+          link.setAttribute("aria-label", link.title);
+          useSystemBrowser(link);
+          value.append(link);
+          if (index < valueText.length - 1) value.append(document.createTextNode("，"));
+        }
+      } else {
+        value.textContent = valueText;
+        value.title = valueText;
+      }
       item.append(label, value);
       summary.append(item);
     }
@@ -724,6 +1257,7 @@ function renderPage() {
     existingVideos = [];
     existingVideoCount = 0;
     existingVideosLoading = false;
+    existingVideosError = "";
   }
   renderActivity();
   renderLogs(logEntries);
@@ -769,6 +1303,7 @@ function galleryThumbnail(item, subscriptionId) {
   const remoteCover = sortCoverFiles(item.files || []).find((file) => /^https?:\/\//i.test(file.cover_url || ""))?.cover_url || "";
   const preview = item.screenshot_thumbnail ? appUrl(item.screenshot_thumbnail) : "";
   const covers = [localCover, remoteCover].filter(Boolean);
+  preloadCover(covers[0]);
   const thumbnails = [...new Set([poster, ...covers, preview].filter(Boolean))];
   const failed = new Set();
   let displayed = "";
@@ -797,47 +1332,81 @@ function galleryThumbnail(item, subscriptionId) {
     showNextThumbnail();
   });
   showNextThumbnail();
+  thumbnail.addEventListener("mouseenter", () => {
+    showCoverHoverPreview(thumbnail, [displayed, ...covers, poster].filter((url) => url && !failed.has(url)));
+  });
+  thumbnail.addEventListener("mouseleave", hideCoverHoverPreview);
   thumbnail.addEventListener("click", () => {
-    const coverUrl = [...covers, poster].find((url) => url && !failed.has(url)) || "";
-    openCoverViewer(item.code, coverUrl, subscriptionId);
+    hideCoverHoverPreview();
+    const coverUrl = (displayed && !failed.has(displayed))
+      ? displayed
+      : [...covers, poster].find((url) => url && !failed.has(url)) || "";
+    const pathKey = coverUrl === localCover ? "cover_path" : coverUrl === poster ? "poster_path" : "";
+    openCoverViewer(item.code, coverUrl, subscriptionId, pathKey);
   });
   return thumbnail;
 }
 
-function renderExistingVideos(errorMessage = "") {
-  hideCoverPreview();
+function renderVideoNumber(code) {
+  const label = document.createElement("span");
+  label.className = "video-number-label";
+  const text = document.createElement("span");
+  text.textContent = code;
+  label.append(text);
+  if (!code) return label;
+  const button = makeButton("", "video-number-copy", async () => {
+    try {
+      await writeClipboardText(code);
+      toast(`已复制番号 ${code}`);
+    } catch (error) {
+      toast(`复制番号失败：${error.message}`, true);
+    }
+  }, `复制番号 ${code}`);
+  button.setAttribute("aria-label", button.title);
+  // Lucide Copy icon; see vendor/lucide-LICENSE.txt.
+  button.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
+  label.append(button);
+  return label;
+}
+
+function renderExistingVideos() {
+  hideCoverHoverPreview();
   const body = $("#existing-body");
   body.replaceChildren();
-  $("#existing-count").textContent = `${existingVideoCount} 个视频`;
-  if (!existingVideos.length) {
+  const numberKey = (value) => value.normalize("NFKC").toLowerCase().replace(/[\s_\-‐‑–—]+/g, "");
+  const query = $("#existing-keyword").value;
+  const numberQuery = query.normalize("NFKC").split(/\s+/).map(numberKey).join(" ");
+  const visibleVideos = query.trim()
+    ? existingVideos.filter((item) => matchesKeywords([numberKey(item.code || "")], numberQuery))
+    : existingVideos;
+  const visibleCount = visibleVideos.reduce((count, item) => count + (item.files || []).length, 0);
+  $("#existing-count").textContent = query.trim() && existingVideos.length
+    ? `${visibleCount} / ${existingVideoCount} 个视频` : `${existingVideoCount} 个视频`;
+  if (!visibleVideos.length) {
     const row = document.createElement("tr");
     row.className = "existing-empty-row";
     const cell = document.createElement("td");
     cell.colSpan = 4;
     cell.className = "empty";
-    cell.textContent = errorMessage || (existingVideosLoading ? "正在加载本地影片…" : existingVideoCount > 0 ? `已扫描到 ${existingVideoCount} 个视频文件，但未能从文件名或所在文件夹识别番号。` : "暂未找到本地视频。");
+    cell.textContent = existingVideosError || (existingVideosLoading ? "正在加载本地影片…" :
+      existingVideos.length ? "没有匹配的番号。" :
+      existingVideoCount > 0 ? `已扫描到 ${existingVideoCount} 个视频文件，但未能从文件名或所在文件夹识别番号。` : "暂未找到本地视频。");
     row.append(cell);
     body.append(row);
     return;
   }
-  for (const item of existingVideos) {
+  for (const item of visibleVideos) {
     const row = document.createElement("tr");
     row.className = "existing-number-row";
     const codeCell = document.createElement("td");
-    codeCell.textContent = item.code || "";
+    codeCell.append(renderVideoNumber(item.code || ""));
     codeCell.className = "number-group-cell";
-    attachCoverPreview(codeCell, item.code, item.files || [], selectedSubscriptionId, item.cover_image);
-    if ((item.files || []).length > 1) {
-      const count = document.createElement("span");
-      count.className = "number-file-count";
-      count.textContent = `${item.files.length} 个版本`;
-      codeCell.append(count);
-    }
     row.append(codeCell);
 
     const coverCell = document.createElement("td");
     coverCell.className = "cover-cell";
     if (item.poster_image || item.cover_image || item.has_screenshots) {
+      row.classList.add("has-local-video-artwork");
       coverCell.append(galleryThumbnail(item, selectedSubscriptionId));
     } else {
       coverCell.textContent = "—";
@@ -869,29 +1438,36 @@ function renderExistingVideos(errorMessage = "") {
       const versionRow = document.createElement("div");
       versionRow.className = `version-row${fileIndex ? " additional-version" : ""}`;
       versionRow.style.setProperty("--file-index", fileIndex);
-      versionRow.append(versionLine);
+      const actions = document.createElement("div");
+      actions.className = "version-actions";
+      if (!fileIndex) {
+        const mobileNumber = document.createElement("div");
+        mobileNumber.className = "mobile-video-number";
+        mobileNumber.append(renderVideoNumber(item.code || ""));
+        if (item.files.length > 1) {
+          const count = document.createElement("span");
+          count.className = "number-file-count";
+          count.textContent = `${item.files.length} 个版本`;
+          mobileNumber.append(count);
+        }
+        actions.append(mobileNumber);
+      }
+      const markers = document.createElement("span");
+      markers.className = "version-markers";
       const refresh = document.createElement("button");
       refresh.type = "button";
       refresh.className = "video-refresh";
       refresh.dataset.refreshKey = videoRefreshKey(subscriptionId, file.path);
       refresh.dataset.filename = file.name;
-      const activeRepair = repairJobs.find((job) => job.subscription_id === subscriptionId && ["queued", "running"].includes(job.state) && (!job.path || job.path === file.path));
-      if (activeRepair) {
-        const phaseLabel = activeRepair.state === "queued" ? "排队中" : ({
-          scan: "扫描视频", matching: "核对 ID", details: "刷新信息", subtitles: "检查字幕", images: "下载图片", waiting_retry: "等待限流结束"
-        })[activeRepair.phase] || "修复中";
-        videoRefreshStates.set(refresh.dataset.refreshKey, {
-          state: "pending", startedAt: Date.parse(activeRepair.started_at || activeRepair.queued_at) || Date.now(),
-          phaseLabel, message: activeRepair.message, jobId: activeRepair.job_id
-        });
-      }
-      updateVideoRefreshButton(refresh, videoRefreshStates.get(refresh.dataset.refreshKey));
+      refresh.dataset.subscriptionId = subscriptionId;
+      refresh.dataset.path = file.path;
+      refresh.dataset.code = item.code;
+      updateVideoRefreshButton(refresh, currentVideoRepairStatus(refresh));
       refresh.addEventListener("click", () => refreshVideoInformation(subscriptionId, item.code, file));
-      versionRow.append(refresh);
+      markers.append(refresh);
       const subtitlePaths = file.subtitle_paths || [];
-      if (subtitlePaths.length || file.has_nfo) {
-        const markers = document.createElement("span");
-        markers.className = "version-markers";
+      const hasHardlinks = file.hardlink_count > 1;
+      if (subtitlePaths.length || file.has_nfo || hasHardlinks) {
         if (subtitlePaths.length) {
           const marker = document.createElement("span");
           marker.className = "subtitle-marker";
@@ -905,8 +1481,22 @@ function renderExistingVideos(errorMessage = "") {
           marker.setAttribute("aria-label", `查看 ${file.name} 的 NFO`);
           markers.append(marker);
         }
-        versionRow.append(markers);
+        if (hasHardlinks) {
+          const marker = document.createElement("span");
+          marker.className = "hardlink-marker";
+          marker.textContent = "硬链接";
+          marker.tabIndex = 0;
+          marker.title = "悬停查看此视频的硬链接路径";
+          marker.setAttribute("aria-label", `查看 ${file.name} 的硬链接路径`);
+          marker.addEventListener("mouseenter", () => showHardlinkPreview(marker, subscriptionId, item.code, file));
+          marker.addEventListener("focus", () => showHardlinkPreview(marker, subscriptionId, item.code, file));
+          marker.addEventListener("mouseleave", hideHardlinkPreview);
+          marker.addEventListener("blur", hideHardlinkPreview);
+          markers.append(marker);
+        }
       }
+      actions.append(markers);
+      versionRow.append(versionLine, actions);
       versionsCell.append(versionRow);
 
       const line = document.createElement("button");
@@ -920,7 +1510,8 @@ function renderExistingVideos(errorMessage = "") {
       line.setAttribute("aria-label", `用飞牛播放器播放 ${file.name}`);
       const fetchFileInfo = () => {
         if (file.mediainfo_checked || !file.mteam_id || !selectedSubscriptionId) return;
-        if (videoRefreshStates.get(videoRefreshKey(subscriptionId, file.path))?.state === "pending") return;
+        if (videoRefreshStates.get(videoRefreshKey(subscriptionId, file.path))?.state === "pending"
+            || activeRepairForVideo(repairJobs, subscriptionId, file.path)) return;
         line.title = fileTooltip(file.path, "", false);
         const request = loadVideoFileInfo(subscriptionId, item.code, file);
         request.then((result) => {
@@ -950,15 +1541,19 @@ function renderExistingVideos(errorMessage = "") {
   }
 }
 
-async function loadExistingVideos(subscriptionId) {
+async function loadExistingVideos(subscriptionId, { keepRows = false } = {}) {
+  const request = ++existingVideosRequest;
+  if (!keepRows || existingForId !== subscriptionId) {
+    existingVideos = [];
+    existingVideoCount = 0;
+  }
   existingForId = subscriptionId;
-  existingVideos = [];
-  existingVideoCount = 0;
   existingVideosLoading = true;
+  existingVideosError = "";
   renderExistingVideos();
   try {
     const result = await api(`/api/subscriptions/${encodeURIComponent(subscriptionId)}/videos`);
-    if (selectedSubscriptionId !== subscriptionId) return;
+    if (selectedSubscriptionId !== subscriptionId || request !== existingVideosRequest) return;
     existingVideos = result.videos || [];
     existingVideoCount = result.video_count || 0;
     const subscription = subscriptions.find((item) => item.id === subscriptionId);
@@ -972,9 +1567,10 @@ async function loadExistingVideos(subscriptionId) {
     existingVideosLoading = false;
     renderExistingVideos();
   } catch (error) {
-    if (selectedSubscriptionId === subscriptionId) {
+    if (selectedSubscriptionId === subscriptionId && request === existingVideosRequest) {
       existingVideosLoading = false;
-      renderExistingVideos(`读取目录失败：${error.message}`);
+      existingVideosError = `读取目录失败：${error.message}`;
+      renderExistingVideos();
     }
   }
 }
@@ -983,20 +1579,34 @@ function renderLogs(entries) {
   const list = $("#log-list");
   list.replaceChildren();
   const selected = subscriptions.find((item) => item.id === selectedSubscriptionId);
-  const visibleEntries = activeView === "subscription"
+  const scopedEntries = activeView === "subscription"
     ? entries.filter((entry) => selected && entry.subscription === selected.performer)
     : entries;
-  const roundsWithVisibleLogs = new Set(visibleEntries
-    .filter((entry) => entry.event !== "run_separator" && entry.round_id)
-    .map((entry) => entry.round_id));
-  const entriesWithContent = visibleEntries.filter((entry) =>
-    entry.event !== "run_separator" || !entry.round_id || roundsWithVisibleLogs.has(entry.round_id));
-  const entriesToRender = compactLogStages(uniqueRoundSeparators(entriesWithContent));
-  $("#log-count").textContent = `${entriesToRender.length} 条`;
+  const select = $("#log-category-filter");
+  const category = select.value;
+  const categories = new Set(scopedEntries.filter((entry) => entry.event !== "run_separator")
+    .map((entry) => logCategory(entry.event)));
+  if (category) categories.add(category);
+  const options = [...categories].sort((a, b) => a.localeCompare(b, "zh-CN"));
+  if (options.join("\n") !== [...select.options].slice(1).map((option) => option.value).join("\n")) {
+    select.replaceChildren(new Option("全部类型", ""), ...options.map((value) => new Option(value, value)));
+    select.value = category;
+  }
+  const keyword = $("#log-keyword").value;
+  const filtering = category || keyword.trim();
+  const matchingEntries = filterLogEntries(scopedEntries, filtering ? (entry) => {
+    const entryCategory = logCategory(entry.event);
+    if (category && entryCategory !== category) return false;
+    return !keyword.trim() || matchesKeywords([
+      entry.subscription || logEventLabel(entry.event), entryCategory, entry.message, formatLogMessage(entry)
+    ], keyword);
+  } : null);
+  const entriesToRender = compactLogStages(uniqueRoundSeparators(matchingEntries));
+  $("#log-count").textContent = `${entriesToRender.filter((entry) => entry.event !== "run_separator").length} 条`;
   if (!entriesToRender.length) {
     const empty = document.createElement("li");
     empty.className = "log-empty";
-    empty.textContent = "等待检查任务。";
+    empty.textContent = filtering ? "没有符合筛选条件的日志。" : "等待检查任务。";
     list.append(empty);
     return;
   }
@@ -1010,7 +1620,7 @@ function renderLogs(entries) {
       row.append(label);
       if (entry.round_id && !copyButtons.has(`${entry.round_id}:${entry.message.includes("开始") ? "start" : "end"}`)) {
         copyButtons.add(`${entry.round_id}:${entry.message.includes("开始") ? "start" : "end"}`);
-        row.append(makeButton("复制本轮", "text-button log-copy-round", () => copyLogRound(entry.id, entry.round_id, entriesWithContent), "复制本轮可见日志"));
+        row.append(makeButton("复制本轮", "text-button log-copy-round", () => copyLogRound(entry.id, entry.round_id, scopedEntries), "复制本轮日志"));
       }
       list.append(row);
       continue;
@@ -1029,7 +1639,7 @@ function renderLogs(entries) {
     category.textContent = logCategory(entry.event);
     let text;
     if (entry.event === "debug_http_response" && entry.message.includes("\n")) {
-      const newline = entry.message.indexOf("\n");
+      const { heading, parameters, response } = splitHttpLog(entry.message);
       text = document.createElement("details");
       text.className = "log-response";
       text.open = expandedResponseLogs.has(entry.id);
@@ -1038,12 +1648,23 @@ function renderLogs(entries) {
         else expandedResponseLogs.delete(entry.id);
       });
       const summary = document.createElement("summary");
-      summary.textContent = entry.message.slice(0, newline);
-      const body = document.createElement("pre");
-      body.textContent = entry.message.slice(newline + 1);
-      const copy = makeButton("复制 JSON", "text-button log-copy-json",
-        () => copyLogText(body.textContent, "接口响应 JSON 已复制"), "复制这条接口响应的 JSON");
-      text.append(summary, copy, body);
+      summary.textContent = heading;
+      text.append(summary);
+      if (parameters) {
+        const label = document.createElement("div");
+        label.className = "log-request-label";
+        label.textContent = "请求参数";
+        const request = document.createElement("pre");
+        request.textContent = parameters;
+        text.append(label, request);
+      }
+      if (response) {
+        const body = document.createElement("pre");
+        body.textContent = response;
+        const copy = makeButton("复制 JSON", "text-button log-copy-json",
+          () => copyLogText(response, "接口响应 JSON 已复制"), "复制这条接口响应的 JSON");
+        text.append(copy, body);
+      }
     } else {
       text = document.createElement("span");
       text.textContent = formattedLogEntry(entry);
@@ -1065,16 +1686,16 @@ const LOG_EVENT_LABELS = {
   mteam_search_started: "M-Team 搜索", mteam_search_completed: "M-Team 搜索",
   retry_waiting: "限流等待", waiting_retry: "限流等待", retry_resuming: "继续检查", rate_limited: "限流",
   debug_decision: "检查依据", debug_performance: "性能统计", release: "资源处理", duplicate_task: "已有任务",
-  debug_http_response: "接口响应",
+  debug_http_response: "接口响应", debug_artwork: "本地资料",
   subtitle_download_completed: "字幕", subtitle_download_failed: "字幕",
   subtitle_not_found: "字幕", subtitle_directory_unavailable: "字幕",
   subtitle_id_missing: "字幕", subtitle_metadata_failed: "字幕",
   subtitle_collection_completed: "字幕汇总", subtitle_collection_failed: "字幕汇总",
   local_video_info_refreshed: "本地视频", mteam_id_backfill: "M-Team ID",
-  local_cover_sync: "封面", local_cover_cleanup_failed: "封面",
+  local_cover_sync: "封面", local_cover_cleanup_completed: "封面", local_cover_cleanup_failed: "封面",
   local_screenshot_sync: "截图", local_screenshot_cleanup_failed: "截图",
-  local_nfo_sync: "NFO",
-  dmm_translation_failed: "翻译",
+  local_nfo_sync: "NFO", local_artwork_sync_started: "本地资料",
+  dmm_translation_failed: "翻译", dmm_actress_sync: "女优资料",
   mteam_id_backfill_started: "开始补全", mteam_id_backfill_progress: "补全进度",
   mteam_id_backfill_completed: "补全完成", mteam_id_backfill_failed: "补全失败",
   mteam_id_backfill_corrected: "ID 修正",
@@ -1093,12 +1714,16 @@ function logEventLabel(event) {
 
 function logCategory(event) {
   if (event === "debug_http_response") return "接口响应";
+  if (/^repair_archive_/.test(event)) return "归档";
   if (/^repair_/.test(event)) return "修复";
+  if (event === "debug_artwork") return "本地资料";
   if (/^debug_/.test(event)) return "排查";
   if (/^subtitle_/.test(event)) return "字幕";
   if (/^local_cover_/.test(event)) return "封面";
   if (/^local_screenshot_/.test(event)) return "截图";
   if (event === "local_nfo_sync") return "NFO";
+  if (event === "local_artwork_sync_started") return "本地资料";
+  if (event === "dmm_actress_sync") return "女优资料";
   if (event === "dmm_translation_failed") return "翻译";
   if (/^local_(scan|video|wash)/.test(event) || event === "orphan_sidecars_cleaned") return "本地";
   if (/^mteam_/.test(event)) return "M-Team";
@@ -1331,12 +1956,14 @@ function renderStatus(status) {
   if (waitingRetry) {
     const seconds = Math.max(0, Math.ceil(Number(status.retry_at || 0) - Date.now() / 1000));
     state.dataset.state = "waiting_retry";
-    state.lastElementChild.textContent = `限流重试 ${formatCountdown(seconds)}`;
+    state.lastElementChild.textContent = status.stop_requested ? "正在停止检查" : `限流重试 ${formatCountdown(seconds)}`;
   } else {
-    state.lastElementChild.textContent = running ? "正在检查" : status.state === "failed" ? "检查失败" : "后台待命";
+    state.lastElementChild.textContent = status.stop_requested ? "正在停止检查" : running ? "正在检查" : status.state === "stopped" ? "检查已停止" : status.state === "failed" ? "检查失败" : "后台待命";
   }
   if (running) {
-    nextScan.textContent = "";
+    nextScan.textContent = Number(status.queued_count) > 0 ? `另有 ${status.queued_count} 项检查排队` : "";
+  } else if (Number(status.queued_count) > 0) {
+    nextScan.textContent = `${status.queued_count} 项检查排队`;
   } else if (!status.auto_scan) {
     nextScan.textContent = "定时检查未启用";
   } else if (Number(status.next_scan_at) > 0) {
@@ -1362,12 +1989,15 @@ function renderScanButtons() {
   const selectedHelp = selected.dataset.help || selected.title;
   selected.dataset.help = selectedHelp;
   const retrying = currentStatus.state === "waiting_retry";
+  const canStop = ["running", "waiting_retry"].includes(currentStatus.state) && Boolean(currentStatus.run_id);
+  const stopRequested = Boolean(currentStatus.stop_requested);
   const retryLabel = retrying ? `M-Team 冷却中，${formatCountdown(Math.max(0, Math.ceil(Number(currentStatus.retry_at || 0) - Date.now() / 1000)))} 后自动重试` : "";
-  sidebar.disabled = busy;
-  sidebar.textContent = busy ? "…" : "↻";
-  sidebar.title = retrying ? retryLabel : busy ? "检查中" : "立即检查";
+  sidebar.disabled = busy && (!canStop || stopRequested);
+  sidebar.textContent = canStop && !stopRequested ? "■" : busy ? "…" : "↻";
+  sidebar.title = stopRequested ? "停止请求已提交，当前操作完成后将停止" : canStop ? "停止本轮检查" : busy ? "检查任务排队中" : "立即检查";
   sidebar.setAttribute("aria-label", sidebar.title);
-  sidebar.setAttribute("aria-busy", String(busy));
+  sidebar.setAttribute("aria-busy", String(busy && !canStop));
+  sidebar.classList.toggle("is-stop-action", canStop && !stopRequested);
   selected.disabled = busy;
   selected.textContent = retrying ? "等待限流结束" : busy ? "检查中…" : "立即检查";
   selected.title = [retryLabel || (busy ? "检查中，请在下方日志查看进度。" : ""), selectedHelp].filter(Boolean).join("\n\n");
@@ -1386,49 +2016,59 @@ function renderScanButtons() {
   $("#mobile-subscription-edit").disabled = !subscriptions.some((item) => item.id === selectedSubscriptionId);
 }
 
+async function refreshSubscriptions() {
+  const now = Date.now();
+  if (subscriptionRefreshInFlight || now - lastSubscriptionRefresh < 30000) return;
+  const revision = subscriptionRevision;
+  lastSubscriptionRefresh = now;
+  subscriptionRefreshInFlight = true;
+  try {
+    const next = await api("/api/subscriptions");
+    if (revision !== subscriptionRevision) {
+      lastSubscriptionRefresh = 0;
+      return;
+    }
+    subscriptions = next;
+    if (activeView === "subscription" && !subscriptions.some((item) => item.id === selectedSubscriptionId)) {
+      activeView = "all";
+      selectedSubscriptionId = "";
+    }
+    renderSubscriptions();
+  } catch (error) {
+    if (revision === subscriptionRevision) toast(`读取订阅失败：${error.message}`, true);
+  } finally {
+    subscriptionRefreshInFlight = false;
+  }
+}
+
 async function refresh() {
+  void refreshSubscriptions();
+  void refreshDownloadActivity();
+  if (activeView === "actresses" && !actressEditorIsActive() && Date.now() - lastActressesRefresh >= 60000) {
+    void loadActresses();
+  }
   if (refreshInFlight) return;
   refreshInFlight = true;
   try {
-    const now = Date.now();
-    const loadSubscriptions = !subscriptionsLoaded || now - lastSubscriptionRefresh >= 30000;
-    const loadActivity = activeView === "all" && now - lastActivityRefresh >= 15000;
     const logsPath = logsLoaded ? `/api/logs?after_id=${lastLogId}` : "/api/logs";
-    const [nextSubscriptions, status, nextActivity, nextLogs, repairs] = await Promise.all([
-      loadSubscriptions ? api("/api/subscriptions") : Promise.resolve(null),
+    const [status, nextLogs, repairs] = await Promise.all([
       api("/api/status"),
-      loadActivity ? api("/api/activity") : Promise.resolve(null),
       api(logsPath),
       api("/api/repair-jobs")
     ]);
-    if (nextSubscriptions) {
-      subscriptions = nextSubscriptions;
-      subscriptionsLoaded = true;
-      lastSubscriptionRefresh = Date.now();
-    }
-    if (nextActivity) {
-      activity = nextActivity;
-      lastActivityRefresh = Date.now();
-    }
     if (!logsLoaded || nextLogs.length) {
       logEntries = [...logEntries, ...nextLogs].slice(-500);
       logsLoaded = true;
       lastLogId = logEntries.reduce((maximum, entry) => Math.max(maximum, Number(entry.id) || 0), lastLogId);
       renderLogs(logEntries);
     }
-    if (activeView === "subscription" && !subscriptions.some((item) => item.id === selectedSubscriptionId)) {
-      activeView = "all";
-      selectedSubscriptionId = "";
-    }
-    if (nextSubscriptions) renderSubscriptions();
     renderStatus(status);
-    if (nextActivity) renderActivity();
     renderDataRepairStatus(repairs);
-    if (selectedSubscriptionId && ["completed", "failed"].includes(status.state) && ["running", "queued", "waiting_retry"].includes(lastStatusState)) {
+    if (selectedSubscriptionId && ["completed", "failed", "stopped"].includes(status.state) && ["running", "queued", "waiting_retry"].includes(lastStatusState)) {
       loadExistingVideos(selectedSubscriptionId);
     }
     lastStatusState = status.state;
-    busy = status.state === "running" || status.state === "queued" || status.state === "waiting_retry";
+    busy = ["running", "queued", "waiting_retry"].includes(status.state) || Number(status.queued_count) > 0;
     renderScanButtons();
   } catch (error) {
     $("#scheduler-state").dataset.state = "failed";
@@ -1438,15 +2078,29 @@ async function refresh() {
   }
 }
 
+async function refreshDownloadActivity() {
+  if (activeView !== "all" || activityRefreshInFlight || Date.now() - lastActivityRefresh < 15000) return;
+  activityRefreshInFlight = true;
+  lastActivityRefresh = Date.now();
+  try {
+    activity = await api("/api/activity");
+    if (activeView === "all") renderActivity();
+  } catch {
+    // Keep the last list while the activity endpoint is unavailable.
+  } finally {
+    activityRefreshInFlight = false;
+  }
+}
+
 function renderDataRepairStatus(jobs) {
-  const previouslyActive = repairJobs.some((job) => ["queued", "running"].includes(job.state));
+  const previouslyActive = new Set(repairJobs.filter((job) => ["queued", "running"].includes(job.state)).map((job) => job.job_id));
   repairJobs = jobs || [];
   const button = $("#selected-repair-data");
   const allActive = repairJobs.filter((job) => ["queued", "running"].includes(job.state));
   const active = repairJobs.filter((job) => job.subscription_id === selectedSubscriptionId && ["queued", "running"].includes(job.state));
   const repairCooldown = repairJobs.find((job) => ["queued", "running"].includes(job.state) && job.phase === "waiting_retry");
   renderRetryCountdown(repairCooldown);
-  if (allActive.length) {
+  if (allActive.length && !["running", "waiting_retry"].includes(currentStatus.state)) {
     const state = $("#scheduler-state");
     state.dataset.state = repairCooldown ? "waiting_retry" : "running";
     state.lastElementChild.textContent = repairCooldown ? "修复等待限流恢复" : "正在修复数据";
@@ -1454,48 +2108,46 @@ function renderDataRepairStatus(jobs) {
   } else {
     renderStatus(currentStatus);
   }
-  const phaseLabel = (job) => job.state === "queued" ? "排队中" : ({
-    scan: "扫描视频", archive: "归档影片", matching: "核对 ID", details: "刷新信息", subtitles: "检查字幕", images: "下载图片", waiting_retry: "等待限流结束"
-  })[job.phase] || "修复中";
   button.disabled = active.length > 0;
   const current = active[0];
   if (current) {
     const progress = current.phase === "waiting_retry"
       ? ` ${formatCountdown(Math.max(0, Math.ceil(Number(current.retry_at || 0) - Date.now() / 1000)))}`
       : current.total > 0 ? ` ${current.completed}/${current.total}` : "";
-    button.textContent = `${phaseLabel(current)}${progress}…`;
+    button.textContent = `${repairPhaseLabel(current)}${progress}…`;
     button.title = current.message;
   } else {
     button.textContent = "修复数据";
     button.title = "将当前订阅已有影片归档到各自番号目录，核对 M-Team ID、刷新影片信息和 MediaInfo、补齐缺少的中文字幕，并在视频旁保存封面、海报和截图。";
   }
   button.setAttribute("aria-live", "polite");
-  for (const group of existingVideos) {
-    for (const file of group.files || []) {
-      const job = active.find((value) => !value.path || value.path === file.path);
-      const key = videoRefreshKey(selectedSubscriptionId, file.path);
-      if (job) videoRefreshStates.set(key, { state: "pending", startedAt: Date.parse(job.started_at || job.queued_at) || Date.now(), phaseLabel: phaseLabel(job), message: job.message, jobId: job.job_id });
-      else if (videoRefreshStates.get(key)?.state === "pending" && videoRefreshStates.get(key)?.jobId) videoRefreshStates.delete(key);
-    }
-  }
+  let reloadSelected = false;
   for (const job of repairJobs) {
-    if (!awaitedRepairJobs.has(job.job_id) || !["completed", "failed"].includes(job.state)) continue;
+    if (!["completed", "failed"].includes(job.state)) continue;
+    const awaited = awaitedRepairJobs.has(job.job_id);
+    if (!awaited && !previouslyActive.has(job.job_id)) continue;
     awaitedRepairJobs.delete(job.job_id);
     videoFileInfoRequests.clear();
-    videoCoverRequests.clear();
     videoSubtitleRequests.clear();
     if (job.path) {
-      const outcome = job.outcomes?.[job.path];
-      const failed = job.state === "failed" || ["failed", "partial", "skipped"].includes(outcome?.state);
-      videoRefreshStates.set(videoRefreshKey(job.subscription_id, job.path), {
-        state: failed ? "error" : "success", message: outcome?.message || job.message, completedAt: Date.now()
-      });
+      const outcome = job.outcomes?.[job.archived_path || job.path];
+      const imageFailed = Number(job.summary?.image_failed) > 0;
+      const failed = job.state === "failed" || imageFailed || ["failed", "partial", "skipped"].includes(outcome?.state);
+      const state = { state: failed ? "error" : "success",
+        message: imageFailed ? job.message : (outcome?.message || job.message), completedAt: Date.now() };
+      videoRefreshStates.set(videoRefreshKey(job.subscription_id, job.archived_path || job.path), state);
+      if (job.archived_path) videoRefreshStates.delete(videoRefreshKey(job.subscription_id, job.path));
     }
-    toast(job.message, job.state === "failed" || Number(job.summary?.failed) > 0
+    if (awaited) toast(job.message, job.state === "failed" || Number(job.summary?.failed) > 0
       || Number(job.summary?.image_failed) > 0 || Number(job.summary?.archive_failed) > 0);
-    if (selectedSubscriptionId === job.subscription_id) loadExistingVideos(job.subscription_id);
+    if (selectedSubscriptionId === job.subscription_id) reloadSelected = true;
   }
-  if (active.length || previouslyActive) renderExistingVideos();
+  if (active.length || previouslyActive.size) {
+    for (const refresh of document.querySelectorAll(".video-refresh")) {
+      updateVideoRefreshButton(refresh, currentVideoRepairStatus(refresh));
+    }
+  }
+  if (reloadSelected) loadExistingVideos(selectedSubscriptionId, { keepRows: true });
 }
 
 function renderRetryCountdown(repairCooldown = null) {
@@ -1515,13 +2167,22 @@ function renderRetryCountdown(repairCooldown = null) {
   }
 }
 
-function openSubscription(item = null) {
+function openSubscription(item = null, initialPerformer = "") {
   form.reset();
+  $("#subscription-save-error").hidden = true;
   $("#subscription-id").value = item?.id || "";
   $("#dialog-title").textContent = item ? "编辑订阅" : "新建订阅";
-  $("#performer").value = item?.performer || "";
-  $("#keywords").value = item?.keywords || "";
+  $("#performer").value = item?.performer || initialPerformer;
+  searchKeywords = Array.isArray(item?.search_keywords)
+    ? item.search_keywords.map((value) => String(value || "").trim()).filter(Boolean)
+    : item?.search_keyword ? [String(item.search_keyword).trim()] : [];
+  const legacyKeyword = String(item?.keywords || "").trim();
+  if (item && !searchKeywords.length) searchKeywords = [[item.performer, legacyKeyword || "ltx"].filter(Boolean).join(" ")];
+  $("#search-keyword").value = item ? "" : (initialPerformer ? `${initialPerformer} ltx` : "");
+  $("#search-keyword").dataset.autoGenerated = String(!item);
+  renderSearchKeywordTags();
   $("#download-dir").value = item?.download_dir || "";
+  $("#exclude-non-chinese").checked = item?.exclude_non_chinese !== false;
   $("#wash-enabled").checked = item?.wash_enabled !== false;
   blacklistNumbers = [...(item?.blacklist || [])];
   renderBlacklistTags();
@@ -1532,25 +2193,54 @@ function openSubscription(item = null) {
 async function saveSubscription(event) {
   event.preventDefault();
   const id = $("#subscription-id").value;
+  const performer = $("#performer").value.trim();
+  const pendingSearchKeywords = $("#search-keyword").value.trim();
+  const keywordsToSave = [...searchKeywords];
+  if (pendingSearchKeywords) {
+    for (const keyword of pendingSearchKeywords.split(/[，,]/).map((value) => value.trim()).filter(Boolean)) {
+      if (!keywordsToSave.includes(keyword)) keywordsToSave.push(keyword);
+    }
+  }
+  if (!keywordsToSave.length) keywordsToSave.push(`${performer} ltx`);
   const payload = {
-    performer: $("#performer").value.trim(), keywords: $("#keywords").value.trim(),
+    performer, search_keywords: keywordsToSave,
     download_dir: $("#download-dir").value.trim(), wash_enabled: $("#wash-enabled").checked,
+    exclude_non_chinese: $("#exclude-non-chinese").checked,
     blacklist: [...blacklistNumbers]
   };
   const button = $("#submit-subscription");
+  if (button.disabled) return;
+  const message = $("#subscription-save-error");
+  message.hidden = true;
   button.disabled = true;
+  button.textContent = "保存中…";
   try {
-    await api(id ? `/api/subscriptions/${encodeURIComponent(id)}` : "/api/subscriptions", {
+    const saved = await api(id ? `/api/subscriptions/${encodeURIComponent(id)}` : "/api/subscriptions", {
       method: id ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
     });
-    existingForId = "";
+    subscriptionRevision++;
+    const index = subscriptions.findIndex((item) => item.id === saved.id);
+    const previous = subscriptions[index];
+    if (index === -1) {
+      subscriptions.push(saved);
+    } else {
+      subscriptions[index] = { ...saved, video_count: previous.download_dir === saved.download_dir ? previous.video_count : 0 };
+    }
+    if (id && id === selectedSubscriptionId && previous?.download_dir !== saved.download_dir) existingForId = "";
     dialog.close();
-    await refresh();
+    renderSubscriptions();
+    if (activeView === "actresses") renderActresses();
     toast(id ? "订阅已更新" : "订阅已创建");
   } catch (error) {
-    toast(error.message, true);
+    if (dialog.open) {
+      message.textContent = error.message;
+      message.hidden = false;
+    } else {
+      toast(error.message, true);
+    }
   } finally {
     button.disabled = false;
+    button.textContent = "保存订阅";
   }
 }
 
@@ -1558,11 +2248,13 @@ async function removeSubscription(item) {
   if (!window.confirm(`删除“${item.performer}”订阅？已加入下载器的任务不会被删除。`)) return;
   try {
     await api(`/api/subscriptions/${encodeURIComponent(item.id)}`, { method: "DELETE" });
+    subscriptionRevision++;
+    subscriptions = subscriptions.filter((entry) => entry.id !== item.id);
     if (selectedSubscriptionId === item.id) {
       selectedSubscriptionId = "";
       activeView = "all";
     }
-    await refresh();
+    renderSubscriptions();
     toast("订阅已删除");
   } catch (error) { toast(error.message, true); }
 }
@@ -1586,6 +2278,22 @@ async function runScan(subscriptionId = "") {
     toast(error.message, true);
     busy = false;
     renderScanButtons();
+  }
+}
+
+async function stopScan() {
+  const runId = currentStatus.run_id;
+  if (!["running", "waiting_retry"].includes(currentStatus.state) || !runId || currentStatus.stop_requested) return;
+  try {
+    await api("/api/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ run_id: runId }) });
+    if (currentStatus.run_id === runId && ["running", "waiting_retry"].includes(currentStatus.state)) {
+      renderStatus({ ...currentStatus, stop_requested: true });
+      renderScanButtons();
+    }
+    toast("已提交停止请求，当前操作完成后将停止");
+    await refresh();
+  } catch (error) {
+    toast(error.message, true);
   }
 }
 
@@ -1740,6 +2448,24 @@ async function testConnection(endpoint, target) {
 }
 
 form.addEventListener("submit", saveSubscription);
+$("#performer").addEventListener("input", (event) => {
+  const searchKeyword = $("#search-keyword");
+  if (searchKeyword.dataset.autoGenerated === "true" && searchKeywords.length === 0) {
+    searchKeyword.value = `${event.currentTarget.value.trim()} ltx`.trim();
+  }
+});
+$("#search-keyword").addEventListener("input", (event) => {
+  event.currentTarget.dataset.autoGenerated = "false";
+});
+$("#search-keyword").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" || event.key === "," || event.key === "，") {
+    event.preventDefault();
+    if (addSearchKeywords(event.currentTarget.value)) event.currentTarget.dataset.autoGenerated = "false";
+  } else if (event.key === "Backspace" && !event.currentTarget.value && searchKeywords.length) {
+    searchKeywords.pop();
+    renderSearchKeywordTags();
+  }
+});
 $("#blacklist-input").addEventListener("keydown", (event) => {
   if (event.key === "Enter" || event.key === ",") {
     event.preventDefault();
@@ -1770,10 +2496,52 @@ for (const button of document.querySelectorAll(".nav-item")) {
   button.addEventListener("click", () => {
     activeView = button.dataset.view;
     if (activeView === "all") selectedSubscriptionId = "";
-    renderPage();
     renderSubscriptions();
+    if (activeView === "actresses") void loadActresses();
   });
 }
+$("#add-actress").addEventListener("click", (event) => {
+  const form = $("#actress-add-form");
+  form.hidden = !form.hidden;
+  event.currentTarget.setAttribute("aria-expanded", String(!form.hidden));
+  if (!form.hidden) $("#actress-source-name").focus();
+});
+$("#actress-add-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const submit = form.querySelector('button[type="submit"]');
+  if (submit.disabled) return;
+  const errorMessage = $("#actress-add-error");
+  errorMessage.hidden = true;
+  submit.disabled = true;
+  try {
+    const result = await api("/api/actresses/add", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source_name: $("#actress-source-name").value,
+        chinese_name: $("#actress-chinese-name").value,
+      }),
+    });
+    form.reset();
+    form.hidden = true;
+    $("#add-actress").setAttribute("aria-expanded", "false");
+    if (actressesLoading) await actressesLoading;
+    await loadActresses();
+    toast(`已添加 ${result.source_name}。`);
+  } catch (error) {
+    errorMessage.textContent = error.message;
+    errorMessage.hidden = false;
+  } finally {
+    submit.disabled = false;
+  }
+});
+$("#actress-merge-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('button[type="submit"]');
+  await mergeActress($("#actress-merge-source").value, $("#actress-merge-target").value, button, $("#actress-merge-state"));
+});
 $("#selected-scan").addEventListener("click", () => runScan(selectedSubscriptionId));
 $("#selected-repair-data").addEventListener("click", async (event) => {
   const button = event.currentTarget;
@@ -1797,6 +2565,24 @@ $("#existing-toggle").addEventListener("click", (event) => {
   button.setAttribute("aria-expanded", String(!expanded));
   $("#existing-content").hidden = expanded;
 });
+for (const [inputId, clearId, render, resultsSelector] of [
+  ["existing-keyword", "clear-existing-keyword", renderExistingVideos, ".existing-section .table-wrap"],
+  ["log-keyword", "clear-log-keyword", () => renderLogs(logEntries), "#log-list"],
+]) {
+  const input = $(`#${inputId}`);
+  const clear = $(`#${clearId}`);
+  const update = () => {
+    clear.hidden = !input.value;
+    render();
+    $(resultsSelector).scrollTop = 0;
+  };
+  input.addEventListener("input", update);
+  clear.addEventListener("click", () => {
+    input.value = "";
+    input.focus();
+    update();
+  });
+}
 $("#selected-edit").addEventListener("click", () => {
   const selected = subscriptions.find((item) => item.id === selectedSubscriptionId);
   if (selected) openSubscription(selected);
@@ -1806,6 +2592,10 @@ $("#selected-delete").addEventListener("click", () => {
   if (selected) removeSubscription(selected);
 });
 $("#clear-logs").addEventListener("click", clearLogs);
+$("#log-category-filter").addEventListener("change", () => {
+  renderLogs(logEntries);
+  $("#log-list").scrollTop = 0;
+});
 function setLogFullscreen(enabled) {
   const section = $("#log-section");
   const button = $("#log-fullscreen");
@@ -1821,13 +2611,17 @@ $("#log-fullscreen").addEventListener("click", () => {
   setLogFullscreen(!$("#log-section").classList.contains("is-fullscreen"));
 });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && $("#log-section").classList.contains("is-fullscreen")) {
-    setLogFullscreen(false);
+  if (event.key === "Escape") {
+    hideCoverHoverPreview();
+    if ($("#log-section").classList.contains("is-fullscreen")) setLogFullscreen(false);
   }
 });
 $("#dialog-close").addEventListener("click", () => dialog.close());
 $("#dialog-cancel").addEventListener("click", () => dialog.close());
-$("#scan-now").addEventListener("click", () => runScan());
+$("#scan-now").addEventListener("click", () => {
+  if (["running", "waiting_retry"].includes(currentStatus.state) && currentStatus.run_id) stopScan();
+  else runScan();
+});
 $("#save-settings").addEventListener("click", () => saveSettings());
 $("#save-settings-footer").addEventListener("click", () => saveSettings());
 $("#add-path-mapping").addEventListener("click", () => {
@@ -1849,11 +2643,18 @@ loadSettings().catch((error) => toast(error.message, true));
 refresh();
 window.setInterval(refresh, 5000);
 window.setInterval(() => {
+  const expired = new Set();
   for (const [key, state] of videoRefreshStates) {
-    if (state.state === "success" && Date.now() - state.completedAt >= 6000) videoRefreshStates.delete(key);
+    if (state.state === "success" && Date.now() - state.completedAt >= 6000) {
+      videoRefreshStates.delete(key);
+      expired.add(key);
+    }
   }
-  for (const button of document.querySelectorAll(".video-refresh")) {
-    updateVideoRefreshButton(button, videoRefreshStates.get(button.dataset.refreshKey));
+  for (const button of document.querySelectorAll(".video-refresh.is-refreshing, .video-refresh.refresh-success")) {
+    const state = currentVideoRepairStatus(button);
+    if ((state?.state === "pending" && state.showElapsed !== false) || expired.has(button.dataset.refreshKey)) {
+      updateVideoRefreshButton(button, state);
+    }
   }
   renderRetryCountdown(repairJobs.find((job) => ["queued", "running"].includes(job.state) && job.phase === "waiting_retry"));
   if (currentStatus.state === "waiting_retry") {

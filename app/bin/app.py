@@ -62,6 +62,7 @@ REQUEST_FILE = DATA_ROOT / "request.json"
 LOCK_FILE = DATA_ROOT / "scheduler.lock"
 DISABLED_FILE = DATA_ROOT / "disabled"
 MTEAM_LIMIT_FILE = DATA_ROOT / "mteam-rate-limit.json"
+CHECK_STOP_FILE = DATA_ROOT / "check-stop.json"
 MTEAM_REQUEST_STATE_FILE = DATA_ROOT / "mteam-request-state.json"
 MTEAM_REQUEST_LOCK_FILE = DATA_ROOT / "mteam-request.lock"
 LOG_LOCK_FILE = DATA_ROOT / "activity-log.lock"
@@ -72,9 +73,17 @@ MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 QB_SUBSCRIPTION_TAG = "AV订阅-馒头"
 MTEAM_MIN_REQUEST_INTERVAL = 5.0
 MTEAM_DEFAULT_COOLDOWN = 900
+MTEAM_DETAIL_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+MTEAM_OPTION_REFRESH_INTERVAL = 24 * 60 * 60
+MTEAM_ACTRESS_PROFILE_TTL = 30 * 24 * 60 * 60
+MTEAM_ACTRESS_PROFILE_MISS_TTL = 7 * 24 * 60 * 60
+COVER_INDEX_CLEANUP_INTERVAL = 24 * 60 * 60
 MAX_SUBTITLE_BYTES = 32 * 1024 * 1024
 MAX_NFO_BYTES = 1024 * 1024
-DMM_EMPTY_GALLERY_TTL_SECONDS = 24 * 60 * 60
+DMM_EMPTY_GALLERY_TTL_SECONDS = 7 * 24 * 60 * 60
+DMM_INFO_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+DMM_SCREENSHOT_CDN = "awsimgsrc.dmm.co.jp"
+MTEAM_RANK_RECHECK_SECONDS = 24 * 60 * 60
 SUBTITLE_CHECK_VERSION = 3
 LOCAL_MTEAM_RANK_VERSION = 3
 MTEAM_RANK_VERSION = 2
@@ -150,7 +159,43 @@ class MTeamRequestInterrupted(AppError):
     pass
 
 
+class CheckStopped(Exception):
+    """Raised at safe boundaries after a user requests stopping the active check."""
+
+
+def check_stop_requested(run_id=None):
+    if run_id is None:
+        run_id = getattr(MTEAM_POLL_CACHE, "run_id", "")
+    if not run_id:
+        return False
+    request = read_json(CHECK_STOP_FILE, {})
+    return request.get("run_id") == run_id
+
+
+def check_requested_stop():
+    if check_stop_requested():
+        raise CheckStopped("本轮检查已停止，已保存处理进度。")
+    if STOP_SCHEDULER and getattr(MTEAM_POLL_CACHE, "run_id", ""):
+        raise MTeamRequestInterrupted("后台调度器正在停止，检查将在重启后恢复。")
+
+
+def request_check_stop(run_id):
+    with file_lock():
+        status = read_json(STATUS_FILE, {})
+        if not run_id or status.get("run_id") != run_id or status.get("state") not in ("running", "waiting_retry"):
+            raise AppError("该轮检查已结束或已切换，无法停止。")
+        if check_stop_requested(run_id):
+            return {"state": "stopping", "run_id": run_id}
+        write_json(CHECK_STOP_FILE, {"run_id": run_id, "requested_at": now_iso()})
+    log_event("已提交停止请求，当前操作完成后将停止本轮检查。", event="stop_requested", subscription=status.get("performer", ""))
+    return {"state": "stopping", "run_id": run_id, "message": "已提交停止请求，当前操作完成后将停止本轮检查。"}
+
+
 class PerformerMismatchError(AppError):
+    pass
+
+
+class NonChineseCandidateError(AppError):
     pass
 
 
@@ -158,10 +203,12 @@ class CheckContext:
     """Caches are owned by one check execution, never by a CGI process or another round."""
     def __init__(self):
         self.scans = {}
+        self.directory_inventories = {}
         self.task_cache = {}
         self.metrics = {}
         self.stages = {}
         self.wait_seconds = 0.0
+        self.pace_seconds = 0.0
         self.generation = 0
 
     def count(self, name, amount=1):
@@ -169,7 +216,7 @@ class CheckContext:
 
     def invalidate_directories(self, *paths):
         roots = [os.path.realpath(path) for path in paths if path]
-        for key in list(self.scans):
+        for key in self.scans.keys() | self.directory_inventories.keys():
             def overlaps(root):
                 try:
                     Path(key).relative_to(Path(root))
@@ -182,9 +229,11 @@ class CheckContext:
                         return False
             if not roots or any(overlaps(root) for root in roots):
                 self.scans.pop(key, None)
+                self.directory_inventories.pop(key, None)
 
     def resume_after_wait(self):
         self.scans.clear()
+        self.directory_inventories.clear()
         self.task_cache.clear()
         self.generation += 1
 
@@ -192,14 +241,18 @@ class CheckContext:
         if not settings.get("debug_mode"):
             return
         labels = (("sync", "下载器同步"), ("scan", "目录扫描"), ("match", "ID匹配"), ("detail", "详情"),
-                  ("search", "搜索"), ("wash", "洗版"), ("index", "索引"), ("subtitle", "字幕处理"))
+                  ("search", "搜索"), ("wash", "洗版"), ("index", "索引"), ("subtitle", "字幕处理"),
+                  ("artwork", "封面与截图"), ("nfo", "NFO 同步"), ("archive", "影片归档"),
+                  ("first_submission", "首次提交前"))
         durations = "，".join(f"{label} {self.stages.get(key, 0):.2f}秒" for key, label in labels)
         counts = (("qb_requests", "qB请求"), ("mteam_requests", "M-Team请求"), ("scan_count", "实际扫描"),
                   ("scan_hits", "扫描缓存命中"), ("task_queries", "任务查询"), ("task_hits", "任务缓存命中"),
                   ("detail_hits", "详情缓存命中"), ("option_hits", "选项缓存命中"), ("file_hits", "种子文件缓存命中"),
-                  ("metadata_hits", "注释缓存命中"), ("path_checks", "路径匹配检查"))
+                  ("metadata_hits", "注释缓存命中"), ("path_checks", "路径匹配检查"),
+                  ("rank_recheck_hits", "分级核对复用"), ("subtitle_list_hits", "字幕列表复用"),
+                  ("directory_walks", "递归枚举"), ("index_writes", "索引写入行"))
         summary = "，".join(f"{label} {self.metrics.get(key, 0)}" for key, label in counts)
-        log_event(f"性能汇总：{durations}；限流等待 {self.wait_seconds:.2f}秒；{summary}。阶段可包含子阶段，耗时已扣除限流等待。",
+        log_event(f"性能汇总：{durations}；请求间隔等待 {self.pace_seconds:.2f}秒；限流等待 {self.wait_seconds:.2f}秒；{summary}。阶段可包含子阶段，耗时已扣除限流等待。",
                   level="debug", event="debug_performance", subscription=performer)
 
 
@@ -237,6 +290,13 @@ def measure_stage(name):
     return decorate
 
 
+class DownloadTaskSnapshot(dict):
+    """Keep the source JSON alongside the normalized task lookup."""
+    def __init__(self, tasks, raw_items):
+        super().__init__(tasks)
+        self.raw_items = raw_items
+
+
 class CheckDownloader:
     """Batch tracked hashes and cache snapshots for at most fifteen seconds."""
     def __init__(self, downloader, context, tracked_hashes=()):
@@ -244,8 +304,10 @@ class CheckDownloader:
         self.context = context
         self.tracked_hashes = {str(value).lower() for value in tracked_hashes if value}
         self.known = {}
+        self.raw_tasks = {}
         self.fetched = {}
         self.full_at = None
+        self.revision = 0
 
     def __getattr__(self, name):
         return getattr(self.downloader, name)
@@ -261,26 +323,47 @@ class CheckDownloader:
     def _fresh(self, timestamp):
         return timestamp is not None and 0 <= time.monotonic() - timestamp < 15
 
+    def snapshot_timestamp(self, hashes):
+        return self.full_at if self.full_at is not None else min(self.fetched.get(key, float("-inf")) for key in hashes)
+
+    def _record_task_cache_hit(self, wanted):
+        self.context.count("task_hits")
+        if self.context.metrics["task_hits"] == 1:
+            keys = self.known if wanted is None else sorted(self.known.keys() & wanted)
+            log_http_json("qBittorrent", "/api/v2/torrents/info", None, cache_source="本轮内存",
+                          cached_data=[self.raw_tasks.get(key, self.known[key]) for key in keys],
+                          request_payload=None if wanted is None else {"hashes": "|".join(sorted(wanted))},
+                          secrets=self._debug_secrets())
+
+    def _debug_secrets(self):
+        return (getattr(self.downloader, "config", {}).get("password"),
+                *getattr(self.downloader, "cookies", {}).values())
+
+    def _remember_task_responses(self, tasks):
+        self.raw_tasks.update((str(item["hash"]).lower(), item)
+                              for item in getattr(tasks, "raw_items", ()) if item.get("hash"))
+
     def list_tasks(self, hashes=None):
         wanted = None if hashes is None else {str(value).lower() for value in hashes if value}
         if wanted == set():
             return {}
         if self._fresh(self.full_at):
-            self.context.count("task_hits")
-            return copy.deepcopy(self.known if wanted is None else {key: value for key, value in self.known.items() if key in wanted})
+            self._record_task_cache_hit(wanted)
+            return copy.deepcopy(self.known if wanted is None else {key: self.known[key] for key in wanted if key in self.known})
         if self.full_at is not None:
             self.invalidate()
         if wanted is None:
             self.context.count("task_queries")
             tasks = self.downloader.list_tasks()
             self.known = {str(key).lower(): value for key, value in tasks.items()}
+            self._remember_task_responses(tasks)
             self.full_at = time.monotonic()
             self.fetched = {key: self.full_at for key in self.known}
             self.context.task_cache["tasks"] = self.known
             return copy.deepcopy(self.known)
         missing = {key for key in wanted if not self._fresh(self.fetched.get(key))}
         if not missing:
-            self.context.count("task_hits")
+            self._record_task_cache_hit(wanted)
         else:
             missing.update(key for key in self.tracked_hashes if not self._fresh(self.fetched.get(key)))
             keys = sorted(missing)
@@ -292,13 +375,17 @@ class CheckDownloader:
                 for key in batch:
                     self.fetched[key] = stamp
                     self.known.pop(key, None)
+                    self.raw_tasks.pop(key, None)
                 self.known.update({str(key).lower(): value for key, value in tasks.items() if str(key).lower() in batch})
-        return copy.deepcopy({key: value for key, value in self.known.items() if key in wanted})
+                self._remember_task_responses(tasks)
+        return copy.deepcopy({key: self.known[key] for key in wanted if key in self.known})
 
     def list_task_files(self, info_hash):
         cache = self.context.task_cache.setdefault("id_file_lists", {})
         if info_hash in cache:
             self.context.count("file_hits")
+            log_http_json("qBittorrent", "/api/v2/torrents/files", None, cache_source="本轮内存",
+                          cached_data=cache[info_hash], request_payload={"hash": info_hash}, secrets=self._debug_secrets())
         else:
             cache[info_hash] = self.downloader.list_task_files(info_hash)
         return copy.deepcopy(cache[info_hash])
@@ -307,13 +394,19 @@ class CheckDownloader:
         cache = self.context.task_cache.setdefault("id_torrent_metadata", {})
         if info_hash in cache:
             self.context.count("metadata_hits")
+            properties, trackers = cache[info_hash]
+            for endpoint, data in (("/api/v2/torrents/properties", properties), ("/api/v2/torrents/trackers", trackers)):
+                log_http_json("qBittorrent", endpoint, None, cache_source="本轮内存", cached_data=data,
+                              request_payload={"hash": info_hash}, secrets=self._debug_secrets())
         else:
             cache[info_hash] = self.downloader.task_mteam_metadata(info_hash)
         return copy.deepcopy(cache[info_hash])
 
     def invalidate(self):
+        self.revision += 1
         self.full_at = None
         self.known.clear()
+        self.raw_tasks.clear()
         self.fetched.clear()
         self.context.task_cache.clear()
 
@@ -336,6 +429,10 @@ class CheckDownloader:
         task = self.known.get(str(info_hash).lower(), {})
         return self._mutate("recheck", info_hash, download_dir, directories=(download_dir, task.get("content_path"), task.get("save_path")))
 
+    def set_location(self, info_hash, download_dir):
+        task = self.known.get(str(info_hash).lower(), {})
+        return self._mutate("set_location", info_hash, download_dir, directories=(download_dir, task.get("content_path"), task.get("save_path")))
+
 
 def check_task_snapshot(downloader, cache):
     if isinstance(downloader, CheckDownloader):
@@ -346,14 +443,37 @@ def check_task_snapshot(downloader, cache):
 
 
 def wait_for_mteam_request():
+    check_requested_stop()
     with MTEAM_THREAD_LOCK, file_lock(MTEAM_REQUEST_LOCK_FILE):
+        check_requested_stop()
+        cooldown = read_json(MTEAM_LIMIT_FILE, {})
+        if cooldown.get("resume") is False and cooldown.get("retry_at"):
+            wait_for_check_deadline(cooldown["retry_at"])
         state = read_json(MTEAM_REQUEST_STATE_FILE, {})
         interval = get_settings().get("mteam_request_interval_seconds", MTEAM_MIN_REQUEST_INTERVAL)
         next_request_at = float(state.get("next_request_at", 0) or 0)
         delay = max(0.0, next_request_at - time.time())
         if delay:
-            time.sleep(delay)
+            started = time.perf_counter()
+            if getattr(MTEAM_POLL_CACHE, "run_id", ""):
+                wait_for_check_deadline(next_request_at)
+            else:
+                time.sleep(delay)
+            context = check_context()
+            if context is not None:
+                context.pace_seconds += time.perf_counter() - started
         write_json(MTEAM_REQUEST_STATE_FILE, {"next_request_at": time.time() + interval})
+
+
+def wait_for_check_deadline(deadline):
+    while True:
+        check_requested_stop()
+        if STOP_SCHEDULER:
+            raise MTeamRequestInterrupted("后台调度器正在停止，当前请求未完成。")
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(1, remaining))
 
 
 def now_iso():
@@ -462,6 +582,7 @@ def connect_video_database():
             poster_filename TEXT NOT NULL DEFAULT '',
             poster_cover_mtime_ns INTEGER NOT NULL DEFAULT 0,
             poster_crop_version INTEGER NOT NULL DEFAULT 0,
+            http_validator_json TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (directory, code)
         );
         CREATE TABLE IF NOT EXISTS local_video_screenshots (
@@ -471,6 +592,7 @@ def connect_video_database():
             source_url TEXT NOT NULL,
             filename TEXT NOT NULL,
             large_checked INTEGER NOT NULL DEFAULT 0,
+            http_validator_json TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (directory, code, position)
         );
         CREATE TABLE IF NOT EXISTS dmm_screenshot_catalog (
@@ -485,7 +607,27 @@ def connect_video_database():
             series_zh TEXT,
             text_data_zh TEXT,
             title_zh TEXT,
+            response_json TEXT,
             hashtag_translation_version INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS mteam_detail_cache (
+            mteam_id TEXT PRIMARY KEY,
+            response_json TEXT NOT NULL,
+            checked_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS mteam_option_cache (
+            endpoint TEXT PRIMARY KEY,
+            response_json TEXT NOT NULL,
+            checked_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS actresses (
+            source_name TEXT PRIMARY KEY,
+            chinese_name TEXT NOT NULL DEFAULT '',
+            canonical_name TEXT NOT NULL DEFAULT '',
+            first_seen REAL NOT NULL,
+            last_seen REAL NOT NULL,
+            profile_json TEXT NOT NULL DEFAULT '',
+            profile_checked_at REAL NOT NULL DEFAULT 0
         );
     """)
     ensure_video_columns(connection, "local_video_files", (
@@ -496,71 +638,429 @@ def connect_video_database():
         ("subtitle", "TEXT NOT NULL DEFAULT ''"),
         ("cover_url", "TEXT NOT NULL DEFAULT ''"),
     ))
-    ensure_video_columns(connection, "local_video_screenshots", (("large_checked", "INTEGER NOT NULL DEFAULT 0"),))
+    ensure_video_columns(connection, "local_video_screenshots", (
+        ("large_checked", "INTEGER NOT NULL DEFAULT 0"),
+        ("http_validator_json", "TEXT NOT NULL DEFAULT ''"),
+    ))
     ensure_video_columns(connection, "local_video_covers", (
         ("dmm_code", "TEXT NOT NULL DEFAULT ''"),
         ("poster_filename", "TEXT NOT NULL DEFAULT ''"),
         ("poster_cover_mtime_ns", "INTEGER NOT NULL DEFAULT 0"),
         ("poster_crop_version", "INTEGER NOT NULL DEFAULT 0"),
+        ("http_validator_json", "TEXT NOT NULL DEFAULT ''"),
     ))
     ensure_video_columns(connection, "dmm_screenshot_catalog", (
         ("base_info_json", "TEXT"), ("series", "TEXT NOT NULL DEFAULT ''"), ("text_data", "TEXT NOT NULL DEFAULT ''"),
         ("base_info_zh_json", "TEXT"), ("series_zh", "TEXT"), ("text_data_zh", "TEXT"),
         ("title", "TEXT"), ("title_zh", "TEXT"),
+        ("response_json", "TEXT"),
         ("hashtag_translation_version", "INTEGER NOT NULL DEFAULT 0"),
     ))
+    ensure_video_columns(connection, "actresses", (
+        ("canonical_name", "TEXT NOT NULL DEFAULT ''"),
+        ("profile_json", "TEXT NOT NULL DEFAULT ''"),
+        ("profile_checked_at", "REAL NOT NULL DEFAULT 0"),
+    ))
+    if connection.execute("PRAGMA user_version").fetchone()[0] < 2:
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("PRAGMA user_version").fetchone()[0] < 2:
+                for response_json, base_info, checked_at in connection.execute(
+                    """SELECT response_json, base_info_json, checked_at FROM dmm_screenshot_catalog
+                       WHERE response_json IS NOT NULL OR base_info_json IS NOT NULL ORDER BY checked_at"""
+                ):
+                    try:
+                        response = json.loads(response_json) if response_json is not None else None
+                    except (ValueError, RecursionError):
+                        response = None
+                    insert_cached_dmm_actresses(connection, response, base_info, checked_at)
+                connection.execute("PRAGMA user_version = 2")
     os.chmod(LOCAL_VIDEO_DATABASE, 0o600)
     return connection
+
+
+def upsert_dmm_actresses(connection, actress_list, *, update_seen=True):
+    with connection:
+        return insert_dmm_actresses(connection, actress_list, time.time(), update_seen=update_seen)
+
+
+def insert_dmm_actresses(connection, actress_list, discovered_at, *, update_seen=True):
+    if not isinstance(actress_list, list):
+        return 0
+    names = list(dict.fromkeys(
+        value.strip() for value in actress_list
+        if isinstance(value, str) and value.strip() and len(value.strip()) <= 120
+        and not re.search(r"[\x00-\x1f\x7f]", value.strip())
+    ))
+    if not names:
+        return 0
+    conflict = "DO UPDATE SET last_seen=max(actresses.last_seen, excluded.last_seen)" if update_seen else "DO NOTHING"
+    connection.executemany(
+        f"""INSERT INTO actresses(source_name, chinese_name, first_seen, last_seen) VALUES (?, '', ?, ?)
+            ON CONFLICT(source_name) {conflict}""",
+        [(name, discovered_at, discovered_at) for name in names],
+    )
+    return len(names)
+
+
+def insert_cached_dmm_actresses(connection, response, base_info, checked_at):
+    data = result_data(response) if isinstance(response, dict) else None
+    names = data.get("actressList") if isinstance(data, dict) else None
+    if not insert_dmm_actresses(connection, names, checked_at, update_seen=False):
+        insert_dmm_actresses(connection, dmm_cast_names(base_info), checked_at, update_seen=False)
+
+
+def list_actresses():
+    now = time.time()
+    connection = connect_video_database()
+    try:
+        return [
+            {"source_name": source_name, "chinese_name": chinese_name, "canonical_name": canonical_name,
+             "first_seen": first_seen, "last_seen": last_seen,
+             "profile": json.loads(profile) if profile else None,
+             "profile_pending": actress_profile_due(profile, checked_at, now)}
+            for source_name, chinese_name, canonical_name, first_seen, last_seen, profile, checked_at in connection.execute(
+                """SELECT source_name, chinese_name, canonical_name, first_seen, last_seen, profile_json, profile_checked_at
+                   FROM actresses ORDER BY source_name COLLATE NOCASE"""
+            )
+        ]
+    finally:
+        connection.close()
+
+
+def actress_profile_due(profile, checked_at, now):
+    ttl = MTEAM_ACTRESS_PROFILE_TTL if profile else MTEAM_ACTRESS_PROFILE_MISS_TTL
+    return not checked_at or not 0 <= now - checked_at < ttl
+
+
+def showcase_name_key(name):
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", name).casefold()).translate(str.maketrans("亜亞", "亚亚"))
+
+
+def showcase_profile(entry):
+    identifier = str(entry.get("id", ""))
+    if not re.fullmatch(r"[0-9]+", identifier):
+        raise AppError("M-Team 女优资料缺少有效的展示 ID。")
+    note = entry.get("note")
+    if isinstance(note, str):
+        try:
+            note = json.loads(note)
+        except (ValueError, RecursionError):
+            note = None
+    note = note if isinstance(note, dict) else {}
+
+    def text(value):
+        return value.strip()[:160] if isinstance(value, str) else ""
+
+    def number(value, minimum, maximum):
+        value = str(value)
+        return value if re.fullmatch(r"[0-9]{1,4}", value) and minimum <= int(value) <= maximum else ""
+
+    def avatar_url():
+        for key in ("pic", "pic1", "pic2"):
+            path = text(entry.get(key))
+            if path.startswith(MTEAM_API_BASE + "/upload/"):
+                path = path.removeprefix(MTEAM_API_BASE + "/upload/")
+            if re.fullmatch(r"showcase/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.(?:jpe?g|png|webp|gif)", path, re.IGNORECASE):
+                return f"{MTEAM_API_BASE}/upload/{path}"
+        return ""
+
+    size = note.get("size") if isinstance(note.get("size"), dict) else {}
+    active = note.get("active") if isinstance(note.get("active"), dict) else {}
+    birthday = text(note.get("birthday"))
+    return {
+        "showcase_id": identifier,
+        "name": text(entry.get("cntitle")),
+        "romanized_name": text(entry.get("entitle")),
+        "reading": text(note.get("reading")),
+        "birthday": birthday if re.fullmatch(r"\d{4}-\d{2}-\d{2}", birthday) else "",
+        "height_cm": number(size.get("height"), 1, 300),
+        "origin": text(note.get("origin")),
+        "blood_type": text(note.get("blood")),
+        "active_start": number(active.get("start"), 1900, 9999),
+        "active_end": number(active.get("end"), 1900, 9999),
+        "avatar_url": avatar_url(),
+    }
+
+
+def subscription_actress_index(connection):
+    matches_by_name = {}
+    profiles_by_source = {}
+    for source, chinese, canonical, profile, checked_at in connection.execute(
+        "SELECT source_name, chinese_name, canonical_name, profile_json, profile_checked_at FROM actresses"
+    ):
+        if not canonical:
+            profiles_by_source[source] = (chinese, profile, checked_at)
+        for name in (source, chinese):
+            if name and (key := showcase_name_key(name)):
+                matches_by_name.setdefault(key, set()).add(canonical or source)
+    return matches_by_name, profiles_by_source
+
+
+def get_subscription_actress_profile(subscription_id):
+    subscription = next((item for item in list_subscriptions() if item["id"] == subscription_id), None)
+    if subscription is None:
+        raise AppError("订阅不存在。")
+    performer = subscription["performer"]
+    with closing(connect_video_database()) as connection:
+        names, _ = subscription_actress_index(connection)
+    matches = names.get(showcase_name_key(performer), ())
+    if len(matches) > 1:
+        return {"profile": None, "profile_pending": False, "chinese_name": ""}
+    source_name = next(iter(matches), performer)
+    return get_actress_profile({"source_name": source_name}, allow_new=not matches, include_chinese_name=True)
+
+
+def get_actress_profile(payload, *, allow_new=False, include_chinese_name=False):
+    if not isinstance(payload, dict) or not isinstance(source_name := payload.get("source_name"), str):
+        raise AppError("女优原名无效。")
+
+    def profile_result():
+        value = {"profile": json.loads(profile) if profile else None, "profile_pending": pending}
+        if include_chinese_name:
+            value["chinese_name"] = chinese_name
+        return value
+
+    with closing(connect_video_database()) as connection:
+        row = connection.execute("SELECT canonical_name FROM actresses WHERE source_name=?", (source_name,)).fetchone()
+        if row is None and not allow_new:
+            raise AppError("找不到该女优。")
+        if row is not None:
+            source_name = row[0] or source_name
+        chinese_name, profile, checked_at = connection.execute(
+            "SELECT chinese_name, profile_json, profile_checked_at FROM actresses WHERE source_name=?", (source_name,),
+        ).fetchone() or ("", "", 0)
+        pending = actress_profile_due(profile, checked_at, time.time())
+        if not pending:
+            return profile_result()
+        aliases = [row[0] for row in connection.execute(
+            "SELECT source_name FROM actresses WHERE canonical_name=? ORDER BY source_name", (source_name,),
+        )]
+    names = {showcase_name_key(name) for name in (source_name, chinese_name, *aliases) if name}
+    token = get_settings().get("mteam_token")
+    if not token:
+        return profile_result()
+    fetched = None
+    japanese_variant = source_name.translate(str.maketrans("亚亞", "亜亜"))
+    keywords = list(dict.fromkeys(name for name in (source_name, japanese_variant, *aliases, chinese_name) if name))[:2]
+    for keyword in keywords:
+        response = mteam_json("/dmm/showcase/search", token, {"keyword": keyword, "pageNumber": 1, "pageSize": 20})
+        result = result_data(response)
+        if not isinstance(result, list):
+            raise AppError("M-Team 女优搜索结果结构无法识别。")
+        exact = {}
+        for entry in result:
+            if not isinstance(entry, dict) or not str(entry.get("id", "")).isdigit():
+                continue
+            for field in ("cntitle", "entitle"):
+                name = entry.get(field)
+                if isinstance(name, str) and (key := showcase_name_key(name)) in names:
+                    exact.setdefault(key, {})[str(entry["id"])] = entry
+        for name in (source_name, chinese_name, *aliases):
+            matches = exact.get(showcase_name_key(name), {}) if name else {}
+            if matches:
+                if len(matches) == 1:
+                    fetched = showcase_profile(next(iter(matches.values())))
+                break
+        if fetched:
+            break
+    if fetched:
+        profile = json.dumps(fetched, ensure_ascii=False, separators=(",", ":"))
+    if row is not None or fetched:
+        with closing(connect_video_database()) as connection, connection:
+            checked_at = time.time()
+            if row is None:
+                if fetched["name"] and showcase_name_key(fetched["name"]) == showcase_name_key(source_name):
+                    source_name = fetched["name"]
+                insert_dmm_actresses(connection, [source_name], checked_at, update_seen=False)
+            connection.execute(
+                "UPDATE actresses SET profile_json=?, profile_checked_at=? WHERE source_name=? AND canonical_name=''",
+                (profile, checked_at, source_name),
+            )
+    pending = False
+    return profile_result()
+
+
+def save_actress_translation(payload, *, create=False):
+    if not isinstance(payload, dict):
+        raise AppError("女优译名请求无效。")
+    source_name = payload.get("source_name")
+    chinese_name = payload.get("chinese_name", "")
+    if (not isinstance(source_name, str) or not source_name.strip() or len(source_name.strip()) > 120
+            or re.search(r"[\x00-\x1f\x7f]", source_name.strip())):
+        raise AppError("女优原名无效。")
+    if (not isinstance(chinese_name, str) or len(chinese_name.strip()) > 120
+            or re.search(r"[\x00-\x1f\x7f]", chinese_name.strip())):
+        raise AppError("女优中文名须为单行文字，最多 120 个字符。")
+    source_name = source_name.strip()
+    chinese_name = chinese_name.strip()
+    connection = connect_video_database()
+    try:
+        with connection:
+            if create:
+                created_at = time.time()
+                cursor = connection.execute(
+                    """INSERT INTO actresses(source_name, chinese_name, first_seen, last_seen)
+                       VALUES (?, ?, ?, ?) ON CONFLICT(source_name) DO NOTHING""",
+                    (source_name, chinese_name, created_at, created_at),
+                )
+            else:
+                cursor = connection.execute(
+                    "UPDATE actresses SET chinese_name=? WHERE source_name=?",
+                    (chinese_name, source_name),
+                )
+        if not cursor.rowcount:
+            raise AppError("该原名已存在，请在列表中编辑。" if create else "找不到该女优。")
+    finally:
+        connection.close()
+    return {"source_name": source_name, "chinese_name": chinese_name}
+
+
+def merge_actress_name(payload):
+    if not isinstance(payload, dict):
+        raise AppError("女优名字归并请求无效。")
+    source_name = payload.get("source_name")
+    canonical_name = payload.get("canonical_name", "")
+    if (not isinstance(source_name, str) or not source_name.strip() or len(source_name.strip()) > 120
+            or re.search(r"[\x00-\x1f\x7f]", source_name.strip())):
+        raise AppError("女优原名无效。")
+    if (not isinstance(canonical_name, str) or len(canonical_name.strip()) > 120
+            or re.search(r"[\x00-\x1f\x7f]", canonical_name.strip())):
+        raise AppError("归并目标无效。")
+    source_name = source_name.strip()
+    canonical_name = canonical_name.strip()
+    if source_name == canonical_name:
+        raise AppError("不能将女优归并到自身。")
+    connection = connect_video_database()
+    try:
+        with connection:
+            source = connection.execute(
+                "SELECT chinese_name, canonical_name FROM actresses WHERE source_name=?", (source_name,),
+            ).fetchone()
+            if not source:
+                raise AppError("找不到要归并的女优原名。")
+            if canonical_name:
+                target = connection.execute(
+                    "SELECT chinese_name, canonical_name FROM actresses WHERE source_name=?", (canonical_name,),
+                ).fetchone()
+                if not target:
+                    raise AppError("找不到归并目标女优。")
+                if target[1]:
+                    raise AppError("归并目标已是别名，请选择独立女优。")
+                if source[1] and source[1] == canonical_name:
+                    raise AppError("该名字已经归属于目标女优。")
+                if not target[0] and source[0]:
+                    connection.execute(
+                        "UPDATE actresses SET chinese_name=? WHERE source_name=?", (source[0], canonical_name),
+                    )
+                connection.execute(
+                    "UPDATE actresses SET canonical_name=? WHERE canonical_name=?", (canonical_name, source_name),
+                )
+                connection.execute(
+                    "UPDATE actresses SET canonical_name=? WHERE source_name=?", (canonical_name, source_name),
+                )
+            else:
+                if not source[1]:
+                    raise AppError("该女优已经是独立名称。")
+                connection.execute("UPDATE actresses SET canonical_name='' WHERE source_name=?", (source_name,))
+    finally:
+        connection.close()
+    return {"source_name": source_name, "canonical_name": canonical_name}
+
+
+def get_actress_translations(connection):
+    entries = {
+        source_name: {"chinese_name": chinese_name, "canonical_name": canonical_name}
+        for source_name, chinese_name, canonical_name in connection.execute(
+            "SELECT source_name, chinese_name, canonical_name FROM actresses"
+        )
+    }
+    groups = {}
+    for source_name, entry in entries.items():
+        canonical = entry["canonical_name"] or source_name
+        groups.setdefault(canonical, []).append(source_name)
+    translations = {}
+    for canonical, members in groups.items():
+        translation = entries.get(canonical, {}).get("chinese_name", "")
+        if not translation:
+            translation = next((entries[name]["chinese_name"] for name in sorted(members)
+                                if entries[name]["chinese_name"]), "")
+        if translation:
+            translations.update({name: translation for name in members})
+    return translations
 
 
 def sync_video_database(subscription_id, indexed_rows, known_subscriptions):
     connection = connect_video_database()
     try:
         with connection:
-            connection.execute("DELETE FROM local_videos WHERE subscription_id = ?", (subscription_id,))
+            # Take a write lock before comparing with the existing index.
+            connection.execute("BEGIN IMMEDIATE")
+            changes = connection.total_changes
             known_ids = sorted(known_subscriptions)
             if known_ids:
                 placeholders = ",".join("?" for _ in known_ids)
                 connection.execute(f"DELETE FROM local_videos WHERE subscription_id NOT IN ({placeholders})", known_ids)
-            else:
-                connection.execute("DELETE FROM local_videos")
+            saved_rows = {code: (rank, source, title) for code, rank, source, title in connection.execute(
+                "SELECT code, rank_json, rank_source, rank_title FROM local_videos WHERE subscription_id=?", (subscription_id,),
+            )}
+            saved_files = {(code, path): data for code, path, *data in connection.execute(
+                """SELECT code, path, name, size, mtime_ns, mteam_id, rank_json, rank_source, rank_title, subtitle, cover_url
+                   FROM local_video_files WHERE subscription_id=?""", (subscription_id,),
+            )}
             for row in indexed_rows:
-                connection.execute(
-                    "INSERT INTO local_videos(subscription_id, code, rank_json, rank_source, rank_title, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (subscription_id, row["code"], json.dumps(row["rank"]), row["rank_source"], row["rank_title"], row["updated_at"]),
-                )
-                connection.executemany(
-                    "INSERT INTO local_video_files(subscription_id, code, path, name, size, mtime_ns, mteam_id, rank_json, rank_source, rank_title, subtitle, cover_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [(subscription_id, row["code"], item["path"], item["name"], item["size"], item["mtime_ns"], item.get("mteam_id", ""), json.dumps(item.get("rank", [0, 0, 0])), item.get("rank_source", ""), item.get("rank_title", ""), item.get("subtitle", ""), item.get("cover_url", "")) for item in row["files"]],
-                )
+                code = row["code"]
+                group = (json.dumps(row["rank"]), row["rank_source"], row["rank_title"])
+                if saved_rows.pop(code, None) != group:
+                    connection.execute(
+                        """INSERT INTO local_videos(subscription_id, code, rank_json, rank_source, rank_title, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(subscription_id, code) DO UPDATE SET
+                           rank_json=excluded.rank_json, rank_source=excluded.rank_source,
+                           rank_title=excluded.rank_title, updated_at=excluded.updated_at""",
+                        (subscription_id, code, *group, row["updated_at"]),
+                    )
+                for item in row["files"]:
+                    path = item["path"]
+                    data = [item["name"], item["size"], item["mtime_ns"], item.get("mteam_id", ""),
+                            json.dumps(item.get("rank", [0, 0, 0])), item.get("rank_source", ""),
+                            item.get("rank_title", ""), item.get("subtitle", ""), item.get("cover_url", "")]
+                    if saved_files.pop((code, path), None) != data:
+                        connection.execute(
+                            """INSERT INTO local_video_files(subscription_id, code, path, name, size, mtime_ns, mteam_id,
+                               rank_json, rank_source, rank_title, subtitle, cover_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               ON CONFLICT(subscription_id, code, path) DO UPDATE SET name=excluded.name, size=excluded.size,
+                               mtime_ns=excluded.mtime_ns, mteam_id=excluded.mteam_id, rank_json=excluded.rank_json,
+                               rank_source=excluded.rank_source, rank_title=excluded.rank_title,
+                               subtitle=excluded.subtitle, cover_url=excluded.cover_url""",
+                            (subscription_id, code, path, *data),
+                        )
+            connection.executemany("DELETE FROM local_video_files WHERE subscription_id=? AND code=? AND path=?",
+                                   ((subscription_id, code, path) for code, path in saved_files))
+            connection.executemany("DELETE FROM local_videos WHERE subscription_id=? AND code=?",
+                                   ((subscription_id, code) for code in saved_rows))
+            performance_count("index_writes", connection.total_changes - changes)
     finally:
         connection.close()
 
 
-def find_indexed_local_release(code, exclude_subscription_id, target_dir):
+def find_indexed_local_releases(code, exclude_subscription_id):
     connection = connect_video_database()
     try:
         rows = connection.execute(
-            """SELECT f.subscription_id, f.path, f.size, f.mtime_ns, v.rank_json
+            """SELECT f.subscription_id, f.path, f.size, f.mtime_ns, f.rank_json
                FROM local_video_files AS f
-               JOIN local_videos AS v USING (subscription_id, code)
                WHERE f.code = ? AND f.subscription_id != ?""",
             (code, exclude_subscription_id),
         ).fetchall()
         valid = []
         stale = []
-        target_root = Path(target_dir).resolve()
         for subscription_id, value, saved_size, saved_mtime, rank_json in rows:
             path = Path(value)
             try:
                 if path.is_symlink() or path.suffix.casefold() not in VIDEO_EXTENSIONS:
                     stale.append((subscription_id, value))
                     continue
-                resolved = path.resolve(strict=True)
-                resolved.relative_to(target_root)
-                continue
-            except ValueError:
-                pass
+                path.resolve(strict=True)
             except OSError:
                 stale.append((subscription_id, value))
                 continue
@@ -583,9 +1083,22 @@ def find_indexed_local_release(code, exclude_subscription_id, target_dir):
                     "DELETE FROM local_video_files WHERE subscription_id = ? AND code = ? AND path = ?",
                     [(subscription_id, code, value) for subscription_id, value in stale],
                 )
-        return max(valid, key=lambda item: (tuple(item["rank"]), item["mtime_ns"])) if valid else None
+        return valid
     finally:
         connection.close()
+
+
+def find_indexed_local_release(code, exclude_subscription_id, target_dir):
+    target_root = Path(target_dir).resolve()
+    valid = []
+    for item in find_indexed_local_releases(code, exclude_subscription_id):
+        try:
+            Path(item["path"]).resolve(strict=True).relative_to(target_root)
+        except ValueError:
+            valid.append(item)
+        except OSError:
+            continue
+    return max(valid, key=lambda item: (local_wash_rank(item["rank"]), item["mtime_ns"])) if valid else None
 
 
 def delete_video_database_subscription(subscription_id):
@@ -618,42 +1131,74 @@ def log_debug(settings, message, subscription=""):
         log_event(message, level="debug", event="debug_decision", subscription=subscription)
 
 
-def log_http_json(service, endpoint, status, raw, *, secrets=(), code="", settings=None, subscription=None):
-    if not raw:
-        return
-    prefix = raw[:128]
-    if isinstance(prefix, bytes):
-        prefix = prefix.decode("utf-8-sig", errors="replace")
-    if not prefix.lstrip().startswith(("{", "[")):
+def log_http_json(service, endpoint, status, raw=None, *, elapsed=None, cache_source="", cached_data=None, request_payload=None,
+                  secrets=(), code="", settings=None, subscription=None):
+    if not raw and not cache_source:
         return
     try:
+        if raw:
+            prefix = raw[:128]
+            if isinstance(prefix, bytes):
+                prefix = prefix.decode("utf-8-sig", errors="replace")
+            if not prefix.lstrip().startswith(("{", "[")):
+                return
         settings = get_settings() if settings is None else settings
         if not settings.get("debug_mode"):
             return
-        endpoint = endpoint.split("?", 1)[0]
+        endpoint, _, query = endpoint.partition("?")
+        number, body = code, ""
         protected = (settings.get("mteam_token"), settings.get("azure_key"), settings.get("downloader", {}).get("password"), *secrets)
-        preview = http_debug.response_preview(raw, endpoint, protected, normalize_code, code)
-        if preview is None:
-            return
-        number, body = preview
-        title = f"{service} {endpoint} · HTTP {status}" + (f" · {number}" if number else "")
+        if raw:
+            preview = http_debug.response_preview(raw, endpoint, protected, normalize_code, code)
+            if preview is None:
+                return
+            number, body = preview
+        elif cached_data is not None:
+            number, body = http_debug.response_data_preview(cached_data, endpoint, protected, normalize_code, code)
+        if cache_source and status is None:
+            status = 200
+        origin = f"HTTP {status}" + ("(缓存)" if cache_source else "")
+        title = f"{service} {endpoint} · {origin}" + (f" · {number}" if number else "")
+        if elapsed is not None:
+            duration = f"{elapsed * 1000:.0f} ms" if elapsed < 1 else f"{elapsed:.2f} 秒"
+            title += f" · 耗时 {duration}"
+        try:
+            parameters = http_debug.request_preview(endpoint, query, request_payload, protected)
+        except (TypeError, ValueError, RecursionError):
+            parameters = ""
+        if parameters:
+            title += "\n请求参数：" + parameters
         maximum = http_debug.MAX_MESSAGE - len(title) - 1
         suffix = "\n…（响应过长，已截断）"
         if len(body) > maximum:
             body = body[:maximum - len(suffix)] + suffix
-        log_event(title + "\n" + body, level="debug", event="debug_http_response",
+        log_event(title + ("\n" + body if body else ""), level="debug", event="debug_http_response",
                   subscription=getattr(MTEAM_POLL_CACHE, "performer", "") if subscription is None else subscription)
     except (AppError, OSError, ValueError, RecursionError, sqlite3.Error):
         pass
 
 
-def log_http_error_json(service, endpoint, error, *, secrets=()):
+def log_http_error_json(service, endpoint, error, started, *, secrets=(), request_payload=None,
+                        request_data=None, content_type=None):
     if error.fp is None:
         return
+    elapsed = time.perf_counter() - started
     try:
         settings = get_settings()
         if settings.get("debug_mode"):
-            log_http_json(service, endpoint, error.code, error.read(1024 * 1024), secrets=secrets, settings=settings)
+            read_started = time.perf_counter()
+            body = error.read(1024 * 1024)
+            elapsed += time.perf_counter() - read_started
+            if request_data and len(request_data) <= 64 * 1024:
+                try:
+                    if content_type == "application/json":
+                        request_payload = json.loads(request_data)
+                    elif content_type == "application/x-www-form-urlencoded":
+                        request_payload = http_debug.query_parameters(request_data.decode("ascii"))
+                except (ValueError, RecursionError):
+                    pass
+            log_http_json(service, endpoint, error.code, body, elapsed=elapsed,
+                          request_payload=request_payload, secrets=secrets, settings=settings)
     except (AppError, OSError, ValueError, http.client.HTTPException):
         pass
 
@@ -1061,7 +1606,7 @@ def apply_mediainfo_rank(rank, mediainfo):
     return adjusted
 
 
-def release_rank(title, metadata=None):
+def release_rank(title, metadata=None, *, require_chinese_evidence=False):
     metadata = metadata or {}
     label_sources = [metadata.get(key) for key in ("labelsNew", "labels", "labelList", "label_list", "tags") if metadata.get(key)]
     def metadata_text(value):
@@ -1128,8 +1673,13 @@ def release_rank(title, metadata=None):
     if "labelsNew" in metadata or "hasChineseSubtitle" in metadata:
         chinese = 2 if embedded_label else 1 if has_chinese_subtitle else 0
     else:
-        embedded_chinese = bool(re.search(r"[内內]嵌\s*(?:中文|中字|字幕)|(?:中文|中字|字幕)\s*[内內]嵌|[内內]封\s*(?:中文|中字|字幕)|(?:国语|國語|普通话|普通話)\s*(?:配音|音轨|音軌)|中配|国配|國配|mandarin\s+(?:audio|dub)|chinese\s+(?:audio|dub)", text))
-        subtitle_chinese = bool(re.search(r"中文字幕|中字|中文|簡體中文|繁體中文|简体中文|繁体中文|简中|繁中|chinese|\bchs\b|\bcht\b|\b(?:chi|zho|zh)\b|字幕", text))
+        language_text = text
+        if require_chinese_evidence:
+            language_text = re.sub(r"(?:非|无|無)\s*(?:中文字幕|中文|中字)|(?:no|non)[\s-]+chinese", "", language_text)
+        subtitle_marker = "(?:中文|中字)" if require_chinese_evidence else "(?:中文|中字|字幕)"
+        embedded_chinese = bool(re.search(rf"[内內](?:嵌|封)\s*{subtitle_marker}|{subtitle_marker}\s*[内內]嵌|(?:国语|國語|普通话|普通話)\s*(?:配音|音轨|音軌)|中配|国配|國配|mandarin\s+(?:audio|dub)|chinese\s+(?:audio|dub)", language_text))
+        subtitles_pattern = r"中文|中字|简中|繁中|chinese|\b(?:chs|cht|chi|zho|zh)\b"
+        subtitle_chinese = bool(re.search(subtitles_pattern if require_chinese_evidence else subtitles_pattern + "|字幕", language_text))
         chinese = 2 if embedded_chinese else 1 if subtitle_chinese or metadata.get("subtitle_available") else 0
     codec_text = codec_tags.casefold() if has_codec_metadata else text
     codec = 2 if re.search(r"x\.?265|h\.?265|hevc", codec_text) else 1 if re.search(r"x\.?264|h\.?264|avc", codec_text) else 0
@@ -1152,24 +1702,34 @@ def explicit_resolution_rank(resolution, height=0):
     return None
 
 
-def list_local_video_files(download_dir):
+def local_directory_inventory(download_dir):
     root = Path(download_dir)
     if not root.is_dir():
         raise AppError(f"订阅目录不存在或应用用户无法访问：{root}")
-    files = []
+    context = check_context()
+    key = os.path.realpath(root)
+    if context is not None and key in context.directory_inventories:
+        return context.directory_inventories[key]
+    inventory = []
     walk_errors = []
-    def on_walk_error(error):
-        walk_errors.append(error)
-    for current, directories, filenames in os.walk(root, onerror=on_walk_error, followlinks=False):
-        directories[:] = [name for name in directories if not (Path(current) / name).is_symlink()]
-        for filename in filenames:
-            path = Path(current) / filename
-            if path.suffix.casefold() in VIDEO_EXTENSIONS:
-                files.append(path)
+    performance_count("directory_walks")
+    for current, directories, filenames in os.walk(root, onerror=walk_errors.append, followlinks=False):
+        check_requested_stop()
+        directory = Path(current)
+        linked = {name for name in directories if (directory / name).is_symlink()}
+        directories[:] = [name for name in directories if name not in linked]
+        inventory.append((directory, filenames, bool(linked)))
     if walk_errors:
         error = walk_errors[0]
         raise AppError(f"应用用户无权完整读取订阅目录 {root}：{error}")
-    return files
+    if context is not None:
+        context.directory_inventories[key] = inventory
+    return inventory
+
+
+def list_local_video_files(download_dir):
+    return [directory / name for directory, names, _linked in local_directory_inventory(download_dir)
+            for name in names if Path(name).suffix.casefold() in VIDEO_EXTENSIONS]
 
 
 def cleanup_orphan_sidecars(download_dir, excluded_dirs=()):
@@ -1178,34 +1738,68 @@ def cleanup_orphan_sidecars(download_dir, excluded_dirs=()):
         raise AppError(f"订阅目录不存在或应用用户无法访问：{root}")
     videos_by_directory = {}
     sidecars_by_directory = {}
-    walk_errors = []
-    excluded = {str(Path(value).resolve()) for value in excluded_dirs if value}
+    artwork_by_directory = {}
+    protected_artwork = set()
+    empty_candidates = set()
+    excluded = {Path(value).resolve() for value in excluded_dirs if value}
 
-    def on_walk_error(error):
-        walk_errors.append(error)
+    def video_path(path):
+        # qBittorrent can append .!qB while a video is being downloaded.
+        media_path = path.with_suffix("") if path.suffix.casefold() == ".!qb" else path
+        return media_path if media_path.suffix.casefold() in VIDEO_EXTENSIONS else None
 
-    for current, directories, filenames in os.walk(root, onerror=on_walk_error, followlinks=False):
-        if any(Path(current).resolve() == Path(value) or Path(value) in Path(current).resolve().parents for value in excluded):
-            directories[:] = []
+    for directory, filenames, linked_directories in local_directory_inventory(download_dir):
+        if excluded and any(directory.resolve().is_relative_to(value) for value in excluded):
+            protected_artwork.add(directory)
             continue
-        directories[:] = [name for name in directories if not (Path(current) / name).is_symlink()]
-        directory = Path(current)
+        if linked_directories:
+            protected_artwork.add(directory)
+        elif directory != root and not filenames:
+            empty_candidates.add(directory)
         for filename in filenames:
             path = directory / filename
+            media_path = video_path(path)
+            if media_path is not None:
+                videos_by_directory.setdefault(directory, []).append(media_path)
+                protected_artwork.add(directory)
+                continue
             if path.is_symlink():
+                protected_artwork.add(directory)
                 continue
             suffix = path.suffix.casefold()
-            if suffix in VIDEO_EXTENSIONS:
-                videos_by_directory.setdefault(directory, []).append(path)
-            elif suffix == ".nfo" or suffix in SUBTITLE_EXTENSIONS:
+            if suffix == ".nfo" or suffix in SUBTITLE_EXTENSIONS:
                 sidecars_by_directory.setdefault(directory, []).append(path)
-    if walk_errors:
-        raise AppError(f"应用用户无权完整读取订阅目录 {root}：{walk_errors[0]}")
+            elif suffix == ".jpeg" or suffix in cover_images.IMAGE_TYPES:
+                artwork_by_directory.setdefault(directory, []).append(path)
+            else:
+                protected_artwork.add(directory)
+    video_ancestors = {parent for directory in videos_by_directory for parent in directory.parents}
+    protected_artwork.update(parent for directory in tuple(protected_artwork) for parent in directory.parents)
+    for directory, paths in artwork_by_directory.items():
+        if any(parent != root and parent in videos_by_directory for parent in directory.parents):
+            continue
+        if directory != root and directory not in protected_artwork:
+            sidecars_by_directory.setdefault(directory, []).extend(paths)
 
-    root = root.resolve()
+    resolved_root = root.resolve()
     removed = []
     for directory, sidecars in sidecars_by_directory.items():
-        videos = videos_by_directory.get(directory, [])
+        check_requested_stop()
+        # A parent folder can contain the NFO or artwork for a nested release.
+        if directory in video_ancestors:
+            continue
+        try:
+            if directory.resolve() != resolved_root / directory.relative_to(root):
+                continue
+            current_videos = [video_path(entry) for entry in directory.iterdir()]
+            current_videos = [path for path in current_videos if path is not None]
+            if directory not in videos_by_directory and current_videos:
+                continue
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise AppError(f"无法核对配套文件目录 {directory}：{error}") from error
+        videos = current_videos
         video_stems = {video.stem.casefold() for video in videos}
         video_codes = {normalize_code(video.stem) for video in videos} - {""}
         for sidecar in sidecars:
@@ -1220,24 +1814,29 @@ def cleanup_orphan_sidecars(download_dir, excluded_dirs=()):
             if paired:
                 continue
             try:
-                sidecar.unlink(missing_ok=True)
+                if not stat.S_ISREG(sidecar.lstat().st_mode):
+                    continue
+                sidecar.unlink()
                 removed.append(str(sidecar))
-                parent = sidecar.parent
-                while True:
-                    try:
-                        parent.resolve().relative_to(root)
-                    except (OSError, ValueError):
-                        break
-                    if parent.resolve() == root:
-                        break
-                    try:
-                        parent.rmdir()
-                    except OSError:
-                        break
-                    parent = parent.parent
+                if directory != root:
+                    empty_candidates.add(directory)
+            except FileNotFoundError:
+                continue
             except OSError as error:
-                raise AppError(f"清理孤立 NFO/字幕失败：{sidecar}：{error}") from error
-    return removed
+                raise AppError(f"清理孤立配套文件失败：{sidecar}：{error}") from error
+
+    removed_directories = []
+    for directory in sorted(empty_candidates, key=lambda path: (-len(path.parts), path)):
+        check_requested_stop()
+        try:
+            if not directory.is_relative_to(root) or directory.resolve(strict=True) != resolved_root / directory.relative_to(root):
+                continue
+            # rmdir also checks emptiness if something was added after the scan.
+            directory.rmdir()
+        except OSError:
+            continue
+        removed_directories.append(str(directory))
+    return removed, removed_directories
 
 
 @measure_stage("scan")
@@ -1262,6 +1861,7 @@ def _scan_local_releases_uncached(download_dir):
     nfo_metadata_cache = {}
     subtitle_directory_cache = {}
     for path in files:
+        check_requested_stop()
         code = normalize_code(path.stem)
         metadata = read_video_metadata(path, nfo_directory_cache, nfo_metadata_cache)
         if not code:
@@ -1296,6 +1896,12 @@ def _scan_local_releases_uncached(download_dir):
 
 
 def find_local_releases(download_dir, code):
+    context = check_context()
+    if context is not None:
+        cached = context.scans.get(os.path.realpath(download_dir))
+        if cached is not None:
+            context.count("scan_hits")
+            return copy.deepcopy(cached.get(code, []))
     return scan_local_releases(download_dir).get(code, [])
 
 
@@ -1375,6 +1981,7 @@ def collect_subscription_subtitles(rows, collection_dir, performer=""):
         log_event(f"字幕汇总失败，无法创建或访问目录 {destination}：{error}", level="warning", event="subtitle_collection_failed", subscription=performer)
         return summary
     for filename, (source_mtime, _path, source) in sorted(candidates.items()):
+        check_requested_stop()
         target = destination / filename
         temporary = destination / f".{filename}.tmp-{uuid.uuid4().hex}"
         try:
@@ -1481,14 +2088,16 @@ def _mteam_request_once(path, token, payload=None, method=None, limit=MAX_RESPON
             headers["Content-Type"] = "application/json"
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers, method=method or ("POST" if data else "GET"))
+    wait_for_mteam_request()
+    performance_count("mteam_requests")
+    started = time.perf_counter()
     try:
-        wait_for_mteam_request()
-        performance_count("mteam_requests")
         with MTEAM_OPENER.open(request, timeout=30) as response:
             body = response.read(limit + 1)
+            elapsed = time.perf_counter() - started
             metadata = {"status": response.status, "content_type": response.headers.get_content_type(), "content_disposition": response.headers.get("Content-Disposition", ""), "url": response.geturl()}
     except urllib.error.HTTPError as error:
-        log_http_error_json("M-Team", path, error, secrets=(token,))
+        log_http_error_json("M-Team", path, error, started, secrets=(token,), request_payload=payload)
         if error.code in (401, 403):
             raise AppError("M-Team 令牌无效或无权访问影片区。") from error
         if error.code == 429:
@@ -1503,12 +2112,11 @@ def _mteam_request_once(path, token, payload=None, method=None, limit=MAX_RESPON
         raise AppError("连接 M-Team API 失败，请检查 NAS 网络。") from error
     if len(body) > limit:
         raise AppError("M-Team 返回内容超过允许大小。")
-    log_http_json("M-Team", path, metadata["status"], body, secrets=(token,))
+    log_http_json("M-Team", path, metadata["status"], body, elapsed=elapsed, secrets=(token,), request_payload=payload)
     return body, metadata
 
 
 def wait_for_mteam_retry(error, request_label, attempt):
-    previous = read_json(MTEAM_LIMIT_FILE, {})
     consecutive, retry_after = rate_limit_retry_delay(error, {"consecutive_rate_limits": attempt - 1})
     retry_at = time.time() + retry_after
     performer = getattr(MTEAM_POLL_CACHE, "performer", "")
@@ -1517,8 +2125,9 @@ def wait_for_mteam_retry(error, request_label, attempt):
     except AppError:
         status = {}
     state = {
-        **previous,
         "retry_at": retry_at,
+        "resume": True,
+        "run_id": getattr(MTEAM_POLL_CACHE, "run_id", ""),
         "retry_after": retry_after,
         "consecutive_rate_limits": consecutive,
         "message": str(error),
@@ -1538,20 +2147,19 @@ def wait_for_mteam_retry(error, request_label, attempt):
         status.update({"state": "waiting_retry", "retry_at": retry_at, "retry_in": retry_after, "completed_at": "", "message": f"M-Team 请求被限流，等待 {retry_after} 秒后继续重试当前请求。"})
         write_json(STATUS_FILE, status)
     log_event(f"M-Team 限流，第 {consecutive} 次；等待 {retry_after} 秒后继续重试当前请求：{request_label}。", event="retry_waiting", subscription=performer)
-    remaining = retry_after
     wait_started = time.perf_counter()
-    while remaining > 0 and not STOP_SCHEDULER:
-        time.sleep(min(5, remaining))
-        remaining = max(0, int(retry_at - time.time() + 0.999))
+    try:
+        wait_for_check_deadline(retry_at)
+    finally:
+        context = check_context()
+        if context is not None:
+            context.wait_seconds += time.perf_counter() - wait_started
     context = check_context()
     if context is not None:
-        context.wait_seconds += time.perf_counter() - wait_started
         context.resume_after_wait()
         downloader = getattr(MTEAM_POLL_CACHE, "downloader", None)
         if isinstance(downloader, CheckDownloader):
             downloader.invalidate()
-    if STOP_SCHEDULER:
-        raise MTeamRequestInterrupted("后台调度器正在停止，当前 M-Team 请求未完成。")
     try:
         status = read_json(STATUS_FILE, {})
     except AppError:
@@ -1657,37 +2265,130 @@ def mteam_detail(identifier, token, force_refresh=False):
     cache = getattr(MTEAM_POLL_CACHE, "active", None)
     cache_key = str(identifier)
     if not force_refresh and cache is not None and cache_key in cache["details"]:
+        detail, response = cache["details"][cache_key]
         performance_count("detail_hits")
-        return dict(cache["details"][cache_key])
+        log_http_json("M-Team", "/torrent/detail", None, cache_source="本轮内存", cached_data=response,
+                      request_payload={"id": identifier}, secrets=(token,),
+                      code=f"M-Team ID {cache_key}" if cache_key.isdigit() else "")
+        return dict(detail)
+    if not force_refresh:
+        started = time.perf_counter()
+        connection = connect_video_database()
+        try:
+            row = connection.execute(
+                "SELECT response_json, checked_at FROM mteam_detail_cache WHERE mteam_id=?", (cache_key,),
+            ).fetchone()
+            if row and time.time() - row[1] < MTEAM_DETAIL_CACHE_TTL_SECONDS:
+                response = json.loads(row[0])
+                detail = mteam_detail_data(response)
+                if cache is not None:
+                    cache["details"][cache_key] = dict(detail), response
+                performance_count("detail_persistent_hits")
+                log_http_json("M-Team", "/torrent/detail", None, row[0], cache_source="SQLite",
+                              elapsed=time.perf_counter() - started, secrets=(token,), request_payload={"id": identifier})
+                return detail
+        finally:
+            connection.close()
     result = mteam_json("/torrent/detail", token, {"id": identifier}, multipart=True)
-    detail = result_data(result)
+    detail = mteam_detail_data(result)
+    if cache is not None:
+        cache["details"][cache_key] = dict(detail), result
+    connection = connect_video_database()
+    try:
+        with connection:
+            connection.execute(
+                """INSERT INTO mteam_detail_cache(mteam_id, response_json, checked_at) VALUES (?, ?, ?)
+                   ON CONFLICT(mteam_id) DO UPDATE SET response_json=excluded.response_json, checked_at=excluded.checked_at""",
+                (cache_key, json.dumps(result, ensure_ascii=False, separators=(",", ":")), time.time()),
+            )
+    finally:
+        connection.close()
+    return detail
+
+
+def mteam_detail_data(response):
+    detail = result_data(response)
     if isinstance(detail, dict):
         for key in ("torrent", "detail", "item"):
             if isinstance(detail.get(key), dict):
-                detail = detail[key]
-                break
-        if cache is not None:
-            cache["details"][cache_key] = dict(detail)
+                return detail[key]
         return detail
     raise AppError("M-Team 影片详情结果结构无法识别。")
 
 
-def mteam_option_map(endpoint, token):
-    cache = getattr(MTEAM_POLL_CACHE, "active", None)
-    if cache is not None and endpoint in cache["options"]:
-        performance_count("option_hits")
-        return dict(cache["options"][endpoint])
-    data = result_data(mteam_json(endpoint, token, {}))
+def parse_mteam_options(response):
+    data = result_data(response)
     items = data if isinstance(data, list) else next((data.get(key) for key in ("data", "records", "items", "results", "list") if isinstance(data, dict) and isinstance(data.get(key), list)), [])
     output = {}
     for item in items:
         if not isinstance(item, dict) or item.get("id") is None:
             continue
         names = [item.get(key) for key in ("name", "nameCn", "nameZh", "nameEn", "label", "value") if item.get(key) not in (None, "")]
-        output[str(item["id"])] = " ".join(str(name) for name in names)
-    if cache is not None:
-        cache["options"][endpoint] = dict(output)
+        if names:
+            output[str(item["id"])] = " ".join(str(name) for name in names)
     return output
+
+
+def mteam_option_map(endpoint, token, required_ids=()):
+    cache = getattr(MTEAM_POLL_CACHE, "active", None)
+    required = {str(identifier) for identifier in required_ids} - {"0"}
+    is_subtitle_dictionary = endpoint == "/subtitle/langs"
+    parse_options = parse_mteam_subtitle_languages if is_subtitle_dictionary else parse_mteam_options
+    started = time.perf_counter()
+    entry = cache["options"].get(endpoint) if cache is not None else None
+    source = "本轮内存" if entry is not None else "SQLite"
+    if entry is None:
+        with closing(connect_video_database()) as connection:
+            row = connection.execute(
+                "SELECT response_json, checked_at FROM mteam_option_cache WHERE endpoint=?", (endpoint,),
+            ).fetchone()
+        if row:
+            try:
+                response = json.loads(row[0])
+                options = parse_options(response) if isinstance(response, dict) else {}
+                if options:
+                    entry = options, response, row[1]
+            except (ValueError, RecursionError):
+                pass
+    if entry is not None:
+        options, response, checked_at = entry
+        age = time.time() - checked_at
+        if required <= options.keys() or 0 <= age < MTEAM_OPTION_REFRESH_INTERVAL:
+            performance_count("option_hits")
+            if cache is None or endpoint not in cache.setdefault("options_logged", set()):
+                log_http_json("M-Team", endpoint, None, cache_source=source, cached_data=response,
+                              elapsed=time.perf_counter() - started, secrets=(token,))
+                if cache is not None:
+                    cache["options_logged"].add(endpoint)
+            if cache is not None:
+                cache["options"][endpoint] = entry
+            return dict(options)
+    try:
+        response = mteam_json(endpoint, token) if is_subtitle_dictionary else mteam_json(endpoint, token, {})
+        options = parse_options(response)
+        if not options and entry is not None:
+            raise AppError("M-Team 选项字典为空。")
+    except (MTeamRateLimitError, MTeamRequestInterrupted):
+        raise
+    except AppError:
+        if entry is None:
+            raise
+        options, response, _ = entry
+        performance_count("option_hits")
+        log_http_json("M-Team", endpoint, None, cache_source=source, cached_data=response, secrets=(token,))
+        if cache is not None:
+            cache.setdefault("options_logged", set()).add(endpoint)
+    checked_at = time.time()
+    if options:
+        with closing(connect_video_database()) as connection, connection:
+            connection.execute(
+                """INSERT INTO mteam_option_cache(endpoint, response_json, checked_at) VALUES (?, ?, ?)
+                   ON CONFLICT(endpoint) DO UPDATE SET response_json=excluded.response_json, checked_at=excluded.checked_at""",
+                (endpoint, json.dumps(response, ensure_ascii=False, separators=(",", ":")), checked_at),
+            )
+    if cache is not None:
+        cache["options"][endpoint] = options, response, checked_at
+    return dict(options)
 
 
 @measure_stage("search")
@@ -1701,12 +2402,10 @@ def mteam_search(keyword, token, refresh_existing_info=False, refresh_codes=None
     items = data if isinstance(data, list) else next((data.get(key) for key in ("data", "records", "items", "results", "list") if isinstance(data, dict) and isinstance(data.get(key), list)), None)
     if items is None:
         raise AppError("M-Team 影片搜索结果结构无法识别。")
-    standard_map = {}
-    codec_map = {}
-    if any(isinstance(item, dict) and str(item.get("standard", "")).isdigit() for item in items):
-        standard_map = mteam_option_map("/torrent/standardList", token)
-    if any(isinstance(item, dict) and str(item.get("videoCodec", "")).isdigit() for item in items):
-        codec_map = mteam_option_map("/torrent/videoCodecList", token)
+    standard_ids = {str(item["standard"]) for item in items if isinstance(item, dict) and str(item.get("standard", "")).isdigit()}
+    codec_ids = {str(item["videoCodec"]) for item in items if isinstance(item, dict) and str(item.get("videoCodec", "")).isdigit()}
+    standard_map = mteam_option_map("/torrent/standardList", token, standard_ids) if standard_ids else {}
+    codec_map = mteam_option_map("/torrent/videoCodecList", token, codec_ids) if codec_ids else {}
     output = []
     for item in items:
         if not isinstance(item, dict):
@@ -1740,7 +2439,7 @@ def mteam_search(keyword, token, refresh_existing_info=False, refresh_codes=None
             has_codec = metadata.get("videoCodec") not in (None, "", 0)
             if not (has_resolution and has_codec and has_language):
                 try:
-                    detail = mteam_detail(identifier, token)
+                    detail = mteam_detail(identifier, token, force_refresh=True)
                 except MTeamRateLimitError:
                     raise
                 except AppError:
@@ -1756,9 +2455,9 @@ def mteam_search(keyword, token, refresh_existing_info=False, refresh_codes=None
                     if detail.get(key) not in (None, "", [], {}, 0):
                         metadata[key] = detail[key]
                 if str(metadata.get("standard", "")).isdigit() and str(metadata["standard"]) not in standard_map:
-                    standard_map.update(mteam_option_map("/torrent/standardList", token))
+                    standard_map.update(mteam_option_map("/torrent/standardList", token, (metadata["standard"],)))
                 if str(metadata.get("videoCodec", "")).isdigit() and str(metadata["videoCodec"]) not in codec_map:
-                    codec_map.update(mteam_option_map("/torrent/videoCodecList", token))
+                    codec_map.update(mteam_option_map("/torrent/videoCodecList", token, (metadata["videoCodec"],)))
         if str(metadata["standard"]).isdigit():
             metadata["standardName"] = standard_map.get(str(metadata["standard"]), "")
         if str(metadata["videoCodec"]).isdigit():
@@ -1813,6 +2512,7 @@ def candidate_metadata(candidate):
         "mediainfo_checked": bool(candidate.get("mediainfo_checked", bool(candidate.get("mediainfo")))),
         "cover_url": str(candidate.get("cover_url", "") or ""),
         "cover_checked": bool(candidate.get("cover_checked", bool(candidate.get("cover_url")))),
+        "dmm_detail_checked": bool(candidate.get("dmm_detail_checked", False)),
         **({"screenshot_urls": candidate["screenshot_urls"]} if "screenshot_urls" in candidate else {}),
         **({"dmm_code": candidate["dmm_code"]} if "dmm_code" in candidate else {}),
         "metadata_complete": bool(candidate.get("metadata_complete", False)),
@@ -1903,12 +2603,34 @@ def detail_screenshot_urls(detail, cover):
     return description_images
 
 
+def infer_dmm_code_from_cover(cover):
+    try:
+        parsed = urllib.parse.urlsplit(cover)
+    except ValueError:
+        return ""
+    if parsed.hostname not in ("pics.dmm.co.jp", "pics.dmm.com"):
+        return ""
+    mono = re.fullmatch(r"/mono/movie/adult/([a-z0-9]+)/\1pl\.(?:jpe?g|png|webp)", parsed.path, re.IGNORECASE)
+    if mono:
+        product = mono[1].lower()
+    else:
+        digital = re.fullmatch(r"/digital/video/([a-z]+)(\d+)/\1\2(?:-\d+)?\.(?:jpe?g|png|webp)", parsed.path, re.IGNORECASE)
+        if not digital:
+            return ""
+        prefix, digits = digital.groups()
+        product = prefix.lower() + (digits.lstrip("0") or "0").zfill(3)
+    return f"https://www.dmm.co.jp/mono/dvd/-/detail/=/cid={product}/"
+
+
 def detail_image_metadata(detail):
     cover = detail_cover_url(detail)
-    dmm_code = detail.get("dmmCode")
+    dmm_code = detail.get("dmmCode") or detail.get("dmm_code")
+    dmm_code = dmm_code.strip() if isinstance(dmm_code, str) else ""
+    if not dmm_code:
+        dmm_code = infer_dmm_code_from_cover(cover)
     return {
         "cover_url": cover, "cover_checked": True, "screenshot_urls": detail_screenshot_urls(detail, cover),
-        "dmm_code": dmm_code.strip() if isinstance(dmm_code, str) else "",
+        "dmm_code": dmm_code, "dmm_detail_checked": True,
     }
 
 
@@ -1922,10 +2644,10 @@ def enrich_candidate_from_detail(candidate, token, detail=None):
     standard_map = {}
     codec_map = {}
     if str(resolution).isdigit():
-        standard_map = mteam_option_map("/torrent/standardList", token)
+        standard_map = mteam_option_map("/torrent/standardList", token, (resolution,))
         resolution = standard_map.get(str(resolution), resolution)
     if str(codec).isdigit():
-        codec_map = mteam_option_map("/torrent/videoCodecList", token)
+        codec_map = mteam_option_map("/torrent/videoCodecList", token, (codec,))
         codec = codec_map.get(str(codec), codec)
     mediainfo = detail_mediainfo(metadata)
     media_stream = mediainfo_video_stream(mediainfo)
@@ -1966,6 +2688,32 @@ def detail_contains_performer(detail, performer):
     expected = normalized_performer_name(performer)
     if not expected:
         return False
+    accepted_names = {expected}
+    connection = connect_video_database()
+    try:
+        actress_rows = connection.execute(
+            "SELECT source_name, chinese_name, canonical_name FROM actresses"
+        ).fetchall()
+    finally:
+        connection.close()
+    selected_groups = set()
+    for source_name, chinese_name, canonical_name in actress_rows:
+        canonical = canonical_name or source_name
+        if expected in {normalized_performer_name(source_name), normalized_performer_name(chinese_name), normalized_performer_name(canonical)}:
+            selected_groups.add(canonical)
+            accepted_names.update(
+                normalized_performer_name(value)
+                for value in (source_name, chinese_name, canonical)
+                if value
+            )
+    if selected_groups:
+        for source_name, chinese_name, canonical_name in actress_rows:
+            if (canonical_name or source_name) in selected_groups:
+                accepted_names.update(
+                    normalized_performer_name(value)
+                    for value in (source_name, chinese_name)
+                    if value
+                )
     values = []
 
     def collect(value):
@@ -1981,7 +2729,7 @@ def detail_contains_performer(detail, performer):
 
     collect(detail)
     haystack = "".join(char for char in unicodedata.normalize("NFKC", " ".join(values)).casefold() if char.isalnum())
-    return expected in haystack
+    return any(name in haystack for name in accepted_names)
 
 
 def normalized_performer_name(performer):
@@ -2023,13 +2771,15 @@ def _mteam_download_request_once(url, limit=MAX_RESPONSE_BYTES):
         "Accept": "application/x-bittorrent, application/octet-stream, application/json, */*",
         "User-Agent": "AVSubscribe/1.0",
     }, method="GET")
+    wait_for_mteam_request()
+    started = time.perf_counter()
     try:
-        wait_for_mteam_request()
         with MTEAM_DOWNLOAD_OPENER.open(request, timeout=30) as response:
             body = response.read(limit + 1)
+            elapsed = time.perf_counter() - started
             metadata = {"status": response.status, "content_type": response.headers.get_content_type(), "content_disposition": response.headers.get("Content-Disposition", ""), "url": response.geturl()}
     except urllib.error.HTTPError as error:
-        log_http_error_json("M-Team", "/torrent/download", error)
+        log_http_error_json("M-Team", "/torrent/download", error, started)
         if error.code in (401, 403):
             raise AppError("M-Team 种子下载授权无效或已过期。") from error
         if error.code == 429:
@@ -2044,7 +2794,7 @@ def _mteam_download_request_once(url, limit=MAX_RESPONSE_BYTES):
         raise AppError("连接 M-Team 种子下载节点失败，请检查 NAS 网络。") from error
     if len(body) > limit:
         raise AppError("M-Team 种子文件超过允许大小。")
-    log_http_json("M-Team", "/torrent/download", metadata["status"], body)
+    log_http_json("M-Team", "/torrent/download", metadata["status"], body, elapsed=elapsed)
     return body, metadata
 
 
@@ -2092,11 +2842,8 @@ def mteam_subtitle_items(result):
     raise AppError("M-Team 字幕搜索结果结构无法识别。")
 
 
-def mteam_subtitle_language_map(token):
-    cache = getattr(MTEAM_POLL_CACHE, "active", None)
-    if cache is not None and cache.get("subtitle_languages") is not None:
-        return dict(cache["subtitle_languages"])
-    data = result_data(mteam_json("/subtitle/langs", token))
+def parse_mteam_subtitle_languages(response):
+    data = result_data(response)
     languages = {}
     if isinstance(data, list):
         for item in data:
@@ -2115,9 +2862,11 @@ def mteam_subtitle_language_map(token):
                 label = item
             if label:
                 languages[str(identifier)] = str(label)
-    if cache is not None:
-        cache["subtitle_languages"] = dict(languages)
     return languages
+
+
+def mteam_subtitle_language_map(token, required_ids=()):
+    return mteam_option_map("/subtitle/langs", token, required_ids)
 
 
 def mteam_subtitle_count(value):
@@ -2127,10 +2876,15 @@ def mteam_subtitle_count(value):
     return int(match.group().replace(",", "")) if match else 0
 
 
-def mteam_subtitle_language(item, languages):
+def mteam_subtitle_language_value(item):
     value = item.get("lang", item.get("langId", item.get("language", "")))
     if isinstance(value, dict):
-        value = value.get("name", value.get("label", value.get("id", "")))
+        return value.get("name", value.get("label", value.get("id", "")))
+    return value
+
+
+def mteam_subtitle_language(item, languages):
+    value = mteam_subtitle_language_value(item)
     label = str(languages.get(str(value), value) or "").strip()
     normalized = unicodedata.normalize("NFKC", label).casefold()
     if not any(marker in normalized for marker in ("chinese", "中文", "汉语", "漢語", "mandarin", "繁体", "繁體", "简体", "簡體", "zh-hk", "zh-tw", "zh-cn", "zh-hans", "zh-hant", "\bchi\b", "\bzho\b")):
@@ -2158,18 +2912,24 @@ def mteam_subtitle_extension(metadata, data=b""):
 @measure_stage("subtitle")
 def mteam_subtitle_download(code, torrent_id, video_paths, token):
     settings = get_settings()
-    results = mteam_subtitle_items(mteam_json(
-        f"/subtitle/list?id={urllib.parse.quote(str(torrent_id), safe='')}", token, method="POST",
-    ))
-    needs_language_map = any(
-        isinstance(item, dict)
-        and (
-            isinstance(item.get("lang", item.get("langId", item.get("language", ""))), dict)
-            or str(item.get("lang", item.get("langId", item.get("language", "")))).isdigit()
+    cache = getattr(MTEAM_POLL_CACHE, "active", None)
+    listings = cache.setdefault("subtitle_lists", {}) if cache is not None else {}
+    identifier = str(torrent_id)
+    if identifier not in listings:
+        response = mteam_json(
+            f"/subtitle/list?id={urllib.parse.quote(identifier, safe='')}", token, method="POST",
         )
-        for item in results
-    )
-    languages = mteam_subtitle_language_map(token) if needs_language_map else {}
+        listings[identifier] = mteam_subtitle_items(response), response
+    else:
+        performance_count("subtitle_list_hits")
+        log_http_json("M-Team", "/subtitle/list", None, cache_source="本轮内存", cached_data=listings[identifier][1],
+                      request_payload={"id": identifier}, secrets=(token,), code=code, settings=settings)
+    results, _ = listings[identifier]
+    language_ids = {
+        value for item in results
+        if isinstance(item, dict) and (value := str(mteam_subtitle_language_value(item))).isdigit()
+    }
+    languages = mteam_subtitle_language_map(token, language_ids) if language_ids else {}
     candidates = []
     unknown_languages = 0
     foreign_ids = 0
@@ -2331,11 +3091,14 @@ class Downloader:
         if content_type:
             request_headers["Content-Type"] = content_type
         request = urllib.request.Request(self._url(path), data=data, headers=request_headers, method=method)
+        started = time.perf_counter()
         try:
             response = urllib.request.urlopen(request, timeout=30)
         except urllib.error.HTTPError as error:
             if error.code not in accept_status:
-                log_http_error_json("qBittorrent", path, error, secrets=(self.config.get("password"), *self.cookies.values()))
+                log_http_error_json("qBittorrent", path, error, started,
+                                    secrets=(self.config.get("password"), *self.cookies.values()),
+                                    request_data=data, content_type=content_type)
             if error.code in (401, 403) and path != "/api/v2/auth/login" and _retry_auth:
                 rejected_sid = self.cookies.get("SID", "")
                 error.close()
@@ -2344,11 +3107,11 @@ class Downloader:
                 self._qb_login(rejected_sid=rejected_sid)
                 return self._request(path, data, headers, method, content_type, accept_status, _retry_auth=False)
             if error.code in accept_status:
-                return error
+                return error, started
             if error.code in (401, 403):
                 raise AppError("下载器认证失败，请检查用户名和密码。") from error
             raise AppError(f"下载器 API 请求失败 (HTTP {error.code})。") from error
-        return response
+        return response, started
 
     def _json(self, path, payload=None, form=False, headers=None, method=None, accept_status=()):
         if form:
@@ -2357,9 +3120,10 @@ class Downloader:
         else:
             body = json.dumps(payload).encode() if payload is not None else None
             content_type = "application/json" if body is not None else None
-        response = self._request(path, body, headers, method or ("POST" if body is not None else "GET"), content_type, accept_status)
+        response, started = self._request(path, body, headers, method or ("POST" if body is not None else "GET"), content_type, accept_status)
         raw = read_response_body(response, 8 * 1024 * 1024)
-        log_http_json("qBittorrent", path, response.status, raw, secrets=(self.config.get("password"), *self.cookies.values()))
+        log_http_json("qBittorrent", path, response.status, raw, elapsed=time.perf_counter() - started,
+                      request_payload=payload, secrets=(self.config.get("password"), *self.cookies.values()))
         if response.status >= 400:
             raise AppError(f"下载器 API 请求失败 (HTTP {response.status})。")
         try:
@@ -2394,9 +3158,11 @@ class Downloader:
 
     def _qb_login_request(self):
         body = urllib.parse.urlencode({"username": self.config.get("username", ""), "password": self.config.get("password", "")}).encode()
-        response = self._request("/api/v2/auth/login", body, method="POST", content_type="application/x-www-form-urlencoded")
-        result = read_response_body(response, 1024).decode("utf-8", errors="replace")
-        log_http_json("qBittorrent", "/api/v2/auth/login", response.status, result, secrets=(self.config.get("password"),))
+        response, started = self._request("/api/v2/auth/login", body, method="POST", content_type="application/x-www-form-urlencoded")
+        raw = read_response_body(response, 1024)
+        log_http_json("qBittorrent", "/api/v2/auth/login", response.status, raw,
+                      elapsed=time.perf_counter() - started, secrets=(self.config.get("password"),))
+        result = raw.decode("utf-8", errors="replace")
         cookie_headers = response.headers.get_all("Set-Cookie", [])
         if response.status != 204 and result.strip() != "Ok.":
             content_type = response.headers.get_content_type()
@@ -2418,10 +3184,10 @@ class Downloader:
 
     def test(self):
         self._qb_login()
-        response = self._request("/api/v2/app/version", headers=self._qb_headers())
+        response, started = self._request("/api/v2/app/version", headers=self._qb_headers())
         result = response.read(1024)
         log_http_json("qBittorrent", "/api/v2/app/version", getattr(response, "status", 200), result,
-                      secrets=(self.config.get("password"), *self.cookies.values()))
+                      elapsed=time.perf_counter() - started, secrets=(self.config.get("password"), *self.cookies.values()))
         if not result.strip():
             raise AppError("qBittorrent version response was empty.")
         return "qBittorrent 连接成功。"
@@ -2443,10 +3209,12 @@ class Downloader:
             body.extend(value + b"\r\n")
         body.extend(f"--{boundary}\r\nContent-Disposition: form-data; name=\"torrents\"; filename=\"release.torrent\"\r\nContent-Type: application/x-bittorrent\r\n\r\n".encode())
         body.extend(torrent_data + f"\r\n--{boundary}--\r\n".encode())
-        response = self._request("/api/v2/torrents/add", bytes(body), headers=self._qb_headers(), method="POST", content_type=f"multipart/form-data; boundary={boundary}", accept_status=(409,))
-        message = response.read(1024).decode("utf-8", errors="replace").strip()
-        log_http_json("qBittorrent", "/api/v2/torrents/add", response.status, message,
+        response, started = self._request("/api/v2/torrents/add", bytes(body), headers=self._qb_headers(), method="POST", content_type=f"multipart/form-data; boundary={boundary}", accept_status=(409,))
+        raw = response.read(1024)
+        log_http_json("qBittorrent", "/api/v2/torrents/add", response.status, raw, elapsed=time.perf_counter() - started,
+                      request_payload={name: value.decode("utf-8") for name, value in fields},
                       secrets=(self.config.get("password"), *self.cookies.values()), code=normalize_code(title))
+        message = raw.decode("utf-8", errors="replace").strip()
         if response.status == 409:
             existing = self.list_tasks([info_hash]).get(info_hash)
             if existing:
@@ -2556,7 +3324,7 @@ class Downloader:
         data, _ = self._json(path, headers=self._qb_headers())
         self._progress(f"qBittorrent 返回 {len(data)} 个任务。", "downloader_query_completed")
         validation_states = {"checkingDL", "checkingUP", "checkingResumeData", "moving", "allocating"}
-        return {str(item.get("hash", "")).lower(): {
+        tasks = {str(item.get("hash", "")).lower(): {
             "name": item.get("name", ""), "progress": float(item.get("progress", 0)),
             "tags": item.get("tags") or "",
             "complete": item.get("state") not in validation_states and (
@@ -2568,6 +3336,7 @@ class Downloader:
             "failed": item.get("state") in ("error", "missingFiles"),
             "error": "下载器报告任务错误。" if item.get("state") in ("error", "missingFiles") else "",
         } for item in data if item.get("hash")}
+        return DownloadTaskSnapshot(tasks, data) if check_context() is not None else tasks
 
     def list_task_files(self, info_hash):
         if self.config.get("type") != "qbittorrent":
@@ -2600,12 +3369,36 @@ class Downloader:
 def validate_subscription(payload, current=None):
     performer = str(payload.get("performer", current.get("performer", "") if current else "")).strip()
     keywords = str(payload.get("keywords", current.get("keywords", "") if current else "")).strip()
+    if "search_keywords" in payload:
+        raw_search_keywords = payload.get("search_keywords")
+        if not isinstance(raw_search_keywords, list) or len(raw_search_keywords) > 30:
+            raise AppError("搜索关键字最多可添加 30 组。")
+        search_keywords = []
+        for value in raw_search_keywords:
+            if not isinstance(value, str):
+                raise AppError("搜索关键字格式无效。")
+            value = value.strip()
+            if len(value) > 200:
+                raise AppError("每组搜索关键字不能超过 200 个字符。")
+            if value and value not in search_keywords:
+                search_keywords.append(value)
+    elif "search_keyword" in payload:
+        value = str(payload.get("search_keyword") or "").strip()
+        search_keywords = [value] if value else []
+    elif current and current.get("search_keywords"):
+        search_keywords = [str(value).strip() for value in current["search_keywords"] if str(value).strip()]
+    elif current and current.get("search_keyword"):
+        search_keywords = [str(current["search_keyword"]).strip()]
+    else:
+        search_keywords = [" ".join(value for value in (performer, keywords or "ltx") if value).strip()]
     download_dir = str(payload.get("download_dir", current.get("download_dir", "") if current else "")).strip()
     raw_blacklist = payload.get("blacklist", current.get("blacklist", []) if current else [])
     if not performer or len(performer) > 120:
         raise AppError("请填写女优名字（最多 120 个字符）。")
-    if len(keywords) > 200:
-        raise AppError("附加关键字不能超过 200 个字符。")
+    if not search_keywords:
+        search_keywords = [f"{performer} ltx"]
+    if len(search_keywords) > 30 or any(len(keyword) > 200 for keyword in search_keywords):
+        raise AppError("搜索关键字最多可添加 30 组，每组不超过 200 个字符。")
     if not isinstance(raw_blacklist, list) or len(raw_blacklist) > 200:
         raise AppError("番号黑名单最多可添加 200 个番号。")
     blacklist = []
@@ -2620,7 +3413,28 @@ def validate_subscription(payload, current=None):
     download_dir = posixpath.normpath(download_dir)
     if download_dir == "/":
         raise AppError("下载目录不能是文件系统根目录。")
-    return {"performer": performer, "keywords": keywords, "blacklist": blacklist, "download_dir": download_dir, "wash_enabled": bool(payload.get("wash_enabled", current.get("wash_enabled", True) if current else True))}
+    return {"performer": performer, "keywords": keywords, "search_keywords": search_keywords, "search_keyword": search_keywords[0], "blacklist": blacklist, "download_dir": download_dir,
+            "wash_enabled": bool(payload.get("wash_enabled", current.get("wash_enabled", True) if current else True)),
+            "exclude_non_chinese": bool(payload.get("exclude_non_chinese", (current or {}).get("exclude_non_chinese", True)))}
+
+
+def subscription_search_keyword(subscription):
+    search_keywords = subscription_search_keywords(subscription)
+    return "，".join(search_keywords)
+
+
+def subscription_search_keywords(subscription):
+    values = subscription.get("search_keywords")
+    if isinstance(values, list):
+        keywords = list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+        if keywords:
+            return keywords
+    search_keyword = str(subscription.get("search_keyword", "") or "").strip()
+    if search_keyword:
+        return [search_keyword]
+    performer = str(subscription.get("performer", "") or "").strip()
+    legacy_keyword = str(subscription.get("keywords", "") or "").strip()
+    return [" ".join(value for value in (performer, legacy_keyword or "ltx") if value)]
 
 
 def list_subscriptions():
@@ -2628,14 +3442,26 @@ def list_subscriptions():
 
 
 def subscriptions_with_video_counts():
-    connection = connect_video_database()
-    try:
+    subscriptions = list_subscriptions()
+    with closing(connect_video_database()) as connection:
         counts = dict(connection.execute(
             "SELECT subscription_id, COUNT(*) FROM local_video_files GROUP BY subscription_id"
         ).fetchall())
-    finally:
-        connection.close()
-    return [{**item, "video_count": counts.get(item["id"], 0)} for item in list_subscriptions()]
+        names, profiles = subscription_actress_index(connection) if subscriptions else ({}, {})
+    now = time.time()
+    result = []
+    for item in subscriptions:
+        matches = names.get(showcase_name_key(item["performer"]), ())
+        source = next(iter(matches)) if len(matches) == 1 else None
+        chinese, profile, checked_at = profiles.get(source, ("", "", 0))
+        result.append({
+            **item, "video_count": counts.get(item["id"], 0),
+            "actress_profile": {
+                "chinese_name": chinese, "profile": json.loads(profile) if profile else None,
+                "profile_pending": len(matches) < 2 and actress_profile_due(profile, checked_at, now),
+            },
+        })
+    return result
 
 
 def save_subscriptions(subscriptions):
@@ -2690,7 +3516,7 @@ def queue_scan(trigger="manual", subscription_id="", refresh_existing_info=False
         requests.append(request)
         write_json(REQUEST_FILE, requests)
         status = read_json(STATUS_FILE, {})
-        if status.get("state") not in ("running", "queued"):
+        if status.get("state") == "idle" or not status:
             status = {"state": "queued", "message": "等待后台检查。", "started_at": "", "completed_at": "", "results": []}
             write_json(STATUS_FILE, status)
         log_event("检查任务已加入队列。", event="queued", subscription=subscription.get("performer", "") if subscription else "")
@@ -2787,6 +3613,8 @@ def pop_scan_request():
 
 def get_status():
     status = read_json(STATUS_FILE, {"state": "idle", "message": "尚未检查。", "results": [], "last_scan_at": ""})
+    status["stop_requested"] = status.get("state") in ("running", "waiting_retry") and check_stop_requested(status.get("run_id", ""))
+    status["queued_count"] = sum(item.get("action") not in ("mteam_id_backfill", "repair_data") for item in read_scan_requests())
     if status.get("state") == "waiting_retry" and status.get("retry_at"):
         status["retry_in"] = max(0, int(float(status["retry_at"]) - time.time() + 0.999))
     try:
@@ -2841,6 +3669,11 @@ def get_activity():
         return [{"subscription": "下载器", "code": "", "title": "", "state": "failed", "progress": 0, "message": f"无法读取下载器任务：{error}", "updated_at": ""}]
 
     subscriptions = {item["id"]: item for item in list_subscriptions()}
+    subscriptions_by_path = {}
+    for subscription in subscriptions.values():
+        directory = subscription.get("download_dir", "")
+        if directory.startswith("/"):
+            subscriptions_by_path.setdefault(posixpath.normpath(directory), []).append(subscription)
     records = read_json(RECORDS_FILE, {})
     associations = {}
     for subscription_id, entries in records.items():
@@ -2873,16 +3706,25 @@ def get_activity():
         failed = bool(task.get("failed"))
         if complete and not failed:
             continue
-        associated = associations.get(info_hash, {})
+        associated = associations.get(info_hash.lower(), {})
         code = associated.get("code") or normalize_code(task.get("name", ""))
         if not code:
             continue
+        save_path = task.get("save_path") or ""
+        if not associated and save_path.startswith("/"):
+            # list_tasks() has already mapped the download path into the app's filesystem.
+            directory = posixpath.normpath(save_path)
+            owners = subscriptions_by_path.get(directory, [])
+            if posixpath.basename(directory) == code:
+                owners = owners + subscriptions_by_path.get(posixpath.dirname(directory), [])
+            if len(owners) == 1:
+                associated = {"subscription_id": owners[0]["id"], "subscription": owners[0]["performer"]}
         state = "failed" if failed else "upgrading" if associated.get("pending") else "downloading"
         task_state = str(task.get("state", "unknown"))
         message = task.get("error", "") if failed else f"qBittorrent：{downloader_state_label(task_state)}"
         output.append({
             "subscription_id": associated.get("subscription_id", ""),
-            "subscription": associated.get("subscription", "qBittorrent"),
+            "subscription": associated.get("subscription", "未关联订阅"),
             "code": code,
             "mteam_id": associated.get("mteam_id", ""),
             "title": task.get("name", ""),
@@ -2935,6 +3777,7 @@ def index_subscription_videos(subscription_id, videos, records):
                 sidecars = matching_video_sidecars(path, directory_entries[path.parent])
                 file_row = {
                     "path": str(path), "name": path.name, "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+                    "hardlink_count": stat.st_nlink,
                     "mteam_id": str(per_file.get("id", "")), "rank": file_rank,
                     "rank_source": rank_source, "rank_title": rank_title, "subtitle": subtitle,
                     "subtitle_raw": str(subtitle_value).strip() if per_file.get("id") else "",
@@ -2950,7 +3793,7 @@ def index_subscription_videos(subscription_id, videos, records):
                 continue
         if not file_rows:
             continue
-        local_best = max(file_rows, key=lambda item: tuple(item["rank"]))
+        local_best = max(file_rows, key=lambda item: local_wash_rank(item["rank"]))
         index_row = {
             "code": code, "count": len(file_rows), "files": file_rows,
             "rank": list(local_best["rank"]), "rank_source": local_best["rank_source"], "rank_title": local_best["rank_title"],
@@ -3030,6 +3873,77 @@ def local_cover_records(connection, directories, code):
             yield directory, cover
 
 
+def indexed_cover_references(connection, subscription_ids):
+    return {(Path(path).parent, code) for owner, code, path in connection.execute(
+        "SELECT subscription_id, code, path FROM local_video_files"
+    ) if owner in subscription_ids}
+
+
+def clean_orphan_cover_index():
+    subscriptions = read_json(SUBSCRIPTIONS_FILE, None, allow_types=(list,))
+    if subscriptions is None or not LOCAL_VIDEO_DATABASE.is_file():
+        return 0
+    if any(not isinstance(item, dict) or not isinstance(item.get("id"), str)
+           or not isinstance(item.get("download_dir"), str) for item in subscriptions):
+        raise AppError("订阅记录格式不正确，无法判断封面是否仍被引用。")
+    subscription_ids = {item["id"] for item in subscriptions}
+    roots = {Path(item["download_dir"]) for item in subscriptions}
+    if any(not root.is_absolute() for root in roots):
+        return 0
+    root_aliases = [(root, root.resolve()) for root in roots]
+    connection = connect_video_database()
+    try:
+        refs = indexed_cover_references(connection, subscription_ids)
+        candidates = []
+        directories = {}
+        for value, code in connection.execute("SELECT directory, code FROM local_video_covers"):
+            if STOP_SCHEDULER or DISABLED_FILE.exists():
+                return 0
+            directory = Path(value)
+            if (directory, code) in refs or not directory.is_absolute():
+                continue
+            if directory not in directories:
+                try:
+                    resolved = directory.resolve()
+                    owners = [root for root, alias in root_aliases
+                              if directory.is_relative_to(root) or resolved.is_relative_to(alias)]
+                    codes = set()
+                    if owners and all(root.is_dir() for root in owners):
+                        try:
+                            with os.scandir(directory) as entries:
+                                for entry in entries:
+                                    path = Path(entry.name)
+                                    if path.suffix.casefold() == ".!qb":
+                                        path = path.with_suffix("")
+                                    if path.suffix.casefold() in VIDEO_EXTENSIONS:
+                                        codes.add(normalize_code(path.stem))
+                        except FileNotFoundError:
+                            pass
+                    elif owners:
+                        codes = None
+                    directories[directory] = codes
+                except (OSError, RuntimeError, ValueError):
+                    directories[directory] = None
+            codes = directories[directory]
+            # A video without a number in its filename may get one from its NFO or parent directory.
+            if codes is not None and "" not in codes and code not in codes:
+                candidates.append((value, code))
+        if not candidates:
+            return 0
+        with file_lock(), connection:
+            if (STOP_SCHEDULER or DISABLED_FILE.exists()
+                    or read_json(SUBSCRIPTIONS_FILE, None, allow_types=(list,)) != subscriptions):
+                return 0
+            connection.execute("BEGIN IMMEDIATE")
+            refs = indexed_cover_references(connection, subscription_ids)
+            return connection.executemany(
+                "DELETE FROM local_video_covers WHERE directory=? AND code=?",
+                ((directory, code) for directory, code in candidates if (Path(directory), code) not in refs),
+            ).rowcount
+    finally:
+        connection.close()
+
+
 def local_screenshot_path(directory, code, position, filename):
     return registered_image_path(
         directory, filename, f"screenshot-{position}", f"{code}-screenshot-{position}", f"{code}-{position}",
@@ -3052,10 +3966,12 @@ def iter_local_screenshot_addresses(connection, directories, subscription_id, co
     prefix = f"/api/subscriptions/{urllib.parse.quote(subscription_id, safe='')}/videos/{urllib.parse.quote(code, safe='')}"
     screenshots = {}
     for directory in directories:
-        for position, _path, stamp in local_screenshot_files(connection, directory, code):
-            screenshots.setdefault(position, f"{prefix}/screenshots/{position}?v={stamp.st_mtime_ns}")
-    for position, url in sorted(screenshots.items()):
-        yield {"position": position, "url": url}
+        for position, path, stamp in local_screenshot_files(connection, directory, code):
+            screenshots.setdefault(position, {
+                "position": position, "url": f"{prefix}/screenshots/{position}?v={stamp.st_mtime_ns}", "path": str(path),
+            })
+    for position in sorted(screenshots):
+        yield screenshots[position]
 
 
 def attach_local_cover_addresses(subscription_id, rows):
@@ -3104,6 +4020,43 @@ def get_local_cover_image(subscription_id, code, *, poster=False):
     return None
 
 
+def get_subscription_cover_download(subscription_id, code, file_path):
+    subscription = next((item for item in list_subscriptions() if item.get("id") == subscription_id), None)
+    if subscription is None:
+        raise AppError("订阅不存在。")
+    normalized = normalize_code(code)
+    if normalized != code:
+        raise AppError("番号格式无效。")
+    if not isinstance(file_path, str) or "\x00" in file_path:
+        raise AppError("视频路径格式无效。")
+    target = Path(file_path)
+    if not target.is_absolute() or target.suffix.casefold() not in VIDEO_EXTENSIONS:
+        raise AppError("视频路径格式无效。")
+    root = Path(subscription["download_dir"]).resolve()
+    resolved = target.resolve()
+    if not resolved.is_relative_to(root):
+        raise AppError("视频路径不在当前订阅目录内。")
+    with closing(connect_video_database()) as connection:
+        indexed = connection.execute(
+            "SELECT size, mtime_ns FROM local_video_files WHERE subscription_id=? AND code=? AND path=?",
+            (subscription_id, code, str(target)),
+        ).fetchone()
+    if indexed is None or indexed_video_path(target, *indexed) is None:
+        raise AppError("视频文件已变化，请刷新列表后重试。")
+    files = (read_json(RECORDS_FILE, {}).get(subscription_id, {}).get(code, {}).get("local_files") or {})
+    metadata = files.get(str(target)) or files.get(str(resolved)) or {}
+    if not re.fullmatch(r"[0-9]+", str(metadata.get("id", ""))):
+        raise AppError("该视频没有已核对的 M-Team ID，无法下载封面。")
+    cover_url = metadata.get("cover_url")
+    if not metadata.get("cover_checked") or not isinstance(cover_url, str) or not cover_url:
+        raise AppError("该视频暂时没有已缓存的 M-Team 封面。")
+    try:
+        extension, data = cover_images.fetch(cover_url)
+    except (OSError, ValueError, http.client.HTTPException) as error:
+        raise AppError("目前无法读取封面原图。") from error
+    return cover_images.IMAGE_TYPES[extension], data, f"{code}-cover{extension}"
+
+
 def get_local_screenshots(subscription_id, code):
     connection = connect_video_database()
     try:
@@ -3118,8 +4071,20 @@ def get_local_gallery(subscription_id, code):
     try:
         directories = local_media_directories(connection, subscription_id, code).get(code, ())
         metadata = {}
-        for _directory, (_filename, dmm_code, _poster) in local_cover_records(connection, directories, code):
-            if not dmm_code:
+        cover_path = ""
+        poster_path = ""
+        for directory, (filename, dmm_code, poster) in local_cover_records(connection, directories, code):
+            if not cover_path:
+                path = local_fanart_path(directory, code, filename)
+                if cover_file_stat(path):
+                    cover_path = str(path)
+            if not poster_path:
+                path = local_poster_path(directory, code, poster)
+                if cover_file_stat(path):
+                    poster_path = str(path)
+            if metadata and cover_path and poster_path:
+                break
+            if not dmm_code or metadata:
                 continue
             row = connection.execute(
                 """SELECT base_info_json, series, text_data, base_info_zh_json, series_zh, text_data_zh, title, title_zh
@@ -3129,10 +4094,14 @@ def get_local_gallery(subscription_id, code):
                 base_info, series, text_data, base_info_zh, series_zh, text_data_zh, title, title_zh = row
                 metadata = {"base_info": json.loads(base_info_zh or base_info or "{}"),
                             "series": series_zh or series, "text_data": text_data_zh or text_data,
-                            "title": title_zh or title or ""}
-                break
-        return {"metadata": metadata,
-                "screenshots": list(iter_local_screenshot_addresses(connection, directories, subscription_id, code))}
+                            "title": numbered_title(code, title_zh or title or "")}
+        result = {"metadata": metadata,
+                  "screenshots": list(iter_local_screenshot_addresses(connection, directories, subscription_id, code))}
+        if cover_path:
+            result["cover_path"] = cover_path
+        if poster_path:
+            result["poster_path"] = poster_path
+        return result
     finally:
         connection.close()
 
@@ -3170,7 +4139,7 @@ def cover_sources(connection, subscription_id, all_records, allowed_sources=None
             continue
         sources.setdefault(code, []).append((tuple(json.loads(rank)), int(identifier), owner_id, path, metadata, size, mtime_ns))
     for items in sources.values():
-        items.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
+        items.sort(key=lambda item: (local_wash_rank(item[0]), item[1], item[2], item[3]), reverse=True)
     return sources
 
 
@@ -3189,27 +4158,80 @@ def local_image_metadata(items, performers):
         yield metadata, performer
 
 
-def read_image_detail(metadata, performer, token, details):
+def find_dmm_code_by_number(metadata, code, token, details):
+    if metadata.get("dmm_code") or metadata.get("dmm_lookup_checked"):
+        return str(metadata.get("dmm_code", "") or "")
+    cache_key = f"dmm-number:{code}"
+    cached = details.get(cache_key)
+    if cached is None:
+        found = {"dmm_code": "", "source_id": "", "image_metadata": {}}
+        for candidate in mteam_search(code, token)[:10]:
+            candidate_id = str(candidate.get("id", ""))
+            if (candidate.get("code") != code or not candidate_id.isdigit()
+                    or candidate_id == str(metadata.get("id", ""))):
+                continue
+            try:
+                if candidate_id not in details:
+                    details[candidate_id] = mteam_detail(candidate_id, token)
+                candidate_detail = details[candidate_id]
+                if isinstance(candidate_detail, AppError):
+                    continue
+                image_metadata = detail_image_metadata(candidate_detail)
+                dmm_code = image_metadata.get("dmm_code", "")
+                if dmm_code:
+                    found = {"dmm_code": dmm_code, "source_id": candidate_id, "image_metadata": image_metadata}
+                    break
+            except (MTeamRateLimitError, MTeamRequestInterrupted):
+                raise
+            except (AppError, OSError, ValueError):
+                continue
+        details[cache_key] = found
+        cached = found
+    metadata["dmm_lookup_checked"] = True
+    if cached["dmm_code"]:
+        metadata["dmm_code"] = cached["dmm_code"]
+        metadata["dmm_source_mteam_id"] = cached["source_id"]
+        if not metadata.get("cover_url"):
+            metadata["cover_url"] = cached["image_metadata"].get("cover_url", "")
+        if not metadata.get("screenshot_urls"):
+            metadata["screenshot_urls"] = cached["image_metadata"].get("screenshot_urls", [])
+        log_debug(
+            get_settings(),
+            f"{code} 当前 M-Team ID {metadata.get('id', '')} 的详情没有 DMM 编号，已从同番号 M-Team ID {cached['source_id']} 找到 DMM 链接。",
+            getattr(MTEAM_POLL_CACHE, "performer", ""),
+        )
+    else:
+        log_debug(
+            get_settings(), f"{code} 同番号其他 M-Team 详情中也没有找到 DMM 链接。",
+            getattr(MTEAM_POLL_CACHE, "performer", ""),
+        )
+    return str(metadata.get("dmm_code", "") or "")
+
+
+def read_image_detail(metadata, performer, token, details, code):
     identifier = str(metadata["id"])
-    if identifier not in details:
-        try:
-            details[identifier] = mteam_detail(identifier, token)
-        except (MTeamRateLimitError, MTeamRequestInterrupted):
-            raise
-        except AppError as error:
-            details[identifier] = error
-    detail = details[identifier]
-    if isinstance(detail, AppError):
-        raise detail
-    if detail_contains_performer(detail, performer):
+    if not metadata.get("dmm_detail_checked"):
+        if identifier not in details:
+            try:
+                details[identifier] = mteam_detail(identifier, token)
+            except (MTeamRateLimitError, MTeamRequestInterrupted):
+                raise
+            except AppError as error:
+                details[identifier] = error
+        detail = details[identifier]
+        if isinstance(detail, AppError):
+            raise detail
         metadata.update(detail_image_metadata(detail))
+    metadata["dmm_detail_checked"] = True
+    if not metadata.get("dmm_code"):
+        find_dmm_code_by_number(metadata, code, token, details)
 
 
-def select_cover_source(sources, token, details):
+def select_cover_source(sources, token, details, code):
     for metadata, performer in sources:
         url = metadata.get("cover_url")
         if not url and not metadata.get("cover_checked") and token:
-            read_image_detail(metadata, performer, token, details)
+            read_image_detail(metadata, performer, token, details, code)
             url = metadata.get("cover_url")
         if url:
             return str(metadata["id"]), url
@@ -3257,25 +4279,83 @@ def replace_local_image(connection, path, image, old_path, register):
     return ""
 
 
-def install_local_cover(connection, directory, code, stem, source, previous, downloaded):
-    extension, image = downloaded
+def read_existing_artwork(path, metadata):
+    if not cover_file_stat(path):
+        return None
+    try:
+        image = cover_images.read_file(path)
+    except (OSError, ValueError):
+        return None
+    try:
+        validator = json.loads(metadata) if metadata else None
+    except (ValueError, RecursionError):
+        validator = None
+    if not isinstance(validator, dict) or validator.get("sha256") != hashlib.sha256(image).hexdigest():
+        validator = None
+    return cover_images.ImageResponse((path.suffix, image), validator)
+
+
+def fetch_artwork(url, existing):
+    validator = existing.validator if existing else None
+    result = cover_images.fetch_image(url, validator) if validator and validator.get("url") == url else cover_images.fetch_image(url)
+    return result if result.image is not None else cover_images.ImageResponse(existing.image, result.validator)
+
+
+def artwork_validator_json(result):
+    if not result.validator:
+        return ""
+    return json.dumps({**result.validator, "sha256": hashlib.sha256(result.image[1]).hexdigest()}, separators=(",", ":"))
+
+
+def install_local_cover(connection, directory, code, stem, source, previous, downloaded, existing):
+    extension, image = downloaded.image
     path = directory / (stem + extension)
     old_path = local_fanart_path(directory, code, previous[2]) if previous else None
+    validator = artwork_validator_json(downloaded)
+    if old_path == path and existing and existing.image == downloaded.image and cover_file_stat(path):
+        if (*previous[:2], previous[3]) != (*source, validator):
+            with connection:
+                connection.execute(
+                    """UPDATE local_video_covers SET source_id=?, source_url=?, http_validator_json=?
+                       WHERE directory=? AND code=?""",
+                    (*source, validator, str(directory), code),
+                )
+        return path, "", False
 
     def register(filename):
         connection.execute(
-            """INSERT INTO local_video_covers(directory, code, source_id, source_url, filename)
-               VALUES (?, ?, ?, ?, ?) ON CONFLICT(directory, code) DO UPDATE SET
+            """INSERT INTO local_video_covers(directory, code, source_id, source_url, filename, http_validator_json)
+               VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(directory, code) DO UPDATE SET
                source_id=excluded.source_id, source_url=excluded.source_url, filename=excluded.filename,
-               poster_cover_mtime_ns=0""",
-            (str(directory), code, *source, filename),
+               poster_cover_mtime_ns=0, http_validator_json=excluded.http_validator_json""",
+            (str(directory), code, *source, filename, validator),
         )
 
     cleanup_error = replace_local_image(connection, path, image, old_path, register)
-    return path, cleanup_error
+    return path, cleanup_error, True
 
 
-def sync_local_poster(connection, directory, code, stem, cover):
+@contextmanager
+def artwork_step(timings, label):
+    if timings is None:
+        yield
+        return
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        count, elapsed = timings.get(label, (0, 0.0))
+        timings[label] = count + 1, elapsed + (time.perf_counter() - started)
+
+
+def format_artwork_timings(timings):
+    return "，".join(
+        f"{label} {elapsed:.2f} 秒" + (f"（{count} 次）" if count > 1 else "")
+        for label, (count, elapsed) in timings.items()
+    )
+
+
+def sync_local_poster(connection, directory, code, stem, cover, *, timings=None):
     stamp = cover_file_stat(cover)
     if stamp is None:
         return None
@@ -3288,7 +4368,8 @@ def sync_local_poster(connection, directory, code, stem, cover):
     if (old_path == path and stamp.st_mtime_ns == cover_mtime
             and crop_version == cover_images.POSTER_CROP_VERSION and cover_file_stat(path)):
         return path
-    poster = cover_images.crop_poster(cover_images.read_file(cover), cover.suffix)
+    with artwork_step(timings, "海报裁切"):
+        poster = cover_images.crop_poster(cover_images.read_file(cover), cover.suffix)
 
     def register(filename):
         connection.execute(
@@ -3298,11 +4379,12 @@ def sync_local_poster(connection, directory, code, stem, cover):
         )
 
     # A conventional poster already present for this title can be refreshed.
-    replace_local_image(connection, path, poster, old_path or (path if cover_file_stat(path) else None), register)
+    with artwork_step(timings, "海报写入"):
+        replace_local_image(connection, path, poster, old_path or (path if cover_file_stat(path) else None), register)
     return path
 
 
-def translate_dmm_catalog(connection, dmm_code, translate):
+def translate_dmm_catalog(connection, dmm_code, translate, *, refresh_actress_names=False):
     originals_and_translations = connection.execute(
         """SELECT base_info_json, series, text_data, base_info_zh_json, series_zh, text_data_zh, hashtag_translation_version,
                   title, title_zh
@@ -3315,10 +4397,14 @@ def translate_dmm_catalog(connection, dmm_code, translate):
         "text_data": (text_data, text_data_zh),
         "title": (title, title_zh),
     }
+    names = azure_translator.actress_name_pattern(get_actress_translations(connection)) if refresh_actress_names else None
     pending = {
         field: original for field, (original, translated) in fields.items()
-        if original and (translated is None or (hashtag_version < azure_translator.HASHTAG_TRANSLATION_VERSION
-                                                and azure_translator.contains_hashtags(original)))
+        if original and (
+            translated is None
+            or (names is not None and azure_translator.contains_actress_name(original, names))
+            or (hashtag_version < azure_translator.HASHTAG_TRANSLATION_VERSION and azure_translator.contains_hashtags(original))
+        )
     }
     if not pending:
         return
@@ -3336,41 +4422,102 @@ def translate_dmm_catalog(connection, dmm_code, translate):
         )
 
 
-def dmm_screenshot_urls(connection, dmm_code, token, refresh=False, translate=None):
+def cached_dmm_response(connection, dmm_code):
+    row = connection.execute(
+        "SELECT response_json, base_info_json, checked_at FROM dmm_screenshot_catalog WHERE dmm_code=?", (dmm_code,),
+    ).fetchone()
+    if not row:
+        return None
+    response = json.loads(row[0]) if row[0] is not None else None
+    with connection:
+        insert_cached_dmm_actresses(connection, response, row[1], row[2])
+    return response
+
+
+def download_cover_from_sources(sources, existing):
+    failures = []
+    for source in sources:
+        try:
+            image = fetch_artwork(source[1], existing)
+        except (OSError, ValueError, http.client.HTTPException) as error:
+            host = urllib.parse.urlsplit(source[1]).hostname
+            failures.append(f"{host}：{error}")
+        else:
+            return source, image
+    raise ValueError("；".join(failures))
+
+
+def dmm_screenshot_urls(connection, dmm_code, token, refresh=False, translate=None, on_actresses=None,
+                        *, settings=None, code="", subscription=None, response_cache=None):
+    started = time.perf_counter()
     cached = connection.execute(
-        "SELECT urls_json, checked_at, base_info_json IS NOT NULL AND title IS NOT NULL FROM dmm_screenshot_catalog WHERE dmm_code = ?", (dmm_code,),
+        "SELECT urls_json, checked_at, base_info_json, title, response_json FROM dmm_screenshot_catalog WHERE dmm_code = ?", (dmm_code,),
     ).fetchone()
     urls = json.loads(cached[0]) if cached else []
-    if refresh or not cached or not cached[2] or (not urls and time.time() - cached[1] >= DMM_EMPTY_GALLERY_TTL_SECONDS):
-        data = result_data(mteam_json("/dmm/dmmInfo", token, {"dmmCode": dmm_code}, multipart=True))
-        if not isinstance(data, dict) or not isinstance(data.get("picData"), (str, type(None))):
+    age = time.time() - cached[1] if cached else float("inf")
+    stale = (not cached or cached[2] is None or cached[3] is None or cached[4] is None
+             or age >= DMM_INFO_CACHE_TTL_SECONDS
+             or (not urls and age >= DMM_EMPTY_GALLERY_TTL_SECONDS))
+    if refresh or stale:
+        response = mteam_json("/dmm/dmmInfo", token, {"dmmCode": dmm_code}, multipart=True)
+        data = result_data(response)
+        if not isinstance(data, dict):
             raise AppError("DMM 截图清单格式无效。")
-        urls = valid_detail_image_urls((data.get("picData") or "").split(","))
+        actress_count = upsert_dmm_actresses(connection, data.get("actressList"))
         base_info = data.get("baseInfo")
         base_info = json.dumps(base_info if isinstance(base_info, dict) else {}, ensure_ascii=False, sort_keys=True)
+        if not actress_count:
+            actress_count = upsert_dmm_actresses(connection, dmm_cast_names(base_info))
+        if on_actresses is not None:
+            on_actresses(actress_count)
+        if not isinstance(data.get("picData"), (str, type(None))):
+            raise AppError("DMM 截图清单格式无效。")
+        urls = valid_detail_image_urls((data.get("picData") or "").split(","))
         series, text_data, title = (value if isinstance(value, str) else "" for value in (data.get("series"), data.get("textData"), data.get("title")))
         with connection:
             connection.execute(
-                """INSERT INTO dmm_screenshot_catalog(dmm_code, urls_json, checked_at, base_info_json, series, text_data, title)
-                   VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(dmm_code) DO UPDATE SET
-                   urls_json=excluded.urls_json, checked_at=excluded.checked_at,
+                """INSERT INTO dmm_screenshot_catalog(dmm_code, urls_json, checked_at, base_info_json, series, text_data, title, response_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(dmm_code) DO UPDATE SET
+                   urls_json=excluded.urls_json, checked_at=excluded.checked_at, response_json=excluded.response_json,
                    base_info_zh_json=CASE WHEN base_info_json=excluded.base_info_json THEN base_info_zh_json END,
                    series_zh=CASE WHEN series=excluded.series THEN series_zh END,
                    text_data_zh=CASE WHEN text_data=excluded.text_data THEN text_data_zh END,
                    title_zh=CASE WHEN title=excluded.title THEN title_zh END,
                    base_info_json=excluded.base_info_json, series=excluded.series, text_data=excluded.text_data, title=excluded.title""",
-                (dmm_code, json.dumps(urls), time.time(), base_info, series, text_data, title),
+                (dmm_code, json.dumps(urls), time.time(), base_info, series, text_data, title,
+                 json.dumps(response, ensure_ascii=False, separators=(",", ":"))),
             )
+    else:
+        response = json.loads(cached[4])
+        log_http_json("M-Team", "/dmm/dmmInfo", None, cached_data=response, cache_source="SQLite",
+                      elapsed=time.perf_counter() - started, secrets=(token,), settings=settings,
+                      request_payload={"dmmCode": dmm_code}, code=code, subscription=subscription)
+        with connection:
+            insert_cached_dmm_actresses(connection, response, cached[2], cached[1])
     if translate:
-        translate_dmm_catalog(connection, dmm_code, translate)
+        translate_dmm_catalog(connection, dmm_code, translate, refresh_actress_names=refresh)
+    if response_cache is not None:
+        response_cache[dmm_code] = response
     return urls
 
 
-def select_screenshot_urls(sources, token, details, catalog_urls):
+def dmm_cast_names(raw_base_info):
+    try:
+        base_info = json.loads(raw_base_info)
+    except (ValueError, TypeError):
+        return []
+    names = base_info.get("出演者") if isinstance(base_info, dict) else None
+    return re.split(r"[,，、]", names) if isinstance(names, str) else []
+
+
+def select_screenshot_urls(sources, token, details, catalog_urls, code):
     gallery_code = ""
     for metadata, performer in sources:
-        if token and ("dmm_code" not in metadata or "screenshot_urls" not in metadata):
-            read_image_detail(metadata, performer, token, details)
+        if token and (
+            (not metadata.get("dmm_code") and not metadata.get("dmm_lookup_checked"))
+            or (not metadata.get("dmm_detail_checked") and not isinstance(metadata.get("screenshot_urls"), list))
+        ):
+            read_image_detail(metadata, performer, token, details, code)
         explicit = metadata.get("screenshot_urls")
         dmm_code = metadata.get("dmm_code")
         if dmm_code and token:
@@ -3392,59 +4539,74 @@ def select_screenshot_urls(sources, token, details, catalog_urls):
 
 def dmm_large_screenshot_url(url):
     parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme not in ("https", "http") or parsed.hostname not in ("pics.dmm.co.jp", "pics.dmm.com"):
+    if parsed.scheme not in ("https", "http"):
         return ""
-    match = re.fullmatch(r"(/digital/video/([a-z0-9_]+)/\2)(-[0-9]+\.jpe?g)", parsed.path, re.IGNORECASE)
+    if parsed.hostname == DMM_SCREENSHOT_CDN:
+        path_prefix = "/pics_dig"
+    elif parsed.hostname in ("pics.dmm.co.jp", "pics.dmm.com"):
+        path_prefix = ""
+    else:
+        return ""
+    match = re.fullmatch(re.escape(path_prefix) + r"(/digital/video/([a-z0-9_]+)/\2)(-[0-9]+\.jpe?g)", parsed.path, re.IGNORECASE)
     if not match:
         return ""
-    return parsed._replace(path=match[1] + "jp" + match[3]).geturl()
+    return parsed._replace(path=path_prefix + match[1] + "jp" + match[3]).geturl()
 
 
-def fetch_screenshot_image(url, large_url, reusable, refresh=False):
+def fetch_screenshot_image(url, large_url, reusable, refresh=False, *, existing=None, timings=None):
     if not large_url:
-        return cover_images.fetch(url), True
+        with artwork_step(timings, "截图请求"):
+            return fetch_artwork(url, existing), True
     try:
-        return cover_images.fetch(large_url), True
+        with artwork_step(timings, "截图大图请求"):
+            return fetch_artwork(large_url, existing), True
     except (OSError, ValueError, http.client.HTTPException) as error:
         unavailable = isinstance(error, cover_images.ImageHTTPError) and error.status in (404, 410)
         if reusable and not unavailable:
             raise
         if reusable and not refresh:
             return None, True
-        return cover_images.fetch(url), unavailable
+        with artwork_step(timings, "回退请求小图"):
+            return fetch_artwork(url, existing), unavailable
 
 
-def sync_video_screenshots(connection, directory, code, urls, settings, performer, refresh=False, *, prefix=""):
+def sync_video_screenshots(connection, directory, code, urls, settings, performer, refresh=False, *, prefix="", timings=None):
     known = {
-        position: (url, filename, large_checked) for position, url, filename, large_checked in connection.execute(
-            "SELECT position, source_url, filename, large_checked FROM local_video_screenshots WHERE directory = ? AND code = ?",
+        position: (url, filename, large_checked, validator) for position, url, filename, large_checked, validator in connection.execute(
+            """SELECT position, source_url, filename, large_checked, http_validator_json
+               FROM local_video_screenshots WHERE directory = ? AND code = ?""",
             (str(directory), code),
         )
     }
     saved = reused = failed = 0
     requested = dict(enumerate(urls, 1))
     for position in sorted(known.keys() | requested.keys()):
+        check_requested_stop()
         url = requested.get(position)
-        old_url, old_filename, large_checked = known.get(position, ("", "", False))
+        old_url, old_filename, large_checked, old_validator = known.get(position, ("", "", 0, ""))
         stem = f"{prefix}screenshot-{position}"
         old_path = local_screenshot_path(directory, code, position, old_filename)
 
-        def register(filename, source_url, checked):
+        def register(filename, source_url, checked, validator):
             connection.execute(
-                """INSERT INTO local_video_screenshots(directory, code, position, source_url, filename, large_checked)
-                   VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(directory, code, position) DO UPDATE SET
-                   source_url=excluded.source_url, filename=excluded.filename, large_checked=excluded.large_checked""",
-                (str(directory), code, position, source_url, filename, int(checked)),
+                """INSERT INTO local_video_screenshots(directory, code, position, source_url, filename, large_checked, http_validator_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(directory, code, position) DO UPDATE SET
+                   source_url=excluded.source_url, filename=excluded.filename,
+                   large_checked=excluded.large_checked, http_validator_json=excluded.http_validator_json
+                   WHERE source_url<>excluded.source_url OR filename<>excluded.filename
+                   OR large_checked<>excluded.large_checked OR http_validator_json<>excluded.http_validator_json""",
+                (str(directory), code, position, source_url, filename, checked, validator),
             )
 
         try:
             cached = cover_file_stat(old_path) is not None
             if cached and old_path.stem != stem:
                 path = directory / (stem + old_path.suffix)
-                cleanup_error = replace_local_image(
-                    connection, path, cover_images.read_file(old_path), old_path,
-                    lambda filename: register(filename, old_url, large_checked),
-                )
+                with artwork_step(timings, "截图迁移"):
+                    cleanup_error = replace_local_image(
+                        connection, path, cover_images.read_file(old_path), old_path,
+                        lambda filename: register(filename, old_url, large_checked, old_validator),
+                    )
                 old_path = path
                 if cleanup_error:
                     log_event(f"{code} 已迁移截图 {position}，旧文件清理失败。", level="warning",
@@ -3454,19 +4616,34 @@ def sync_video_screenshots(connection, directory, code, urls, settings, performe
                 continue
             reusable = old_url == url and cached
             large_url = dmm_large_screenshot_url(url)
-            if not refresh and reusable and (large_checked or not large_url):
+            # Older releases marked these CDN thumbnails as checked without probing the large URL.
+            check_version = 2 if large_url and urllib.parse.urlsplit(large_url).hostname == DMM_SCREENSHOT_CDN else 1
+            if not refresh and reusable and (not large_url or large_checked >= check_version):
                 reused += 1
                 continue
-            downloaded, checked = fetch_screenshot_image(url, large_url, reusable, refresh)
+            existing = read_existing_artwork(old_path, old_validator)
+            downloaded, checked = fetch_screenshot_image(url, large_url, reusable and existing is not None, refresh,
+                                                          existing=existing, timings=timings)
             if downloaded is None:
                 with connection:
-                    register(old_path.name, url, True)
+                    register(old_path.name, url, check_version, old_validator)
                 reused += 1
                 continue
-            extension, image = downloaded
+            extension, image = downloaded.image
             path = directory / (stem + extension)
+            validator = artwork_validator_json(downloaded)
+            checked_version = check_version if checked else 0
+            if old_path == path and existing and existing.image == downloaded.image and cover_file_stat(path):
+                if (old_url, large_checked, old_validator) != (url, checked_version, validator):
+                    with connection:
+                        register(path.name, url, checked_version, validator)
+                reused += 1
+                continue
 
-            cleanup_error = replace_local_image(connection, path, image, old_path, lambda filename: register(filename, url, checked))
+            with artwork_step(timings, "截图写入"):
+                cleanup_error = replace_local_image(
+                    connection, path, image, old_path, lambda filename: register(filename, url, checked_version, validator),
+                )
             saved += 1
             if cleanup_error:
                 log_event(f"{code} 已保存截图 {position}，旧截图清理失败。", level="warning", event="local_screenshot_cleanup_failed", subscription=performer)
@@ -3493,7 +4670,16 @@ def nfo_text(element, name, value):
         ET.SubElement(element, name).text = value
 
 
-def movie_nfo(metadata, catalog_row):
+def numbered_title(code, title):
+    title = str(title or "").strip()
+    if not title or not code:
+        return title
+    if title.casefold().startswith(f"{code} ".casefold()) or title.casefold() == code.casefold():
+        return title
+    return f"{code} {title}"
+
+
+def movie_nfo(metadata, catalog_row, code=""):
     original_title, title, original_plot, plot, original_series, series, base_json, translated_json = catalog_row or (None,) * 8
     original_title = original_title or metadata.get("title")
     if not (title or original_title or plot or original_plot):
@@ -3501,7 +4687,7 @@ def movie_nfo(metadata, catalog_row):
     base = json.loads(base_json or "{}")
     translated_base = json.loads(translated_json or "{}")
     root = ET.Element("movie")
-    nfo_text(root, "title", title or original_title)
+    nfo_text(root, "title", numbered_title(code, title or original_title))
     nfo_text(root, "originaltitle", original_title)
     nfo_text(root, "plot", plot or original_plot)
     if series or original_series:
@@ -3615,12 +4801,14 @@ def write_dmm_nfo(path, original, root, title, plot, artwork, *, rebuild):
     return True
 
 
+@measure_stage("nfo")
 def sync_dmm_nfos(connection, row, records, subscription, settings, details, catalog_urls, allowed_sources, artwork):
     files = (records.get(row["code"], {}).get("local_files") or {})
     performer = subscription["performer"]
     token = settings.get("mteam_token", "")
     updated = failed = 0
     for file in row["files"]:
+        check_requested_stop()
         path = file["path"]
         if allowed_sources is not None and (subscription["id"], path) not in allowed_sources:
             continue
@@ -3636,9 +4824,9 @@ def sync_dmm_nfos(connection, row, records, subscription, settings, details, cat
             root = read_nfo(nfo, original)
             rebuild = not nfo_has_mteam_id(root)
             replacing = rebuild and original is not None
-            if settings.get("azure_key") and token and "dmm_code" not in metadata:
+            if settings.get("azure_key") and token and not metadata.get("dmm_code") and not metadata.get("dmm_lookup_checked"):
                 try:
-                    read_image_detail(metadata, performer, token, details)
+                    read_image_detail(metadata, performer, token, details, row["code"])
                 except (MTeamRateLimitError, MTeamRequestInterrupted):
                     raise
                 except AppError as error:
@@ -3660,10 +4848,11 @@ def sync_dmm_nfos(connection, row, records, subscription, settings, details, cat
                    FROM dmm_screenshot_catalog WHERE dmm_code=?""", (dmm_code,),
             ).fetchone() if dmm_code else None
             title, plot = (catalog_row[1], catalog_row[3]) if catalog_row else (None, None)
+            title = numbered_title(row["code"], title)
             if rebuild:
                 if replacing and catalog_error is not None and catalog_row is None:
                     raise catalog_error
-                root = movie_nfo(metadata, catalog_row)
+                root = movie_nfo(metadata, catalog_row, row["code"])
                 if root is None:
                     continue
             updated += write_dmm_nfo(nfo, original, root, title, plot, artwork.get(video.parent), rebuild=rebuild)
@@ -3675,7 +4864,9 @@ def sync_dmm_nfos(connection, row, records, subscription, settings, details, cat
     return updated, failed
 
 
-def sync_subscription_covers(subscription, rows, all_records, settings, *, refresh=False, allowed_sources=None, on_number=None):
+@measure_stage("artwork")
+def sync_subscription_covers(subscription, rows, all_records, settings, *, refresh=False, allowed_sources=None,
+                             on_number_started=None, on_number=None):
     if not rows:
         return
     performer = subscription["performer"]
@@ -3690,12 +4881,21 @@ def sync_subscription_covers(subscription, rows, all_records, settings, *, refre
             return None
         try:
             if settings.get("debug_mode"):
+                actress_translations = get_actress_translations(connection)
                 return azure_translator.translate_metadata(
                     fields, settings["azure_key"], settings.get("azure_region", ""),
-                    on_response=lambda status, raw: log_http_json("Azure", "/translate", status, raw, code=code,
-                                                                 settings=settings, subscription=performer),
+                    on_response=lambda status, raw, elapsed, payload: log_http_json(
+                        "Azure", urllib.parse.urlsplit(azure_translator.TRANSLATE_URL)._replace(scheme="", netloc="").geturl(),
+                        status, raw, elapsed=elapsed, request_payload=payload, code=code,
+                        settings=settings, subscription=performer,
+                    ),
+                    **({"actress_translations": actress_translations} if actress_translations else {}),
                 )
-            return azure_translator.translate_metadata(fields, settings["azure_key"], settings.get("azure_region", ""))
+            actress_translations = get_actress_translations(connection)
+            return azure_translator.translate_metadata(
+                fields, settings["azure_key"], settings.get("azure_region", ""),
+                **({"actress_translations": actress_translations} if actress_translations else {}),
+            )
         except azure_translator.TranslationError as error:
             if not translation_reported:
                 log_event(str(error), level="warning", event="dmm_translation_failed", subscription=performer)
@@ -3712,17 +4912,37 @@ def sync_subscription_covers(subscription, rows, all_records, settings, *, refre
             details = {}
             token = settings.get("mteam_token", "")
             catalog = {}
+            catalog_responses = {}
+            catalog_logged = set()
+
+            def log_catalog_reuse(dmm_code, source, elapsed=None):
+                key = (dmm_code, code)
+                if key in catalog_logged or catalog_responses.get(dmm_code) is None:
+                    return
+                catalog_logged.add(key)
+                log_http_json("M-Team", "/dmm/dmmInfo", None, cache_source=source,
+                              cached_data=catalog_responses[dmm_code], elapsed=elapsed, secrets=(token,),
+                              request_payload={"dmmCode": dmm_code}, settings=settings, code=code, subscription=performer)
 
             def catalog_urls(dmm_code):
                 if dmm_code not in catalog:
                     try:
+                        def report_actresses(count):
+                            message = f"{code} 已收录或核对 {count} 位女优。" if count else f"{code} 的 DMM 资料未返回有效女优名。"
+                            log_event(message, event="dmm_actress_sync", subscription=performer)
+
                         catalog[dmm_code] = dmm_screenshot_urls(
                             connection, dmm_code, token, refresh=refresh, translate=translate_fields,
+                            on_actresses=report_actresses if refresh else None,
+                            settings=settings, code=code, subscription=performer, response_cache=catalog_responses,
                         )
+                        catalog_logged.add((dmm_code, code))
                     except (MTeamRateLimitError, MTeamRequestInterrupted):
                         raise
                     except AppError as error:
                         catalog[dmm_code] = error
+                else:
+                    log_catalog_reuse(dmm_code, "本轮内存")
                 result = catalog[dmm_code]
                 if isinstance(result, AppError):
                     raise result
@@ -3734,10 +4954,13 @@ def sync_subscription_covers(subscription, rows, all_records, settings, *, refre
             ))
             directory_numbers = {}
             for row in rows:
+                check_requested_stop()
                 before = (downloaded, screenshot_saved, failed + screenshot_failed + nfo_failed)
                 code = row["code"]
                 if not re.fullmatch(r"[A-Z0-9]+(?:-[A-Z0-9]+)+", code):
                     continue
+                if on_number_started:
+                    on_number_started(code)
                 media_dirs = set()
                 for file in row["files"]:
                     path = file["path"]
@@ -3747,32 +4970,86 @@ def sync_subscription_covers(subscription, rows, all_records, settings, *, refre
                     if video is not None:
                         media_dirs.add(video.parent)
                 if not media_dirs:
+                    if on_number:
+                        screenshot_failed += 1
+                        on_number(code, 0, 0, 1)
                     continue
+                timings = screenshot_timings = None
+                if settings.get("debug_mode"):
+                    timings, screenshot_timings = {}, {}
+                    log_event(f"{code} 开始处理本地资料（{len(media_dirs)} 个目录）。",
+                              level="debug", event="debug_artwork", subscription=performer)
+                    artwork_started = time.perf_counter()
+                    covers_reused_before, screenshots_reused_before = reused, screenshot_reused
+                    screenshots_failed_before = screenshot_failed
                 image_sources = list(local_image_metadata(sources.get(code, []), performers))
                 source, urls, dmm_code = None, [], ""
                 try:
-                    source = select_cover_source(image_sources, token, details)
+                    with artwork_step(timings, "封面资料"):
+                        source = select_cover_source(image_sources, token, details, code)
                 except (MTeamRateLimitError, MTeamRequestInterrupted):
                     raise
                 except (AppError, OSError, ValueError) as error:
                     failed += 1
                     log_debug(settings, f"{code} 封面资料读取失败：{error}", performer)
                 try:
-                    urls, dmm_code = select_screenshot_urls(image_sources, token, details, catalog_urls)
+                    with artwork_step(timings, "截图资料与翻译"):
+                        urls, dmm_code = select_screenshot_urls(image_sources, token, details, catalog_urls, code)
                 except (MTeamRateLimitError, MTeamRequestInterrupted):
                     raise
                 except (AppError, OSError, ValueError, sqlite3.Error) as error:
                     screenshot_failed += 1
-                    log_debug(settings, f"{code} 截图资料读取失败：{error}", performer)
+                    if refresh:
+                        log_event(f"{code} 截图及女优资料读取失败：{error}", level="warning",
+                                  event="dmm_actress_sync", subscription=performer)
+                    else:
+                        log_debug(settings, f"{code} 截图资料读取失败：{error}", performer)
+                if refresh and image_sources and not any(metadata.get("dmm_code") for metadata, _ in image_sources):
+                    log_event(f"{code} 的 M-Team 详情缺少 DMM 编号，无法读取女优资料。",
+                              event="dmm_actress_sync", subscription=performer)
+                if refresh and token:
+                    for metadata, _ in image_sources:
+                        identifier = metadata.get("dmm_code")
+                        if not identifier or identifier in catalog:
+                            continue
+                        try:
+                            catalog_urls(identifier)
+                        except (MTeamRateLimitError, MTeamRequestInterrupted):
+                            raise
+                        except AppError as error:
+                            screenshot_failed += 1
+                            log_event(f"{code} 女优资料读取失败：{error}", level="warning",
+                                      event="dmm_actress_sync", subscription=performer)
 
+                cover_sources_for_number = [source] if source else []
+                dmm_source = next((
+                    metadata for metadata, _ in image_sources
+                    if metadata.get("dmm_code") and (not dmm_code or metadata["dmm_code"] == dmm_code)
+                ), None)
+                if dmm_source:
+                    identifier = dmm_source["dmm_code"]
+                    if identifier not in catalog_responses:
+                        started = time.perf_counter()
+                        catalog_responses[identifier] = cached_dmm_response(connection, identifier)
+                        log_catalog_reuse(identifier, "SQLite", time.perf_counter() - started)
+                    else:
+                        log_catalog_reuse(identifier, "本轮内存")
+                    response = catalog_responses[identifier]
+                    dmm_info = result_data(response) if response is not None else None
+                    if isinstance(dmm_info, dict):
+                        for url in valid_detail_image_urls([dmm_info.get("pic1")]):
+                            if not source or url != source[1]:
+                                cover_sources_for_number.append((str(dmm_source["id"]), url))
                 artwork = {}
-                downloaded_cover = None
+                downloaded_cover = completed_cover_source = cover_download_error = None
                 for directory in sorted(media_dirs):
+                    check_requested_stop()
                     images = {}
                     artwork[directory] = images
                     prefix = f"{code}-"
                     previous = connection.execute(
-                        "SELECT source_id, source_url, filename FROM local_video_covers WHERE directory=? AND code=?",
+                        """SELECT source_id, source_url, filename, http_validator_json
+                           FROM local_video_covers WHERE directory=? AND code=?""",
                         (str(directory), code),
                     ).fetchone()
                     cover = local_fanart_path(directory, code, previous[2]) if previous else None
@@ -3787,27 +5064,40 @@ def sync_subscription_covers(subscription, rows, all_records, settings, *, refre
                             }
                         prefix = "" if directory_numbers[directory] == {code} else f"{code}-"
                         cover_stem = prefix + "fansrt"
-                        if source and (not cover or refresh or previous[:2] != source):
+                        if cover_sources_for_number and (not cover or refresh or previous[:2] not in cover_sources_for_number):
+                            existing = read_existing_artwork(cover, previous[3]) if cover else None
+                            if cover_download_error is not None:
+                                raise cover_download_error
                             if downloaded_cover is None:
-                                downloaded_cover = cover_images.fetch(source[1])
-                            cover, cleanup_error = install_local_cover(
-                                connection, directory, code, cover_stem, source, previous, downloaded_cover,
-                            )
-                            downloaded += 1
+                                with artwork_step(timings, "封面请求"):
+                                    try:
+                                        completed_cover_source, downloaded_cover = download_cover_from_sources(cover_sources_for_number, existing)
+                                    except ValueError as error:
+                                        cover_download_error = error
+                                        raise
+                            with artwork_step(timings, "封面核对与保存"):
+                                cover, cleanup_error, saved = install_local_cover(
+                                    connection, directory, code, cover_stem, completed_cover_source, previous, downloaded_cover, existing,
+                                )
+                            downloaded += int(saved)
+                            reused += int(not saved)
                             if cleanup_error:
                                 log_debug(settings, f"{code} 旧封面清理失败：{cleanup_error}", performer)
                         elif cover:
                             if cover.stem != cover_stem:
-                                cover, _cleanup_error = install_local_cover(
-                                    connection, directory, code, cover_stem, previous[:2], previous,
-                                    (cover.suffix, cover_images.read_file(cover)),
-                                )
+                                with artwork_step(timings, "封面迁移"):
+                                    existing = read_existing_artwork(cover, previous[3])
+                                    if existing is None:
+                                        raise ValueError("原封面无法读取。")
+                                    cover, _cleanup_error, _saved = install_local_cover(
+                                        connection, directory, code, cover_stem, previous[:2], previous, existing, None,
+                                    )
                             reused += 1
                         else:
                             unavailable += 1
                         if cover:
                             images["fansrt"] = cover.name
-                            poster = sync_local_poster(connection, directory, code, prefix + "poster", cover)
+                            poster = sync_local_poster(connection, directory, code, prefix + "poster", cover, timings=timings)
                             if poster:
                                 images["poster"] = poster.name
                     except (OSError, ValueError, sqlite3.Error, http.client.HTTPException) as error:
@@ -3825,9 +5115,11 @@ def sync_subscription_covers(subscription, rows, all_records, settings, *, refre
                                        WHERE dmm_code <> excluded.dmm_code""",
                                     (str(directory), code, dmm_code),
                                 )
-                        saved, cached, errors = sync_video_screenshots(
-                            connection, directory, code, urls, settings, performer, refresh, prefix=prefix,
-                        )
+                        with artwork_step(timings, "截图核对与保存"):
+                            saved, cached, errors = sync_video_screenshots(
+                                connection, directory, code, urls, settings, performer, refresh,
+                                prefix=prefix, timings=screenshot_timings,
+                            )
                         screenshot_saved += saved
                         screenshot_reused += cached
                         screenshot_failed += errors
@@ -3835,11 +5127,26 @@ def sync_subscription_covers(subscription, rows, all_records, settings, *, refre
                     except (OSError, ValueError, sqlite3.Error) as error:
                         screenshot_failed += 1
                         log_debug(settings, f"{code} 截图处理失败：{error}", performer)
-                saved_nfos, errors = sync_dmm_nfos(
-                    connection, row, all_records.get(subscription["id"], {}), subscription, settings, details, catalog_urls, allowed_sources, artwork,
-                )
+                with artwork_step(timings, "NFO 核对与写入"):
+                    saved_nfos, errors = sync_dmm_nfos(
+                        connection, row, all_records.get(subscription["id"], {}), subscription, settings, details, catalog_urls, allowed_sources, artwork,
+                    )
                 nfo_updated += saved_nfos
                 nfo_failed += errors
+                if timings is not None:
+                    elapsed = time.perf_counter() - artwork_started
+                    steps = f"分步耗时：{format_artwork_timings(timings)}。"
+                    if screenshot_timings:
+                        steps += f"其中截图：{format_artwork_timings(screenshot_timings)}。"
+                    log_event(
+                        f"{code} 本地资料处理耗时 {elapsed:.2f} 秒。"
+                        f"封面保存 {downloaded - before[0]} 张、复用 {reused - covers_reused_before} 张。"
+                        f"截图保存 {screenshot_saved - before[1]} 张、复用 {screenshot_reused - screenshots_reused_before} 张、"
+                        f"失败 {screenshot_failed - screenshots_failed_before} 张。"
+                        f"NFO 更新 {saved_nfos} 个、失败 {errors} 个。"
+                        + steps,
+                        level="debug", event="debug_artwork", subscription=performer,
+                    )
                 if on_number:
                     on_number(code, downloaded - before[0], screenshot_saved - before[1], failed + screenshot_failed + nfo_failed - before[2])
         finally:
@@ -3918,6 +5225,7 @@ def match_qbittorrent_file_ids(targets, downloader, task_cache=None, progress_ca
     if progress_callback:
         progress_callback("matching", 0, len(tasks), f"正在核对 {len(tasks)} 个下载任务。")
     for index, (info_hash, task) in enumerate(tasks.items(), 1):
+        check_requested_stop()
         if progress_callback and (index % 25 == 0 or index == len(tasks)):
             progress_callback("matching", index, len(tasks), f"已核对 {index}/{len(tasks)} 个下载任务。")
         possible_codes = {normalize_code(task.get("name", "")), normalize_code(task.get("content_path", ""))} & wanted_codes
@@ -3967,24 +5275,41 @@ def match_qbittorrent_file_ids(targets, downloader, task_cache=None, progress_ca
     return matches, matched_hashes, ambiguous, checked, errors
 
 
-def bind_missing_local_mteam_ids(subscription, videos, records, downloader, task_cache=None, settings=None):
+def bind_missing_local_mteam_ids(subscription, videos, records, downloader, task_cache=None, settings=None,
+                                 *, priority_codes=(), deferred_details=None):
     targets = {}
+    details = []
     for code, items in videos.items():
         local_files = records.get(code, {}).get("local_files") or {}
-        existing_paths = {str(Path(path).resolve()) for path, value in local_files.items() if value.get("id")}
+        existing_files = {
+            os.path.normcase(os.path.realpath(path)): value
+            for path, value in local_files.items() if value.get("id")
+        }
         for item in items:
             path = Path(item["path"])
             path_key = str(path.resolve())
             item.pop("_id_binding_error", None)
-            if path_key not in existing_paths:
-                targets[path_key] = {"path": path, "code": code, "item": item}
+            metadata = existing_files.get(os.path.normcase(os.path.realpath(path)))
+            if metadata:
+                item["mteam_id"] = str(metadata["id"])
+                if metadata.get("metadata_complete") and metadata.get("rank"):
+                    item.update({
+                        "rank": list(metadata["rank"]), "rank_source": "M-Team",
+                        "rank_title": metadata.get("title") or item.get("title", ""),
+                    })
+                elif metadata.get("binding_detail_pending"):
+                    details.append(({"path": path, "code": code, "item": item}, metadata))
+                continue
+            targets[path_key] = {"path": path, "code": code, "item": item}
+    token = (settings or {}).get("mteam_token", "")
+    performer = subscription["performer"]
     if not targets:
+        refresh_bound_local_details(details, token, performer, priority_codes, deferred_details)
         return
     # Lightweight downloader implementations may not expose the file/metadata API.
     file_api = downloader.downloader if isinstance(downloader, CheckDownloader) else downloader
     if not callable(getattr(file_api, "list_task_files", None)) or not callable(getattr(file_api, "task_mteam_metadata", None)):
         return
-    performer = subscription["performer"]
     log_event(f"发现 {len(targets)} 个本地视频未绑定 M-Team ID，正在按文件路径读取 qBittorrent 注释。", event="mteam_id_backfill_started", subscription=performer)
     try:
         matches, hashes, ambiguous, checked, errors = match_qbittorrent_file_ids(
@@ -4003,7 +5328,11 @@ def bind_missing_local_mteam_ids(subscription, videos, records, downloader, task
         local_files = record.setdefault("local_files", {})
         path_string = str(target["path"])
         # Discard grades that were not tied to this torrent ID.
-        local_files[path_string] = {"id": identifier, "torrent_hash": hashes[path_key], "id_source": "qbittorrent_file"}
+        metadata = {"id": identifier, "torrent_hash": hashes[path_key], "id_source": "qbittorrent_file",
+                    "binding_detail_pending": True}
+        local_files[path_string] = metadata
+        details.append((target, metadata))
+        target["item"]["mteam_id"] = identifier
         if path_key != path_string:
             local_files.pop(path_key, None)
         filled += 1
@@ -4011,28 +5340,37 @@ def bind_missing_local_mteam_ids(subscription, videos, records, downloader, task
         f"自动补全 M-Team ID：新增 {filled} 个，未匹配 {len(targets) - filled - len(ambiguous)} 个，匹配冲突 {len(ambiguous)} 个，读取失败 {errors} 个。",
         level="warning" if errors or ambiguous else "info", event="mteam_id_backfill", subscription=performer,
     )
-    token = (settings or {}).get("mteam_token", "")
+    refresh_bound_local_details(details, token, performer, priority_codes, deferred_details)
+
+
+def refresh_bound_local_details(details, token, performer, priority_codes=(), deferred_details=None):
     if not token:
         return
-    for path_key, target in targets.items():
-        if path_key in ambiguous or path_key not in matches:
+    for target, metadata in details:
+        check_requested_stop()
+        if deferred_details is not None and target["code"] not in priority_codes:
+            deferred_details.append((target, metadata))
             continue
         path = target["path"]
-        metadata = records[target["code"]]["local_files"][str(path)]
         try:
+            signature = path.stat()
             detail = mteam_detail(metadata["id"], token)
-            if not detail_contains_performer(detail, performer):
-                raise AppError("详情中没有对应女优关键字")
             enriched = enrich_candidate_from_detail({"id": metadata["id"], "code": target["code"], "title": target["item"].get("title") or path.name, "rank": [0, 0, 0]}, token, detail)
             if not metadata_is_complete(candidate_metadata(enriched)):
                 raise AppError("M-Team 详情分级信息不完整")
-            stat = path.stat()
-            metadata.update({**candidate_metadata(enriched), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "rank_version": LOCAL_MTEAM_RANK_VERSION})
-        except MTeamRateLimitError:
+            if not indexed_video_path(path, signature.st_size, signature.st_mtime_ns):
+                raise AppError("本地文件在分级核对期间发生变化")
+            metadata.update({**candidate_metadata(enriched), "size": signature.st_size, "mtime_ns": signature.st_mtime_ns, "rank_version": LOCAL_MTEAM_RANK_VERSION})
+            target["item"].update({
+                "rank": list(enriched["rank"]), "rank_source": "M-Team",
+                "rank_title": enriched.get("title") or target["item"].get("title", ""),
+            })
+        except (MTeamRateLimitError, MTeamRequestInterrupted):
             raise
         except (AppError, OSError) as error:
             target["item"]["_id_binding_error"] = f"ID 已绑定，但分级核对失败：{error}"
             log_event(f"{target['code']}：已绑定 {path.name} 的 M-Team ID {metadata['id']}，分级核对失败：{error}", level="warning", event="mteam_id_backfill_failed", subscription=performer)
+        metadata.pop("binding_detail_pending", None)
 
 
 def backfill_subscription_mteam_ids(subscription_id, downloader=None, progress_callback=None):
@@ -4202,7 +5540,12 @@ def save_repair_job(job):
 
 def public_repair_job(job):
     result = {key: value for key, value in job.items()
-              if key not in ("targets", "detail_cache", "detail_errors", "image_results", "archive_plans")}
+              if key not in ("targets", "detail_cache", "detail_errors", "image_results", "archive_plans", "image_current_code")}
+    if job.get("state") in ("queued", "running"):
+        result["image_progress"] = {
+            "current_code": job.get("image_current_code", "") if job.get("phase") == "images" else "",
+            "results": {code: entry["errors"] for code, entry in job.get("image_results", {}).items()},
+        }
     cooldown = read_json(MTEAM_LIMIT_FILE, {})
     if job.get("state") == "running" and cooldown.get("repair_job_id") == job["job_id"] and cooldown.get("retry_at", 0) > time.time():
         result.update({"phase": "waiting_retry", "retry_at": cooldown["retry_at"],
@@ -4258,11 +5601,17 @@ def queue_data_repair(subscription_id, file_path="", code=""):
     return public_repair_job(job)
 
 
-def plan_video_archive(root, videos, downloader, task_cache):
+def plan_video_archive(root, videos, downloader, task_cache, records):
     targets = {}
     ancestors = {}
+    skipped = []
     for code, items in videos.items():
-        destination = Path(release_download_directory(str(root), code))
+        check_requested_stop()
+        try:
+            destination = Path(release_download_directory(str(root), code))
+        except AppError as error:
+            skipped.extend(f"{Path(item['path']).name}：{error}" for item in items)
+            continue
         for item in items:
             video = Path(item["path"])
             if video.is_symlink() or not video.is_file():
@@ -4275,57 +5624,67 @@ def plan_video_archive(root, videos, downloader, task_cache):
             for parent in video.parents:
                 ancestors.setdefault(parent, set()).add(video)
     if not targets:
-        return [], []
+        return [], skipped
 
     tasks = check_task_snapshot(downloader, task_cache)
     file_lists = task_cache.setdefault("id_file_lists", {})
     owners = {}
     task_destinations = {}
+    blocked = {}
     for info_hash, task in tasks.items():
+        check_requested_stop()
         content_value = task.get("content_path")
+        save_value = task.get("save_path")
+        save = Path(save_value).resolve() if save_value and Path(save_value).is_absolute() else None
         if not content_value:
-            # An incomplete qBittorrent response cannot safely identify a matching path.
-            save_value = task.get("save_path")
-            if save_value:
-                for video in ancestors.get(Path(save_value).resolve(), ()):
-                    if normalize_code(task.get("name", "")) == targets[video]["code"]:
-                        owners.setdefault(video, set()).add(info_hash)
+            code = normalize_code(task.get("name", ""))
+            covered = {video for video in ancestors.get(save, ()) if code == targets[video]["code"]}
+            content = None
+        elif Path(content_value).is_absolute():
+            content = Path(content_value).resolve()
+            covered = {content} if content in targets else ancestors.get(content)
+        else:
             continue
-        content = Path(content_value).resolve()
-        covered = {content} if content in targets else ancestors.get(content)
         if not covered:
             continue
         matched = covered
         relative_files = []
-        save_value = task.get("save_path")
-        save = Path(save_value).resolve() if save_value else None
         if save is not None:
             try:
-                if content in targets and content.parent == save:
-                    relative_files = [Path(content.name)]
-                else:
-                    if info_hash not in file_lists:
-                        file_lists[info_hash] = downloader.list_task_files(info_hash)
-                    relative_files = [Path(str(file["name"]).replace("\\", "/")) for file in file_lists[info_hash]]
-                    if any(path.is_absolute() or not path.parts or ".." in path.parts for path in relative_files):
-                        raise ValueError("种子文件路径无效。")
-                    matched = {(save / path).resolve() for path in relative_files}.intersection(covered)
-            except (AppError, OSError, TypeError, KeyError, ValueError):
+                if info_hash not in file_lists:
+                    file_lists[info_hash] = downloader.list_task_files(info_hash)
+                relative_files = [Path(str(file["name"]).replace("\\", "/")) for file in file_lists[info_hash]]
+                if not relative_files or any(path.anchor or not path.parts or ".." in path.parts for path in relative_files):
+                    raise ValueError("种子文件清单为空或包含无效路径。")
+                matched = {(save / path).resolve() for path in relative_files}.intersection(covered)
+                if content in targets and content not in matched:
+                    matched, relative_files = covered, []
+            except (AppError, AttributeError, OSError, TypeError, KeyError, ValueError):
                 relative_files = []
         for video in matched:
             owners.setdefault(video, set()).add(info_hash)
-        if not matched or not task.get("complete") or save is None or not save.is_relative_to(root):
+        if not matched:
             continue
-        task_videos = {(save / path).resolve() for path in relative_files if path.suffix.casefold() in VIDEO_EXTENSIONS}
+        if task.get("failed") or not task.get("complete"):
+            blocked[info_hash] = f"qBittorrent 任务尚未完成或不可用（{downloader_state_label(task.get('state'))}）"
+            continue
+        if save is None or not relative_files:
+            blocked[info_hash] = "无法确认 qBittorrent 保存路径或种子文件清单，请检查下载器路径映射"
+            continue
+        sources = {path: (save / path).resolve() for path in relative_files}
+        task_videos = {source for path, source in sources.items() if path.suffix.casefold() in VIDEO_EXTENSIONS}
         codes = {targets[video]["code"] for video in matched}
-        if task_videos == matched and len(codes) == 1:
-            code = codes.pop()
-            destination = root / code
-            if destination.is_relative_to(content):
-                continue
-            task_destinations[info_hash] = (save, destination, relative_files, matched)
+        if task_videos != matched or len(codes) != 1:
+            blocked[info_hash] = "同一种子还包含当前迁移范围外的视频"
+            continue
+        if any(not source.is_relative_to(root) or source != save / path for path, source in sources.items()):
+            blocked[info_hash] = "种子包含订阅目录外的文件或链接"
+            continue
+        destination = root / codes.pop()
+        # qBittorrent keeps each file's relative path under the new save directory.
+        task_destinations[info_hash] = (save, destination, relative_files, matched)
 
-    plans, skipped = [], []
+    plans = []
 
     def relocation(video, destination):
         return {**targets[video], "old": str(video), "new": str(destination),
@@ -4333,6 +5692,12 @@ def plan_video_archive(root, videos, downloader, task_cache):
 
     for video, target in sorted(targets.items()):
         if video not in owners:
+            record = records.get(target["code"], {})
+            local_files = record.get("local_files") or {}
+            tracked = (local_files.get(str(video)) or {}).get("torrent_hash")
+            if tracked and str(tracked).lower() in tasks:
+                skipped.append(f"{video.name}：已绑定的 qBittorrent 任务路径与本地文件不匹配，请检查路径映射。")
+                continue
             plans.append({"entries": [relocation(video, root / target["code"] / video.name)]})
     for info_hash, (save, destination, files, matched) in task_destinations.items():
         if any(owners[video] != {info_hash} for video in matched):
@@ -4341,9 +5706,12 @@ def plan_video_archive(root, videos, downloader, task_cache):
                       "files": [str(destination / path) for path in files],
                       "entries": [relocation(video, destination / video.relative_to(save)) for video in sorted(matched)]})
     planned = {entry["old"] for plan in plans for entry in plan["entries"]}
-    for video in owners:
+    for video, hashes in owners.items():
         if str(video) not in planned:
-            skipped.append(f"{video.name}：关联的 qBittorrent 任务未完成、路径冲突或包含其他番号，已保留原位置。")
+            reason = "多个 qBittorrent 任务同时使用种子中的文件"
+            if len(hashes) == 1:
+                reason = blocked.get(next(iter(hashes)), reason)
+            skipped.append(f"{video.name}：{reason}，已保留原位置。")
     return plans, skipped
 
 
@@ -4367,7 +5735,7 @@ def archive_local_files(pairs):
         source.unlink(missing_ok=True)
 
 
-def apply_video_archive_plan(plan, subscription, downloader, job):
+def apply_video_archive_plan(plan, subscription, downloader, persist):
     root = Path(subscription["download_dir"]).resolve()
     entries = plan["entries"]
     for entry in entries:
@@ -4389,7 +5757,8 @@ def apply_video_archive_plan(plan, subscription, downloader, job):
     info_hash = plan.get("hash")
     if info_hash:
         location = Path(plan["location"])
-        task = downloader.list_tasks([info_hash]).get(info_hash)
+        client = downloader.downloader if isinstance(downloader, CheckDownloader) else downloader
+        task = client.list_tasks([info_hash]).get(info_hash)
         if not task or task.get("failed") or not task.get("save_path"):
             raise AppError("无法核对 qBittorrent 任务当前的保存路径。")
         current_location = Path(task["save_path"]).resolve()
@@ -4405,11 +5774,11 @@ def apply_video_archive_plan(plan, subscription, downloader, job):
                     raise AppError(f"种子目标文件冲突：{target.name}。")
             # Persist intent before calling qBittorrent so an interrupted job can recover.
             plan["requested"] = True
-            save_repair_job(job)
+            persist()
             downloader.set_location(info_hash, plan["location"])
         started = time.monotonic()
         while True:
-            task = downloader.list_tasks([info_hash]).get(info_hash)
+            task = client.list_tasks([info_hash]).get(info_hash)
             if not task or task.get("failed"):
                 raise AppError("qBittorrent 任务消失或报告移动失败。")
             moving = task.get("state") == "moving"
@@ -4450,30 +5819,45 @@ def update_archived_video_records(all_records, entry):
                 release["verified_local_path"] = new
 
 
-def archive_subscription_videos(subscription, videos, downloader, task_cache, all_records, job, progress):
+@measure_stage("archive")
+def archive_subscription_videos(subscription, videos, downloader, task_cache, all_records, job=None, progress=None):
     performer = subscription["performer"]
     root = Path(subscription["download_dir"]).resolve()
+    repair_job = job
+    if job is None:
+        job = {}
+
+    def persist():
+        if repair_job is not None:
+            save_repair_job(repair_job)
+
     if "archive_plans" not in job:
         try:
-            plans, warnings = plan_video_archive(root, videos, downloader, task_cache)
+            plans, warnings = plan_video_archive(root, videos, downloader, task_cache, all_records.get(subscription["id"], {}))
         except (AppError, OSError) as error:
             plans, warnings = [], [f"无法核对影片归档路径：{error}"]
         job["archive_plans"] = plans
         job["archive_failed"] = len(warnings)
         for message in warnings:
             log_event(message, level="warning", event="repair_archive_skipped", subscription=performer)
-        save_repair_job(job)
+        persist()
     plans = job["archive_plans"]
-    if not plans:
-        return False
-    progress("archive", 0, len(plans), "正在将已有影片归档到番号目录。")
-    with closing(connect_video_database()) as database:
+    if plans and progress:
+        progress("archive", 0, len(plans), "正在将已有影片归档到番号目录。")
+    elif plans:
+        log_event(f"正在将 {len(plans)} 组已有影片归档到番号目录。", event="repair_archive_started", subscription=performer)
+    if plans:
+        database = connect_video_database()
+    else:
+        database = None
+    try:
         for index, plan in enumerate(plans, 1):
             if not plan.get("done"):
+                check_requested_stop()
                 if STOP_SCHEDULER:
                     raise MTeamRequestInterrupted("后台调度器正在停止，影片归档等待恢复。")
                 try:
-                    apply_video_archive_plan(plan, subscription, downloader, job)
+                    apply_video_archive_plan(plan, subscription, downloader, persist)
                     with database:
                         for entry in plan["entries"]:
                             update_archived_video_records(all_records, entry)
@@ -4481,6 +5865,9 @@ def archive_subscription_videos(subscription, videos, downloader, task_cache, al
                                              (entry["new"], entry["code"], entry["old"]))
                     write_json(RECORDS_FILE, all_records)
                     job["archived"] = job.get("archived", 0) + len(plan["entries"])
+                    for entry in plan["entries"]:
+                        if entry["old"] == job.get("path"):
+                            job["archived_path"] = entry["new"]
                 except MTeamRequestInterrupted:
                     raise
                 except (AppError, OSError, sqlite3.Error) as error:
@@ -4488,12 +5875,20 @@ def archive_subscription_videos(subscription, videos, downloader, task_cache, al
                     log_event(f"{plan['entries'][0]['code']} 归档未完成：{error}", level="warning",
                               event="repair_archive_failed", subscription=performer)
                 plan["done"] = True
-            progress("archive", index, len(plans), f"已处理 {index}/{len(plans)} 组影片归档。")
+            if progress:
+                progress("archive", index, len(plans), f"已处理 {index}/{len(plans)} 组影片归档。")
+    finally:
+        if database is not None:
+            database.close()
     # Discard the pre-move task paths and cached local scan.
     if any(plan.get("hash") for plan in plans):
         task_cache.clear()
-    invalidate_local_scans(str(root))
-    return True
+    if plans:
+        invalidate_local_scans(str(root))
+    if plans or job["archive_failed"]:
+        log_event(f"影片归档完成：已迁移 {job.get('archived', 0)} 个，未迁移 {job['archive_failed']} 个。",
+                  level="warning" if job["archive_failed"] else "info", event="repair_archive_completed", subscription=performer)
+    return bool(plans)
 
 
 def repair_subscription_data(job, downloader=None):
@@ -4531,8 +5926,12 @@ def repair_subscription_data(job, downloader=None):
     records = all_records.setdefault(subscription["id"], {})
     downloader = downloader or Downloader(settings["downloader"])
     task_cache = {}
-    if not job.get("path") and "targets" not in job:
-        if archive_subscription_videos(subscription, videos, downloader, task_cache, all_records, job, progress):
+    if "targets" not in job:
+        archive_videos = videos
+        if job.get("path"):
+            code = job["code"]
+            archive_videos = {code: [item for item in videos.get(code, ()) if str(Path(item["path"]).resolve()) == job["path"]]}
+        if archive_subscription_videos(subscription, archive_videos, downloader, task_cache, all_records, job, progress):
             videos = scan_local_releases(subscription["download_dir"])
     scanned = {str(Path(item["path"]).resolve()): {"code": code, "item": item} for code, items in videos.items() for item in items}
     log_event(
@@ -4540,8 +5939,9 @@ def repair_subscription_data(job, downloader=None):
         event="repair_scan_completed", subscription=performer,
     )
     if "targets" not in job:
-        selected = {path: value for path, value in scanned.items() if not job.get("path") or path == job["path"]}
-        if job.get("path") and (not selected or selected[job["path"]]["code"] != job.get("code")):
+        selected_path = job.get("archived_path") or job.get("path")
+        selected = {path: value for path, value in scanned.items() if not selected_path or path == selected_path}
+        if selected_path and (not selected or selected[selected_path]["code"] != job.get("code")):
             raise AppError("当前订阅中没有找到该视频文件或番号不匹配。")
         job["targets"] = {path: {"code": value["code"], "size": Path(path).stat().st_size, "mtime_ns": Path(path).stat().st_mtime_ns} for path, value in selected.items()}
         save_repair_job(job)
@@ -4628,8 +6028,6 @@ def repair_subscription_data(job, downloader=None):
                 if identifier not in detail_cache:
                     try:
                         detail = mteam_detail(identifier, token, force_refresh=True)
-                        if not detail_contains_performer(detail, performer):
-                            raise AppError("M-Team 详情没有对应女优关键字，未写入新信息。")
                         enriched = enrich_candidate_from_detail({"id": identifier, "code": code,
                             "title": detail.get("name") or detail.get("title") or code, "rank": [0, 0, 0]}, token, detail)
                         detail_cache[identifier] = candidate_metadata(enriched)
@@ -4643,8 +6041,11 @@ def repair_subscription_data(job, downloader=None):
                         raise
                     save_repair_job(job)
                 previous = files.get(saved_key, {})
-                files[saved_key] = {**previous, **detail_cache[identifier], "size": actual.st_size,
+                refreshed = detail_cache[identifier]
+                files[saved_key] = {**previous, **refreshed, "size": actual.st_size,
                     "mtime_ns": actual.st_mtime_ns, "rank_version": LOCAL_MTEAM_RANK_VERSION}
+                if previous.get("dmm_code") and not refreshed.get("dmm_code"):
+                    files[saved_key]["dmm_code"] = previous["dmm_code"]
                 write_json(RECORDS_FILE, all_records)
                 outcome["details_done"] = True
                 save_repair_job(job)
@@ -4697,16 +6098,20 @@ def repair_subscription_data(job, downloader=None):
     image_failed = 0
     if image_rows:
         total_images = len(image_results) + len(image_rows)
-        progress("images", len(image_results), total_images, "正在重新下载封面和截图。")
+
+        def start_images(code):
+            job["image_current_code"] = code
+            progress("images", len(image_results), total_images, f"正在核对 {code} 的封面和截图。")
 
         def finish_images(code, covers, screenshots, errors):
             image_results[code] = {"covers": covers, "screenshots": screenshots, "errors": errors}
+            job.pop("image_current_code", None)
             progress("images", len(image_results), total_images, f"已检查 {len(image_results)}/{total_images} 个番号的封面和截图。")
 
         try:
             allowed_sources = {(subscription["id"], str(Path(scanned[path]["item"]["path"]))) for path in image_targets}
             if not sync_subscription_covers(subscription, image_rows, all_records, settings, refresh=True,
-                                            allowed_sources=allowed_sources, on_number=finish_images):
+                                            allowed_sources=allowed_sources, on_number_started=start_images, on_number=finish_images):
                 image_failed = 1
         finally:
             write_json(RECORDS_FILE, all_records)
@@ -4763,7 +6168,7 @@ def run_data_repair_request(request, downloader=None):
         summary = repair_subscription_data(job, downloader)
         job.update({"state": "completed", "phase": "completed", "summary": summary, "completed": summary["total"],
             "total": summary["total"], "completed_at": now_iso(),
-            "message": f"数据修复完成：归档 {summary['archived']} 个，未归档 {summary['archive_failed']} 个。新增 ID {summary['filled']} 个，修正 {summary['corrected']} 个，刷新 {summary['refreshed']} 个，字幕下载 {summary['subtitles_downloaded']} 个，跳过 {summary['skipped']} 个，失败 {summary['failed']} 个。封面 {summary['covers_downloaded']} 张，截图 {summary['screenshots_downloaded']} 张，图片失败 {summary['image_failed']} 项。"})
+            "message": f"数据修复完成：归档 {summary['archived']} 个，未归档 {summary['archive_failed']} 个。新增 ID {summary['filled']} 个，修正 {summary['corrected']} 个，刷新 {summary['refreshed']} 个，字幕下载 {summary['subtitles_downloaded']} 个，跳过 {summary['skipped']} 个，失败 {summary['failed']} 个。封面保存 {summary['covers_downloaded']} 张，截图保存 {summary['screenshots_downloaded']} 张，图片失败 {summary['image_failed']} 项。"})
         job.pop("detail_cache", None)
         job.pop("detail_errors", None)
         job.pop("archive_plans", None)
@@ -4820,10 +6225,12 @@ def get_subscription_video_cover(subscription_id, code, file_path):
     if not identifier.isdigit() or not token:
         raise AppError("缺少逐文件 M-Team ID 或存取令牌，请先修复数据。")
     signature = target.stat()
-    detail = mteam_detail(identifier, token)
-    if not detail_contains_performer(detail, subscription["performer"]):
-        raise AppError("M-Team 详情中未找到对应女优关键字。")
-    image_metadata = detail_image_metadata(detail)
+    image_metadata = dict(metadata)
+    read_image_detail(image_metadata, subscription["performer"], token, {}, normalize_code(code))
+    image_metadata = {key: image_metadata[key] for key in (
+        "cover_url", "cover_checked", "screenshot_urls", "dmm_code",
+        "dmm_detail_checked", "dmm_lookup_checked", "dmm_source_mteam_id",
+    ) if key in image_metadata}
     cover = image_metadata["cover_url"]
     with file_lock():
         all_records = read_json(RECORDS_FILE, {})
@@ -4915,8 +6322,6 @@ def get_subscription_video_file_info(subscription_id, code, file_path):
         if not token:
             raise AppError("请先配置 M-Team 存取令牌。")
         detail = mteam_detail(identifier, token)
-        if not detail_contains_performer(detail, subscription["performer"]):
-            raise AppError(f"M-Team 详情中未找到女优关键字“{subscription['performer']}”，已拒绝读取详情信息。")
         mediainfo = detail_mediainfo(detail)
         record = records.setdefault(code, {"code": code})
         local_files = record.setdefault("local_files", {})
@@ -4925,6 +6330,47 @@ def get_subscription_video_file_info(subscription_id, code, file_path):
         metadata["mediainfo_checked"] = True
         write_json(RECORDS_FILE, all_records)
     return {"path": str(target), "mediainfo": localize_mediainfo(mediainfo), "mediainfo_checked": True}
+
+
+def get_subscription_video_hardlinks(subscription_id, code, file_path):
+    subscriptions = {item["id"]: Path(item["download_dir"]).resolve() for item in list_subscriptions()}
+    root = subscriptions.get(subscription_id)
+    if root is None:
+        raise AppError("订阅不存在。")
+    if not isinstance(file_path, str) or "\x00" in file_path:
+        raise AppError("视频路径格式无效。")
+    target = Path(file_path)
+    if not target.is_absolute() or not target.resolve().is_relative_to(root):
+        raise AppError("视频路径不在当前订阅目录内。")
+    code = normalize_code(code)
+    with closing(connect_video_database()) as connection:
+        indexed = connection.execute(
+            "SELECT size, mtime_ns FROM local_video_files WHERE subscription_id=? AND code=? AND path=?",
+            (subscription_id, code, str(target)),
+        ).fetchone()
+        if indexed is None or indexed_video_path(target, *indexed) is None:
+            raise AppError("未找到当前版本的视频，请刷新列表后重试。")
+        signature = target.lstat()
+        candidates = connection.execute(
+            "SELECT subscription_id, path FROM local_video_files WHERE code=?", (code,),
+        ).fetchall()
+
+    paths = {target.resolve()}
+    for owner_id, filename in candidates:
+        directory = subscriptions.get(owner_id)
+        if directory is None:
+            continue
+        path = Path(filename)
+        try:
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode) or not os.path.samestat(signature, info):
+                continue
+            resolved = path.resolve(strict=True)
+            if resolved.is_relative_to(directory):
+                paths.add(resolved)
+        except (OSError, RuntimeError):
+            continue
+    return {"paths": sorted(map(str, paths)), "count": len(paths)}
 
 
 def localize_mediainfo(value):
@@ -5028,8 +6474,6 @@ def refresh_subscription_video_file(subscription_id, code, file_path):
     if not identifier.isdigit():
         raise AppError("该视频没有 M-Team ID，请先使用“补全 M-Team ID”。")
     detail = mteam_detail(identifier, token, force_refresh=True)
-    if not detail_contains_performer(detail, subscription["performer"]):
-        raise AppError(f"M-Team 详情中未找到女优关键字“{subscription['performer']}”，已拒绝写入该视频信息。")
     candidate = {
         "id": identifier, "code": code, "title": previous.get("title") or item.get("title") or target.name,
         "rank": previous.get("rank") or item.get("rank", [0, 0, 0]),
@@ -5041,7 +6485,7 @@ def refresh_subscription_video_file(subscription_id, code, file_path):
         **candidate_metadata(enriched), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
         "rank_version": LOCAL_MTEAM_RANK_VERSION,
     }
-    for key in ("torrent_hash", "id_source"):
+    for key in ("torrent_hash", "id_source", "dmm_code", "dmm_lookup_checked", "dmm_source_mteam_id"):
         if previous.get(key):
             refreshed[key] = previous[key]
     if previous.get("subtitle_check"):
@@ -5083,9 +6527,6 @@ def refresh_subscription_videos(subscription_id):
                 continue
             try:
                 detail = mteam_detail(identifier, token)
-                if not detail_contains_performer(detail, subscription["performer"]):
-                    failed += 1
-                    continue
                 enriched = enrich_candidate_from_detail({
                     "id": identifier, "code": code,
                     "title": previous.get("title") or item.get("title") or path.name,
@@ -5119,9 +6560,64 @@ def best_candidates(items):
     chosen = {}
     for item in items:
         existing = chosen.get(item["code"])
-        if existing is None or (tuple(item["rank"]), item["seeders"], item["created"]) > (tuple(existing["rank"]), existing["seeders"], existing["created"]):
+        if existing is None or candidate_sort_key(item) > candidate_sort_key(existing):
             chosen[item["code"]] = item
     return chosen
+
+
+def allows_subscription_language(subscription, candidate):
+    rank = candidate.get("rank") or ()
+    return not subscription.get("exclude_non_chinese", True) or (len(rank) > 1 and rank[1] in (1, 2))
+
+
+def candidate_sort_key(candidate):
+    return local_wash_rank(candidate.get("rank")), candidate.get("seeders", 0), candidate.get("created", "")
+
+
+def verified_candidate_language(candidate, detail):
+    metadata = dict(detail)
+    if "labelsNew" not in metadata and "labels" in metadata:
+        metadata["labelsNew"] = metadata["labels"]
+    language = release_rank("", metadata, require_chinese_evidence=True)[1]
+    if language or "labelsNew" in metadata or "hasChineseSubtitle" in metadata:
+        return language
+    if re.search(r"(?:非|无|無)\s*(?:中文|中字)|(?:no|non)[\s-]+chinese",
+                 " ".join(str(metadata.get(key, "")) for key in ("smallDescr", "subtitle", "subtitleType", "subtitleLanguage", "language")),
+                 re.IGNORECASE):
+        return 0
+    return candidate["rank"][1]
+
+
+def select_chinese_candidate(items, token):
+    ordered = sorted(items, key=candidate_sort_key, reverse=True)
+    eligible = [item for item in ordered if item["rank"][1] in (1, 2) or item.get("metadata_complete") is False]
+    best = None
+    for item in eligible:
+        check_requested_stop()
+        try:
+            if item.get("metadata_complete") is False:
+                candidate = enrich_candidate_from_detail(item, token)
+                detail = candidate["_mteam_detail"]
+            elif len(eligible) > 1 and item.get("metadata_complete") is True:
+                detail = item.get("_mteam_detail") or mteam_detail(item["id"], token)
+                candidate = {**item, "_mteam_detail": detail}
+            else:
+                candidate = item
+                detail = None
+        except (MTeamRateLimitError, MTeamRequestInterrupted):
+            raise
+        except AppError:
+            continue
+        language = verified_candidate_language(item, detail) if detail is not None else item["rank"][1]
+        if language in (1, 2):
+            rank = list(candidate["rank"])
+            rank[1] = language
+            candidate = {**candidate, "rank": rank}
+            if best is None or candidate_sort_key(candidate) > candidate_sort_key(best):
+                best = candidate
+        if best is not None and candidate_sort_key(best) >= candidate_sort_key(item):
+            break
+    return best
 
 
 def local_file_variant_tokens(value):
@@ -5228,11 +6724,6 @@ def cache_local_file_mteam_metadata(subscription, local_releases, search_results
                 continue
             try:
                 detail = mteam_detail(candidate["id"], token)
-                if not detail_contains_performer(detail, subscription["performer"]):
-                    if previous:
-                        current_files[path] = previous
-                        used_ids.add(identifier)
-                    continue
                 enriched = enrich_candidate_from_detail(candidate, token, detail)
             except MTeamRateLimitError:
                 raise
@@ -5280,12 +6771,66 @@ def rank_dimension_labels(rank):
     return resolution, language
 
 
+def describe_version_rank(rank):
+    if not rank or len(rank) < 2:
+        return "分级未知"
+    codec = {1: "x264", 2: "x265"}.get(rank[2] if len(rank) > 2 else None, "其他编码")
+    return " · ".join((*rank_dimension_labels(rank), codec))
+
+
+def describe_search_candidate(candidate, position=None):
+    prefix = f"候选 {position} · " if position is not None else ""
+    identifier = candidate.get("id") or "未知"
+    completeness = candidate.get("metadata_complete")
+    detail_status = {True: "详情分级完整", False: "详情分级待核对"}.get(completeness, "详情状态未知")
+    title = " ".join(str(candidate.get("title") or "").split())[:120] or "无标题"
+    return (
+        f"{prefix}M-Team ID {identifier}；版本等级：{describe_version_rank(candidate.get('rank'))}；"
+        f"{detail_status}；主标题：《{title}》"
+    )
+
+
+def describe_candidate_check(code, candidate, local_items, record):
+    lines = [
+        f"{code} 正在核对候选版本",
+        f"候选版本 · {describe_version_rank(candidate.get('rank'))}（M-Team ID {candidate.get('id') or '未知'}）",
+    ]
+    if candidate.get("metadata_complete") is False:
+        lines.append("候选分级尚需核对详情")
+    if not local_items:
+        lines.append("本地未发现该番号的视频")
+    local_files = (record or {}).get("local_files") or {}
+    local_files_by_resolved_path = {
+        os.path.normcase(os.path.realpath(path)): metadata
+        for path, metadata in local_files.items()
+    }
+    for item in local_items:
+        metadata = local_files_by_resolved_path.get(os.path.normcase(os.path.realpath(item["path"])), {})
+        mteam_id = item.get("mteam_id") or metadata.get("id")
+        identifier = f"M-Team ID {mteam_id}" if mteam_id else "未绑定 M-Team ID"
+        source = item.get("rank_source") or "NFO/MediaInfo"
+        filename = f" · {Path(item['path']).name}" if len(local_items) > 1 else ""
+        lines.append(f"本地版本 · {describe_version_rank(item.get('rank'))}（{identifier}，依据 {source}）{filename}")
+    states = {"completed": "已完成", "downloading": "下载中", "upgrading": "洗版下载中",
+              "submitted": "已提交", "missing": "任务丢失", "failed": "失败"}
+    for key, label in (("current", "当前记录"), ("pending", "待下载版本")):
+        release = (record or {}).get(key)
+        if not release or (key == "current" and local_items and not release.get("id") and release.get("state") == "completed"):
+            continue
+        identifier = f"M-Team ID {release['id']}" if release.get("id") else ""
+        details = (states.get(release.get("state"), "状态未知"), identifier, describe_version_rank(release.get("rank")))
+        lines.append(f"{label} · " + " · ".join(part for part in details if part))
+    return "\n".join(lines)
+
+
 def wash_rank(rank):
-    return tuple((rank or (0, 0, 0))[:2])
+    return local_wash_rank(rank)[:2]
 
 
 def local_wash_rank(rank):
-    return tuple((rank or (0, 0, 0))[:3])
+    # Stored ranks remain (resolution, language, codec).
+    resolution, language, codec = (tuple(rank or ()) + (0, 0, 0))[:3]
+    return language, resolution, codec
 
 
 def local_wash_reason(old_rank, new_rank):
@@ -5293,9 +6838,9 @@ def local_wash_reason(old_rank, new_rank):
     new_rank = tuple(new_rank or (0, 0, 0))
     if old_rank == new_rank:
         return "版本等级相同，清理重复文件并保留一个版本"
-    labels = ("分辨率", "中文等级", "编码")
-    old_values = (*rank_dimension_labels(old_rank), {0: "其他编码", 1: "x264", 2: "x265"}.get(old_rank[2], "其他编码"))
-    new_values = (*rank_dimension_labels(new_rank), {0: "其他编码", 1: "x264", 2: "x265"}.get(new_rank[2], "其他编码"))
+    labels = ("中文等级", "分辨率", "编码")
+    old_values = (*reversed(rank_dimension_labels(old_rank)), {0: "其他编码", 1: "x264", 2: "x265"}.get(old_rank[2], "其他编码"))
+    new_values = (*reversed(rank_dimension_labels(new_rank)), {0: "其他编码", 1: "x264", 2: "x265"}.get(new_rank[2], "其他编码"))
     changes = [f"{label}：{old} → {new}" for label, old, new in zip(labels, old_values, new_values) if old != new]
     return "；".join(changes) or "版本优先级提高"
 
@@ -5348,8 +6893,6 @@ def prepare_local_wash_metadata(releases, record_sources, token, performer, forc
                     if not token:
                         raise AppError("未配置 M-Team 令牌，无法核对文件等级")
                     detail = mteam_detail(identifier, token)
-                    if not detail_contains_performer(detail, performer):
-                        raise AppError("详情中没有对应女优关键字")
                     candidate = {
                         "id": identifier, "code": code,
                         "title": previous.get("title") or item.get("title") or path.name,
@@ -5384,12 +6927,10 @@ def prepare_local_wash_metadata(releases, record_sources, token, performer, forc
 
 
 def local_wash_description(item):
-    rank = tuple(item.get("rank") or (0, 0, 0))
-    resolution, language = rank_dimension_labels(rank)
-    codec = {0: "其他编码", 1: "x264", 2: "x265"}.get(rank[2], "其他编码")
     identifier = item.get("mteam_id") or "未绑定"
     source = item.get("rank_source") or "NFO/文件名"
-    return f"{Path(item['path']).name}（M-Team ID {identifier}，{resolution} · {language} · {codec}，依据：{source}）"
+    rank = describe_version_rank(item.get("rank") or (0, 0, 0))
+    return f"{Path(item['path']).name}（M-Team ID {identifier}，{rank}，依据：{source}）"
 
 
 def local_task_for_video(video_path, tasks):
@@ -5475,7 +7016,7 @@ def wash_local_duplicate_releases(download_dir, releases, performer="", download
                 removed_hash = remove_local_release_task(item["path"], downloader, tasks, all_records) if downloader else ""
                 remove_local_releases([item["path"]], download_dir, code, [download_dir])
                 task_note = f"并已移除下载器任务 {removed_hash}（保留任务数据，由应用精确清理视频及配套文件）" if removed_hash else ""
-                reason = local_wash_reason(rank, best_rank)
+                reason = local_wash_reason(item.get("rank"), winner.get("rank"))
                 log_event(
                     f"本地洗版原因：{reason}；保留：{local_wash_description(winner)}；已删除文件 {local_wash_description(item)}及其 NFO/字幕。{task_note}",
                     subscription=performer,
@@ -5495,9 +7036,9 @@ def wash_local_duplicate_releases(download_dir, releases, performer="", download
 
 
 def upgrade_reason(old_rank, new_rank):
-    old_values = rank_dimension_labels(old_rank)
-    new_values = rank_dimension_labels(new_rank)
-    labels = ("分辨率", "中文等级")
+    old_values = reversed(rank_dimension_labels(old_rank))
+    new_values = reversed(rank_dimension_labels(new_rank))
+    labels = ("中文等级", "分辨率")
     changes = [f"{label}：{old} → {new}" for label, old, new in zip(labels, old_values, new_values) if old != new]
     return "；".join(changes) or "版本优先级提高"
 
@@ -5607,6 +7148,12 @@ def link_local_release_to_subscription(source, download_dir, code):
                 raise AppError("来源文件名无效，已拒绝在订阅目录外创建链接。")
             if target.exists():
                 if item == source_path:
+                    try:
+                        if os.path.samefile(item, target):
+                            target_video = target
+                            continue
+                    except OSError:
+                        pass
                     raise AppError("订阅目录中已有同名文件，无法安全创建硬链接。")
                 continue
             try:
@@ -5630,8 +7177,42 @@ def link_local_release_to_subscription(source, download_dir, code):
     return {"path": str(target_video)}
 
 
+def propagate_coappearance_release(active, code, all_records):
+    subscription_ids = active.get("shared_subscription_ids") or []
+    if not subscription_ids:
+        return
+    source_items = find_local_releases(active.get("download_dir", ""), code)
+    source_video = next((Path(item["path"]) for item in source_items if Path(item["path"]).is_file()), None)
+    if source_video is None:
+        raise AppError("新版已完成，但无法在当前订阅目录找到可共享的影片文件。")
+    subscriptions = {item.get("id"): item for item in list_subscriptions() if item.get("id")}
+    for subscription_id in subscription_ids:
+        owner = subscriptions.get(subscription_id)
+        if not owner or owner.get("download_dir") == active.get("download_dir"):
+            continue
+        linked = link_local_release_to_subscription(source_video, owner["download_dir"], code)
+        linked_paths = [linked["path"]]
+        subscription_records = (all_records or {}).setdefault(subscription_id, {})
+        record = subscription_records.setdefault(code, {"code": code})
+        pending = record.get("pending")
+        if pending and str(pending.get("id", "")) == str(active.get("id", "")):
+            record.pop("pending", None)
+        record["current"] = record_state({
+            "id": "", "code": code, "title": active.get("title", code),
+            "rank": list(active.get("rank", [0, 0, 0])),
+            "hash": "", "owns_task": False, "local_existing": True,
+            "local_paths": linked_paths, "download_dir": owner["download_dir"], "progress": 100,
+        }, "completed", "共演订阅已同步更高版本影片硬链接。")
+        if active.get("id"):
+            record["mteam_metadata"] = candidate_metadata(active)
+        log_event(
+            f"{code} 已将洗版后的影片硬链接同步到共演订阅目录：{owner['performer']}。",
+            event="coappearance_wash_synced", subscription=owner["performer"],
+        )
+
+
 @measure_stage("sync")
-def poll_downloader_records(downloader, records, results, all_records=None, performer="", token=""):
+def poll_downloader_records(downloader, records, results, all_records=None, performer="", token="", *, deferred_subtitles=None):
     if not records:
         return
     def report(message, event):
@@ -5646,9 +7227,12 @@ def poll_downloader_records(downloader, records, results, all_records=None, perf
         if release and release.get("hash") and not release.get("local_existing")
         and release.get("state") not in ("failed", "superseded")
     }
-    tasks = downloader.list_tasks(hashes) if hashes else {}
     context = check_context()
     task_generation = context.generation if context is not None else 0
+    tasks = downloader.list_tasks(hashes) if hashes else {}
+    batched = isinstance(downloader, CheckDownloader) and bool(hashes)
+    snapshot_at = downloader.snapshot_timestamp(hashes) if batched else None
+    snapshot_revision = downloader.revision if batched else 0
     processable = sum(
         1 for item in records.values()
         if (active := (item.get("pending") or item.get("current")))
@@ -5658,9 +7242,7 @@ def poll_downloader_records(downloader, records, results, all_records=None, perf
     if processable:
         report(f"正在处理下载任务状态（{processable} 个任务）。", "task_status_started")
     for item in records.values():
-        if context is not None and task_generation != context.generation:
-            tasks = downloader.list_tasks(hashes) if hashes else {}
-            task_generation = context.generation
+        check_requested_stop()
         pending = item.get("pending")
         active = pending or item.get("current")
         if active and active.get("local_existing") and not pending:
@@ -5669,13 +7251,18 @@ def poll_downloader_records(downloader, records, results, all_records=None, perf
         if not active or active.get("state") in ("superseded", "failed"):
             continue
         code = item.get("code") or active.get("code") or "未知番号"
-        if isinstance(downloader, CheckDownloader) and active.get("hash"):
-            tasks.pop(str(active["hash"]).lower(), None)
-            tasks.update(downloader.list_tasks([active["hash"]]))
+        if batched and (
+            not downloader._fresh(snapshot_at) or task_generation != downloader.context.generation
+            or snapshot_revision != downloader.revision
+        ):
+            tasks = downloader.list_tasks(hashes)
+            task_generation = downloader.context.generation
+            snapshot_at = downloader.snapshot_timestamp(hashes)
+            snapshot_revision = downloader.revision
         if active.get("state") == "completed" and not pending and active.get("download_dir"):
             directory = active["download_dir"]
             try:
-                local_files = scan_local_releases(directory).get(code, [])
+                local_files = find_local_releases(directory, code)
             except AppError as error:
                 active["message"] = f"下载任务曾标记完成，但无法核对本地文件：{error}"
                 report(f"{code} 已完成记录无法核对本地文件，保留记录并跳过重新提交。", "completed_file_check_failed")
@@ -5790,12 +7377,35 @@ def poll_downloader_records(downloader, records, results, all_records=None, perf
                 active.pop("directory_recheck_requested", None)
                 active.pop("completed_missing_recheck_requested", None)
         if active["state"] == "completed" and pending:
+            if active.get("shared_subscription_ids"):
+                try:
+                    propagate_coappearance_release(active, code, all_records)
+                except (AppError, OSError) as error:
+                    active["state"] = "cleanup_failed"
+                    active["message"] = f"新版已下载完成，共演订阅同步硬链接失败，旧版保留：{error}"
+                    report(f"{code} 共演订阅洗版同步失败，保留旧版并等待重试：{error}", "coappearance_wash_sync_failed")
+                    results.append({"code": code, "title": active.get("title", ""), "state": "cleanup_failed", "progress": active.get("progress", 0), "message": active["message"]})
+                    continue
             old = item.get("current")
             still_referenced = False
             if old:
                 if old.get("local_existing"):
                     try:
                         remove_local_releases(old.get("local_paths", []), old["download_dir"], item.get("code", ""), old.get("local_roots"))
+                        if active.get("shared_subscription_ids"):
+                            subscriptions = {sub.get("id"): sub for sub in list_subscriptions() if sub.get("id")}
+                            for subscription_id in active["shared_subscription_ids"]:
+                                owner = subscriptions.get(subscription_id)
+                                if not owner:
+                                    continue
+                                linked = scan_local_releases(owner["download_dir"]).get(code, [])
+                                sibling_record = (all_records or {}).get(subscription_id, {}).get(code, {})
+                                sibling_current = sibling_record.get("current") or {}
+                                if linked and sibling_current.get("local_existing"):
+                                    best_linked = max(linked, key=lambda entry: local_wash_rank(entry["rank"]))
+                                    sibling_current["local_paths"] = [entry["path"] for entry in linked]
+                                    sibling_current["rank"] = list(active.get("rank", best_linked["rank"]))
+                                    sibling_current["title"] = active.get("title", best_linked["title"])
                     except AppError as error:
                         active["state"] = "cleanup_failed"
                         active["message"] = str(error)
@@ -5854,7 +7464,11 @@ def poll_downloader_records(downloader, records, results, all_records=None, perf
             else:
                 item["current"]["message"] = "qBittorrent 已有的新版本经校验并在订阅目录确认，旧版已完成替换。"
         if active["state"] == "completed" and token and not active.get("local_existing"):
-            _download_release_subtitles(active, code, token, performer, item.get("mteam_metadata"))
+            subtitle_args = (active, code, token, performer, item.get("mteam_metadata"))
+            if deferred_subtitles is None:
+                _download_release_subtitles(*subtitle_args)
+            else:
+                deferred_subtitles.append(subtitle_args)
         results.append({"code": item.get("code", ""), "title": active.get("title", ""), "state": active["state"], "progress": active.get("progress", 0), "message": active.get("message", "")})
 
 
@@ -5979,15 +7593,41 @@ def _download_existing_local_subtitles(code, local_items, record, token, perform
             log_event(f"{code} 在 M-Team 字幕区没有找到可下载的中文字幕。", event="subtitle_not_found", subscription=performer)
 
 
-def submit_candidate(subscription, candidate, token, downloader, item):
+def submit_candidate(subscription, candidate, token, downloader, item, *, minimum_grade=None):
+    context = check_context()
+    generation = context.generation if context is not None else 0
+    root = subscription["download_dir"]
+    code = candidate["code"]
+    if not allows_subscription_language(subscription, candidate):
+        raise NonChineseCandidateError("已开启排除非中文影片，跳过未确认有中文的版本。")
+    scanned = context.scans.get(os.path.realpath(root)) if context is not None else None
+    signatures = None
+    if scanned is not None:
+        signatures = candidate_file_signatures(scanned.get(code, ()))
     detail = candidate.get("_mteam_detail") or mteam_detail(candidate["id"], token)
     if not detail_contains_performer(detail, subscription["performer"]):
         raise PerformerMismatchError(f"M-Team 详情中未找到女优关键字“{subscription['performer']}”，已跳过 {candidate['code']}。")
     clean_candidate = {key: value for key, value in candidate.items() if not key.startswith("_")}
+    if subscription.get("exclude_non_chinese", True):
+        language = verified_candidate_language(candidate, detail)
+        if language not in (1, 2):
+            raise NonChineseCandidateError("M-Team 详情未确认有中文，未提交下载。")
+        clean_candidate["rank"] = list(candidate["rank"])
+        clean_candidate["rank"][1] = language
+        if minimum_grade is not None and wash_rank(clean_candidate["rank"]) <= minimum_grade:
+            raise NonChineseCandidateError("详情核对后的版本等级未高于现有版本，已跳过洗版。")
     if not clean_candidate.get("subtitle"):
         clean_candidate["subtitle"] = str(next((detail.get(key) for key in ("smallDescr", "small_descr", "subtitle", "subTitle") if detail.get(key)), "") or "")
     clean_candidate["subtitle_checked"] = True
     torrent_data = fetch_torrent(candidate["id"], token)
+    check_requested_stop()
+    if context is not None and context.generation != generation:
+        if signatures is not None and signatures != candidate_file_signatures(find_local_releases(root, code)):
+            raise AppError(f"{code} 的本地文件在限流等待期间发生变化，下轮将重新判断是否提交。")
+        hashes = [release["hash"] for key in ("current", "pending")
+                  if (release := (item or {}).get(key)) and release.get("hash")]
+        if hashes and isinstance(downloader, CheckDownloader):
+            downloader.list_tasks(hashes)
     download_dir = release_download_directory(subscription["download_dir"], candidate["code"])
     added = downloader.add(torrent_data, candidate["title"], download_dir)
     if isinstance(added, dict):
@@ -6026,6 +7666,18 @@ def submit_candidate(subscription, candidate, token, downloader, item):
     return release
 
 
+def candidate_file_signatures(items):
+    signatures = {}
+    for item in items:
+        path = Path(item["path"])
+        try:
+            stamp = path.lstat()
+        except FileNotFoundError:
+            continue
+        signatures[path] = (stamp.st_dev, stamp.st_ino, stamp.st_size, stamp.st_mtime_ns)
+    return signatures
+
+
 def existing_task_release_in_subscription(task, download_dir, code, downloader=None, info_hash=""):
     content_value = str((task or {}).get("content_path", "") or "")
     if not content_value:
@@ -6039,7 +7691,7 @@ def existing_task_release_in_subscription(task, download_dir, code, downloader=N
     if not content.exists():
         return False
     try:
-        releases = scan_local_releases(str(root)).get(code, [])
+        releases = find_local_releases(str(root), code)
     except AppError:
         return ""
     local_paths = {str(Path(item["path"]).resolve()) for item in releases}
@@ -6117,10 +7769,33 @@ def bind_verified_candidate_to_local_file(current, candidate, local_items, recor
     return True
 
 
-def process_subscription(subscription, records, settings, downloader, results, refresh_existing_info=False, local_scan_cache=None, local_task_cache=None):
+def search_subscription_releases(keywords, token, performer):
+    search_results = []
+    seen_search_results = set()
+    for keyword in keywords:
+        check_requested_stop()
+        log_event(f"正在搜索 M-Team：{keyword}。", event="mteam_search_started", subscription=performer)
+        matched_results = mteam_search(keyword, token)
+        log_event(f"搜索“{keyword}”返回 {len(matched_results)} 条资源。", event="mteam_search_completed", subscription=performer)
+        for item in matched_results:
+            unique_id = str(item.get("id", "") or "")
+            identity = ("id", unique_id) if unique_id else ("candidate", item.get("code", ""), item.get("title", ""))
+            if identity in seen_search_results:
+                continue
+            seen_search_results.add(identity)
+            search_results.append(item)
+    return search_results
+
+
+def process_subscription(subscription, records, settings, downloader, results, refresh_existing_info=False,
+                         local_scan_cache=None, local_task_cache=None, *, on_submission=None, deferred_subtitles=None):
+    if deferred_subtitles is None:
+        deferred_subtitles = []
     if local_task_cache is None:
         local_task_cache = {}
-    keyword = " ".join(part for part in (subscription["performer"], subscription.get("keywords", "")) if part).strip()
+    keywords = subscription_search_keywords(subscription)
+    subscriptions_by_id = {item.get("id"): item for item in list_subscriptions() if item.get("id")}
+    subscriptions_by_id[subscription["id"]] = subscription
     subscription_records = records.setdefault(subscription["id"], {})
     local_dirs = [subscription["download_dir"]]
     local_subscriptions = [subscription]
@@ -6139,15 +7814,18 @@ def process_subscription(subscription, records, settings, downloader, results, r
     scans_by_directory = {}
     log_event(f"开始扫描本地目录，共 {len(local_dirs)} 个。", event="local_scan_started", subscription=subscription["performer"])
     for directory in local_dirs:
+        check_requested_stop()
         cache_key = os.path.realpath(directory)
         if settings.get("cleanup_orphan_sidecars", False):
-            removed_sidecars = cleanup_orphan_sidecars(directory, excluded_dirs=[settings.get("subtitle_collection_dir", "")])
-            if removed_sidecars:
+            removed_sidecars, removed_dirs = cleanup_orphan_sidecars(
+                directory, excluded_dirs=[settings.get("subtitle_collection_dir", "")],
+            )
+            if removed_sidecars or removed_dirs:
                 invalidate_local_scans(directory)
                 if local_scan_cache is not None:
                     local_scan_cache.pop(cache_key, None)
                 log_event(
-                    f"自动清理了 {len(removed_sidecars)} 个没有对应视频的 NFO/字幕文件。",
+                    f"自动清理：孤立配套文件 {len(removed_sidecars)} 个，空目录 {len(removed_dirs)} 个。",
                     event="orphan_sidecars_cleaned",
                     subscription=subscription["performer"],
                 )
@@ -6158,16 +7836,31 @@ def process_subscription(subscription, records, settings, downloader, results, r
             scanned = local_scan_cache[cache_key]
         else:
             scanned = local_scan_cache[cache_key] if local_scan_cache is not None else scan_local_releases(directory)
+        scans_by_directory[cache_key] = scanned
+    search_results = search_subscription_releases(keywords, settings["mteam_token"], subscription["performer"])
+    context = check_context()
+    candidates = best_candidates(search_results)
+    blacklist = set(subscription.get("blacklist", []))
+    blocked_codes = sorted(candidates.keys() & blacklist)
+    candidates = {code: candidate for code, candidate in candidates.items() if code not in blacklist}
+    deferred_details = []
+    for directory in local_dirs:
+        check_requested_stop()
+        cache_key = os.path.realpath(directory)
+        scanned = scans_by_directory[cache_key]
+        if context is not None and cache_key not in context.scans:
+            scanned = scan_local_releases(directory)
         directory_owners = [
             owner for owner in local_subscriptions
             if os.path.realpath(owner.get("download_dir", "")) == cache_key
         ]
+        duplicates = {code for code, items in scanned.items() if len(items) > 1} if settings.get("local_multi_disk_wash") else set()
         for owner in directory_owners:
             owner_records = records.setdefault(owner["id"], {})
-            bind_missing_local_mteam_ids(owner, scanned, owner_records, downloader, local_task_cache, settings)
+            bind_missing_local_mteam_ids(owner, scanned, owner_records, downloader, local_task_cache, settings,
+                                         priority_codes=candidates.keys() | duplicates, deferred_details=deferred_details)
         if settings.get("local_multi_disk_wash", False):
-            has_duplicates = any(len(items) > 1 for items in scanned.values())
-            if has_duplicates:
+            if duplicates:
                 directory_records = [
                     records.get(owner["id"], {}) for owner in directory_owners
                 ]
@@ -6175,7 +7868,7 @@ def process_subscription(subscription, records, settings, downloader, results, r
                     scanned, directory_records, settings.get("mteam_token", ""),
                     subscription["performer"], refresh_existing_info,
                 )
-            tasks = check_task_snapshot(downloader, local_task_cache) if has_duplicates else None
+            tasks = check_task_snapshot(downloader, local_task_cache) if duplicates else None
             scanned = wash_local_duplicate_releases(
                 directory, scanned, subscription["performer"], downloader,
                 tasks, records,
@@ -6187,9 +7880,6 @@ def process_subscription(subscription, records, settings, downloader, results, r
             local_releases.setdefault(code, []).extend(items)
     log_event(f"本地扫描完成，识别到 {sum(len(items) for items in local_releases.values())} 个视频、{len(local_releases)} 个番号。", event="local_scan_completed", subscription=subscription["performer"])
     refresh_codes = set(subscription_records) | set(local_releases)
-    log_event("正在请求 M-Team 搜索结果。", event="mteam_search_started", subscription=subscription["performer"])
-    search_results = mteam_search(keyword, settings["mteam_token"])
-    log_event(f"M-Team 搜索返回 {len(search_results)} 条资源。", event="mteam_search_completed", subscription=subscription["performer"])
     tracked_codes = set(subscription_records) | set(local_releases)
     search_by_code = {}
     for item in search_results:
@@ -6199,33 +7889,28 @@ def process_subscription(subscription, records, settings, downloader, results, r
         if not hits:
             log_debug(settings, f"{code} 搜索诊断：此番号存在本地文件或订阅记录，但 M-Team 本轮搜索没有返回该番号候选。", subscription["performer"])
             continue
-        summaries = [
-            f"ID {item.get('id', '?')} rank={tuple(item.get('rank', []))} complete={item.get('metadata_complete')} title={item.get('title', '')[:90]}"
-            for item in hits
-        ]
-        log_debug(settings, f"{code} 搜索诊断：返回 {len(hits)} 个候选；" + " | ".join(summaries), subscription["performer"])
-    candidates = best_candidates(search_results)
-    log_debug(settings, f"搜索词“{keyword}”解析出 {len(candidates)} 个番号：{', '.join(sorted(candidates)) or '无'}。", subscription["performer"])
+        summaries = "\n".join(describe_search_candidate(item, index) for index, item in enumerate(hits, 1))
+        log_debug(settings, f"{code} 搜索诊断：找到 {len(hits)} 个候选。\n{summaries}", subscription["performer"])
+    log_debug(settings, f"搜索词“{'；'.join(keywords)}”合并解析出 {len(candidates)} 个番号：{', '.join(sorted(candidates)) or '无'}。", subscription["performer"])
     for code in sorted(set(candidates) & tracked_codes):
+        check_requested_stop()
         chosen = candidates[code]
-        log_debug(settings, f"{code} 候选选择：采用 M-Team ID {chosen.get('id', '?')}，rank={tuple(chosen.get('rank', []))}，metadata_complete={chosen.get('metadata_complete')}。", subscription["performer"])
-    blacklist = set(subscription.get("blacklist", []))
-    blocked_codes = sorted(set(candidates) & blacklist)
+        log_debug(settings, f"{code} 候选选择：{describe_search_candidate(chosen)}。", subscription["performer"])
     if blocked_codes:
         log_debug(settings, f"黑名单过滤番号：{', '.join(blocked_codes)}。", subscription["performer"])
-    candidates = {code: candidate for code, candidate in candidates.items() if code not in blacklist}
     refreshed_existing = {}
-    for code in refresh_codes:
+    def refresh_local_rank(code):
+        check_requested_stop()
         record = subscription_records.get(code)
         if not record:
-            continue
+            return
         saved = record.get("mteam_metadata") or {}
         current = record.get("current") or {}
         identifier = saved.get("id") or current.get("id")
         current_rank = current.get("rank", saved.get("rank", [0, 0, 0]))
         needs_rank_lookup = wash_rank(current_rank) == (0, 0)
         if not identifier or not str(identifier).isdigit() or not (refresh_existing_info or needs_rank_lookup):
-            continue
+            return
         seed = {
             "id": str(identifier), "code": code,
             "title": saved.get("title") or current.get("title") or code,
@@ -6242,19 +7927,36 @@ def process_subscription(subscription, records, settings, downloader, results, r
                 current["resolution"] = refreshed.get("resolution", current.get("resolution", ""))
                 current["video_codec"] = refreshed.get("video_codec", current.get("video_codec", ""))
             refreshed_existing[code] = refreshed
-        except MTeamRateLimitError:
+        except (MTeamRateLimitError, MTeamRequestInterrupted):
             raise
         except AppError:
-            continue
+            return
+    candidate_generation = context.generation if context is not None else 0
+    excluded_language = 0
     for code, candidate in candidates.items():
+        check_requested_stop()
+        if context is not None and context.generation != candidate_generation:
+            for directory in local_dirs:
+                scans_by_directory[os.path.realpath(directory)] = scan_local_releases(directory)
+            local_releases.clear()
+            for scanned in scans_by_directory.values():
+                for local_code, items in scanned.items():
+                    local_releases.setdefault(local_code, []).extend(items)
+            candidate_generation = context.generation
+        if subscription.get("exclude_non_chinese", True):
+            chosen = select_chinese_candidate(search_by_code[code], settings["mteam_token"])
+            if chosen is None:
+                excluded_language += 1
+                log_debug(settings, f"跳过 {code}：搜索结果未确认有中文版本。", subscription["performer"])
+                continue
+            candidate = candidates[code] = chosen
+        if code in refresh_codes:
+            refresh_local_rank(code)
         record = subscription_records.get(code)
-        local_snapshot = "; ".join(
-            f"{Path(item['path']).name} [ID={item.get('mteam_id') or '未绑定'}, rank={tuple(item.get('rank', []))}, source={item.get('rank_source', 'NFO/MediaInfo')}]"
-            for item in local_releases.get(code, [])
-        ) or "无"
-        current_snapshot = record.get("current") or {} if record else {}
-        pending_snapshot = record.get("pending") or {} if record else {}
-        log_debug(settings, f"{code} 候选开始：M-Team ID {candidate.get('id', '未知')} rank={tuple(candidate.get('rank', []))} complete={candidate.get('metadata_complete')}；本地=[{local_snapshot}]；current=ID {current_snapshot.get('id') or '无'} rank={tuple(current_snapshot.get('rank', []))} state={current_snapshot.get('state', '无')}；pending=ID {pending_snapshot.get('id') or '无'} rank={tuple(pending_snapshot.get('rank', []))} state={pending_snapshot.get('state', '无')}。", subscription["performer"])
+        if record:
+            record.pop("shared_local", None)
+        if settings.get("debug_mode"):
+            log_debug(settings, describe_candidate_check(code, candidate, local_releases.get(code, []), record), subscription["performer"])
         saved_metadata = (record or {}).get("mteam_metadata") or {}
         saved_complete = metadata_is_complete(saved_metadata)
         same_saved_id = bool(saved_metadata.get("id")) and str(saved_metadata.get("id", "")) == str(candidate.get("id", ""))
@@ -6267,7 +7969,7 @@ def process_subscription(subscription, records, settings, downloader, results, r
         if already_refreshed:
             candidate = cached_refresh
             candidates[code] = candidate
-        elif force_refresh or (candidate.get("metadata_complete") is False and not same_saved_candidate):
+        elif force_refresh or (candidate.get("metadata_complete") is False and not same_saved_candidate and "_mteam_detail" not in candidate):
             try:
                 candidate = enrich_candidate_from_detail(candidate, settings["mteam_token"])
                 candidates[code] = candidate
@@ -6279,7 +7981,16 @@ def process_subscription(subscription, records, settings, downloader, results, r
         elif same_saved_candidate:
             saved_rank = tuple(saved_metadata.get("rank", [0, 0, 0]))
             search_rank = tuple(candidate.get("rank", [0, 0, 0]))
-            if search_rank != saved_rank:
+            verification = record.get("rank_verification") or {}
+            verification_key = [str(candidate["id"]), subscription["performer"], list(search_rank), list(saved_rank)]
+            verified_at = verification.get("checked_at", 0)
+            reuse_verified = (
+                search_rank != saved_rank
+                and verification.get("key") == verification_key
+                and isinstance(verified_at, (int, float))
+                and 0 <= time.time() - verified_at < MTEAM_RANK_RECHECK_SECONDS
+            )
+            if search_rank != saved_rank and not reuse_verified:
                 log_debug(settings, f"{code} 的 M-Team ID {candidate['id']} 搜索分级 {search_rank} 与缓存 {saved_rank} 不一致，强制核对详情 MediaInfo。", subscription["performer"])
                 try:
                     detail = mteam_detail(candidate["id"], settings["mteam_token"], force_refresh=True)
@@ -6290,6 +8001,9 @@ def process_subscription(subscription, records, settings, downloader, results, r
                     refreshed = True
                     rank_mismatch_refreshed = True
                     record["mteam_metadata"] = candidate_metadata(candidate)
+                    if metadata_is_complete(record["mteam_metadata"]):
+                        verification_key[-1] = list(candidate["rank"])
+                        record["rank_verification"] = {"key": verification_key, "checked_at": time.time()}
                     for tracked in (record.get("pending"), record.get("current")):
                         if tracked and str(tracked.get("id", "")) == str(candidate.get("id", "")):
                             tracked["rank"] = list(candidate["rank"])
@@ -6301,6 +8015,8 @@ def process_subscription(subscription, records, settings, downloader, results, r
                     log_event(f"{code} 同一 M-Team ID 的缓存分级与搜索分级不一致，详情核对失败，保留现有版本：{error}", level="warning", event="rank_mismatch_detail_failed", subscription=subscription["performer"])
                     continue
             else:
+                if reuse_verified:
+                    performance_count("rank_recheck_hits")
                 candidate = {
                     **candidate,
                     "rank": saved_metadata.get("rank", candidate["rank"]),
@@ -6317,7 +8033,7 @@ def process_subscription(subscription, records, settings, downloader, results, r
                     tracked["video_codec"] = candidate.get("video_codec", tracked.get("video_codec", ""))
         if local_releases.get(code) and (record is None or (not record.get("current") and not record.get("pending"))):
             found = local_releases[code]
-            best_local = max(found, key=lambda item: tuple(item["rank"]))
+            best_local = max(found, key=lambda item: local_wash_rank(item["rank"]))
             current = record_state({
                 "id": "", "code": code, "title": best_local["title"], "rank": best_local["rank"],
                 "hash": "", "owns_task": False, "local_existing": True,
@@ -6329,7 +8045,7 @@ def process_subscription(subscription, records, settings, downloader, results, r
         if record and (record.get("current") or {}).get("local_existing"):
             local_items = local_releases.get(code, [])
             if local_items:
-                best_local = max(local_items, key=lambda item: tuple(item["rank"]))
+                best_local = max(local_items, key=lambda item: local_wash_rank(item["rank"]))
                 record["current"].update({
                     "title": best_local["title"], "rank": best_local["rank"],
                     "local_paths": [item["path"] for item in local_items],
@@ -6348,73 +8064,103 @@ def process_subscription(subscription, records, settings, downloader, results, r
             apply_local_file_mteam_ranks(code, local_releases[code], path_record_sources)
             current_local = record.get("current") or {}
             if current_local.get("local_existing") and local_releases[code]:
-                best_local = max(local_releases[code], key=lambda item: tuple(item["rank"]))
+                best_local = max(local_releases[code], key=lambda item: local_wash_rank(item["rank"]))
                 current_local["rank"] = list(best_local["rank"])
                 current_local["title"] = best_local["title"]
         if record and not record.get("pending") and (record.get("current") or {}).get("state") == "missing":
             record.pop("current", None)
             record.pop("last_error", None)
             record.pop("retry_after", None)
-        if (record is None or record.get("current") is None) and not local_releases.get(code):
-            shared = find_indexed_local_release(code, subscription["id"], subscription["download_dir"])
-            if shared:
-                try:
-                    detail = candidate.get("_mteam_detail") or mteam_detail(candidate["id"], settings["mteam_token"])
-                    if not detail_contains_performer(detail, subscription["performer"]):
-                        raise PerformerMismatchError(f"M-Team 详情中未找到女优关键字“{subscription['performer']}”，已跳过 {code}。")
-                    linked = link_local_release_to_subscription(shared["path"], subscription["download_dir"], code)
-                    own_scan_key = os.path.realpath(subscription["download_dir"])
-                    refreshed_local = scan_local_releases(subscription["download_dir"])
-                    if local_scan_cache is not None:
-                        local_scan_cache[own_scan_key] = refreshed_local
-                    scans_by_directory[own_scan_key] = refreshed_local
-                    linked_items = refreshed_local.get(code, [])
-                    if not linked_items:
-                        raise AppError("影片已创建链接，但无法从目标目录识别其番号。")
-                    best_local = max(linked_items, key=lambda item: tuple(item["rank"]))
-                    current = record_state({
-                        "id": "", "code": code, "title": best_local["title"], "rank": best_local["rank"],
-                        "hash": "", "owns_task": False, "local_existing": True,
-                        "local_paths": [item["path"] for item in linked_items],
-                        "download_dir": subscription["download_dir"], "progress": 100,
-                    }, "completed", "该番号已存在于其他订阅，已复用本地影片并跳过下载。")
-                    record = record or {"code": code}
-                    record["current"] = current
-                    record["shared_local"] = True
-                    record.pop("last_error", None)
-                    record.pop("retry_after", None)
-                    subscription_records[code] = record
-                    results.append({
-                        "subscription": subscription["performer"], "code": code,
-                        "title": candidate["title"], "state": "completed",
-                        "message": "该番号已存在于其他订阅，已复用本地影片并跳过下载。",
-                    })
-                    continue
-                except PerformerMismatchError as error:
-                    results.append({"subscription": subscription["performer"], "code": code, "title": candidate["title"], "state": "skipped", "message": str(error)})
-                    continue
-                except MTeamRateLimitError:
-                    raise
-                except AppError as error:
-                    record = record or {"code": code}
-                    record["last_error"] = str(error)
-                    record["retry_after"] = time.time() + 3600
-                    subscription_records[code] = record
-                    results.append({"subscription": subscription["performer"], "code": code, "title": candidate["title"], "state": "failed", "message": str(error)})
-                    continue
-        if record is not None:
-            if not record.get("shared_local") and code not in refreshed_existing and ((force_refresh and refreshed) or (not saved_complete and (not saved_metadata or same_saved_id))):
-                record["mteam_metadata"] = candidate_metadata(candidate)
-        if record and record.get("shared_local") and (record.get("current") or {}).get("local_existing"):
-            log_debug(settings, f"跳过 {code}：已复用其他订阅的本地影片。", subscription["performer"])
-            results.append({"subscription": subscription["performer"], "code": code, "title": candidate["title"], "state": "completed", "message": "该番号已复用其他订阅的本地影片，跳过重复下载。"})
+        if not allows_subscription_language(subscription, candidate):
+            excluded_language += 1
+            log_debug(settings, f"跳过 {code}：核对后未确认有中文版本。", subscription["performer"])
             continue
+        indexed_siblings = find_indexed_local_releases(code, subscription["id"])
+        coappearance_releases = []
+        if indexed_siblings:
+            try:
+                detail = candidate.get("_mteam_detail") or mteam_detail(candidate["id"], settings["mteam_token"])
+                shared_rank = list(candidate["rank"])
+                shared_rank[1] = verified_candidate_language(candidate, detail)
+                for sibling in indexed_siblings:
+                    owner = subscriptions_by_id.get(sibling["subscription_id"])
+                    if (owner and allows_subscription_language(owner, {"rank": shared_rank})
+                            and detail_contains_performer(detail, owner.get("performer", ""))):
+                        coappearance_releases.append({**sibling, "download_dir": owner["download_dir"]})
+            except MTeamRateLimitError:
+                raise
+            except AppError as error:
+                log_event(f"{code} 共演订阅版本核验失败，暂不纳入跨订阅洗版：{error}", level="warning", event="coappearance_rank_check_failed", subscription=subscription["performer"])
+        eligible_shared = [item for item in coappearance_releases if allows_subscription_language(subscription, item)]
+        if eligible_shared and not local_releases.get(code) and (record is None or record.get("current") is None):
+            shared = max(eligible_shared, key=lambda item: (local_wash_rank(item["rank"]), item["mtime_ns"]))
+            try:
+                link_local_release_to_subscription(shared["path"], subscription["download_dir"], code)
+                own_scan_key = os.path.realpath(subscription["download_dir"])
+                refreshed_local = scan_local_releases(subscription["download_dir"])
+                if local_scan_cache is not None:
+                    local_scan_cache[own_scan_key] = refreshed_local
+                scans_by_directory[own_scan_key] = refreshed_local
+                local_releases[code] = refreshed_local.get(code, [])
+                if not local_releases[code]:
+                    raise AppError("影片已创建链接，但无法从目标目录识别其番号。")
+                best_local = max(local_releases[code], key=lambda item: local_wash_rank(item["rank"]))
+                record = record or {"code": code}
+                record["current"] = record_state({
+                    "id": "", "code": code, "title": best_local["title"], "rank": best_local["rank"],
+                    "hash": "", "owns_task": False, "local_existing": True,
+                    "local_paths": [item["path"] for item in local_releases[code]],
+                    "download_dir": subscription["download_dir"], "progress": 100,
+                }, "completed", "已复用其他订阅的共演影片，参与跨订阅洗版比较。")
+                subscription_records[code] = record
+            except AppError as error:
+                log_event(f"{code} 无法复用共演订阅中的本地影片：{error}", level="warning", event="coappearance_link_failed", subscription=subscription["performer"])
+        if record and (record.get("current") or {}).get("local_existing") and coappearance_releases:
+            current_local = record["current"]
+            all_local_paths = list(dict.fromkeys([
+                *current_local.get("local_paths", []),
+                *(item["path"] for item in coappearance_releases),
+            ]))
+            roots = list(dict.fromkeys([
+                *current_local.get("local_roots", [subscription["download_dir"]]),
+                *(item["download_dir"] for item in coappearance_releases),
+            ]))
+            current_local["local_paths"] = all_local_paths
+            current_local["local_roots"] = roots
+            current_local["shared_subscription_ids"] = list(dict.fromkeys(item["subscription_id"] for item in coappearance_releases))
+            best_shared = max(coappearance_releases, key=lambda item: (local_wash_rank(item["rank"]), item["mtime_ns"]))
+            if local_wash_rank(best_shared["rank"]) > local_wash_rank(current_local.get("rank")):
+                current_local["rank"] = list(best_shared["rank"])
+                current_local["title"] = candidate["title"]
+        coappearance_ids = {item["subscription_id"] for item in coappearance_releases}
+        shared_pending = next((
+            other_record.get("pending")
+            for owner_id, subscription_items in records.items()
+            if owner_id in coappearance_ids and owner_id != subscription["id"]
+            for other_record in [subscription_items.get(code, {})]
+            if other_record.get("pending")
+            and str(other_record["pending"].get("id", "")) == str(candidate.get("id", ""))
+            and allows_subscription_language(subscription, other_record["pending"])
+        ), None)
+        if shared_pending:
+            shared_pending_ids = set(shared_pending.get("shared_subscription_ids") or [])
+            shared_pending_ids.add(subscription["id"])
+            shared_pending["shared_subscription_ids"] = sorted(shared_pending_ids)
+            message = "共演订阅已在下载此版本；完成后会同步硬链接到当前目录。"
+            log_event(f"{code} {message}", event="coappearance_upgrade_reused", subscription=subscription["performer"])
+            results.append({"subscription": subscription["performer"], "code": code, "title": candidate["title"], "state": "upgrading", "message": message})
+            continue
+        if record is not None:
+            if code not in refreshed_existing and ((force_refresh and refreshed) or (not saved_complete and (not saved_metadata or same_saved_id))):
+                record["mteam_metadata"] = candidate_metadata(candidate)
         if record is None:
             try:
                 pending = submit_candidate(subscription, candidate, settings["mteam_token"], downloader, None)
                 subscription_records[code] = {"code": code, "current": pending, "mteam_metadata": candidate_metadata(pending)}
+                if on_submission:
+                    on_submission()
                 results.append({"subscription": subscription["performer"], "code": code, "title": candidate["title"], "state": "downloading", "message": pending.get("message", "已提交到下载器。")})
-            except PerformerMismatchError as error:
+            except (PerformerMismatchError, NonChineseCandidateError) as error:
                 results.append({"subscription": subscription["performer"], "code": code, "title": candidate["title"], "state": "skipped", "message": str(error)})
             except MTeamRateLimitError:
                 raise
@@ -6427,7 +8173,7 @@ def process_subscription(subscription, records, settings, downloader, results, r
             pending = record["pending"]
             if str(candidate.get("id", "")) == str(pending.get("id", "")):
                 log_debug(settings, f"跳过 {code}：相同 M-Team ID 已在待下载/洗版任务中跟踪。", subscription["performer"])
-                if tuple(candidate["rank"]) > tuple(pending.get("rank", [0, 0, 0])):
+                if local_wash_rank(candidate["rank"]) > local_wash_rank(pending.get("rank")):
                     pending["rank"] = list(candidate["rank"])
                     pending["resolution"] = candidate.get("resolution", pending.get("resolution", ""))
                     pending["video_codec"] = candidate.get("video_codec", pending.get("video_codec", ""))
@@ -6437,14 +8183,21 @@ def process_subscription(subscription, records, settings, downloader, results, r
                 reason = upgrade_reason(pending["rank"], candidate["rank"])
                 replacement = None
                 try:
-                    replacement = submit_candidate(subscription, candidate, settings["mteam_token"], downloader, record)
+                    replacement = submit_candidate(
+                        subscription, candidate, settings["mteam_token"], downloader, record,
+                        minimum_grade=wash_rank(pending["rank"]),
+                    )
                     if replacement.get("hash") != pending.get("hash"):
                         downloader.remove(pending["hash"], True)
                     record["pending"] = replacement
+                    if coappearance_releases:
+                        record["pending"]["shared_subscription_ids"] = list(dict.fromkeys(item["subscription_id"] for item in coappearance_releases))
                     record["pending"]["upgrade_reason"] = reason
                     record["pending"]["message"] = f"发现更高优先级版本（{reason}），已替换待下载版本。"
+                    if on_submission:
+                        on_submission()
                     results.append({"subscription": subscription["performer"], "code": code, "title": candidate["title"], "state": "upgrading", "message": record["pending"]["message"]})
-                except PerformerMismatchError as error:
+                except (PerformerMismatchError, NonChineseCandidateError) as error:
                     results.append({"subscription": subscription["performer"], "code": code, "title": candidate["title"], "state": "skipped", "message": str(error)})
                 except MTeamRateLimitError:
                     raise
@@ -6465,7 +8218,9 @@ def process_subscription(subscription, records, settings, downloader, results, r
                 record["current"] = submit_candidate(subscription, candidate, settings["mteam_token"], downloader, record)
                 record.pop("last_error", None)
                 record.pop("retry_after", None)
-            except PerformerMismatchError as error:
+                if on_submission:
+                    on_submission()
+            except (PerformerMismatchError, NonChineseCandidateError) as error:
                 results.append({"subscription": subscription["performer"], "code": code, "title": candidate["title"], "state": "skipped", "message": str(error)})
             except MTeamRateLimitError:
                 raise
@@ -6507,24 +8262,46 @@ def process_subscription(subscription, records, settings, downloader, results, r
         if same_tracked_id:
             log_debug(settings, f"{code} 的记录 ID {candidate_id} 对应文件已不存在，改按本地现存版本等级比较。", subscription["performer"])
         current_rank = tuple(current.get("rank", [0, 0, 0]))
-        local_rank = max((tuple(item["rank"]) for item in local_items), default=(0, 0, 0))
+        best_local = max(local_items, key=lambda item: local_wash_rank(item["rank"]), default=None)
+        local_rank = tuple(best_local["rank"]) if best_local else (0, 0, 0)
+        reference = "当前记录"
+        reference_id = current.get("id")
         if local_items and candidate_id not in installed_ids and any(item.get("mteam_id") for item in local_items):
             current_rank = local_rank
+            reference, reference_id = "本地版本", best_local.get("mteam_id")
         elif wash_rank(local_rank) > wash_rank(current_rank):
             current["rank"] = list(local_rank)
             current_rank = local_rank
-        log_debug(settings, f"{code} 洗版比较：candidate ID={candidate_id or '无'} rank={tuple(candidate.get('rank', []))}；本地 ID=[{','.join(sorted(installed_ids)) or '无'}] rank={local_rank}；当前记录 rank={current_rank}；比较维度={wash_rank(candidate.get('rank'))} 对 {wash_rank(current_rank)}；wash_enabled={bool(subscription.get('wash_enabled', True))}。", subscription["performer"])
-        if wash_rank(current_rank) == (0, 0):
+            reference, reference_id = "本地版本", best_local.get("mteam_id")
+        elif best_local and current.get("local_existing") and current_rank == local_rank:
+            reference, reference_id = "本地版本", best_local.get("mteam_id")
+        candidate_grade = wash_rank(candidate["rank"])
+        reference_grade = wash_rank(current_rank)
+
+        def log_wash_decision(decision):
+            if not settings.get("debug_mode"):
+                return
+            candidate_description = describe_version_rank(candidate["rank"])
+            reference_description = describe_version_rank(current_rank)
+            if candidate_id:
+                candidate_description += f"（M-Team ID {candidate_id}）"
+            if reference_id:
+                reference_description += f"（M-Team ID {reference_id}）"
+            log_debug(settings, f"{code} 洗版判断 · {decision}\n候选版本 · {candidate_description}\n{reference} · {reference_description}",
+                      subscription["performer"])
+
+        if reference_grade == (0, 0):
             can_replace_unknown_local = (
                 current.get("local_existing")
                 and subscription.get("wash_enabled", True)
-                and wash_rank(candidate["rank"]) > (0, 0)
+                and candidate_grade > (0, 0)
             )
             if not can_replace_unknown_local:
+                log_wash_decision("当前版本等级未知，暂不洗版")
                 results.append({"subscription": subscription["performer"], "code": code, "title": candidate["title"], "state": "upgrade_available", "message": "当前版本等级未知，为避免自动替换成较低版本，已跳过洗版。"})
                 continue
-        if wash_rank(candidate["rank"]) <= wash_rank(current_rank):
-            log_debug(settings, f"跳过 {code}：候选等级 {wash_rank(candidate['rank'])} 未高于当前等级 {wash_rank(current_rank)}。", subscription["performer"])
+        if candidate_grade <= reference_grade:
+            log_wash_decision("分辨率和中文等级相同，无需洗版" if candidate_grade == reference_grade else "候选版本等级较低，保留现有版本")
             if rank_mismatch_refreshed and local_items:
                 candidate_resolution, candidate_language = rank_dimension_labels(candidate["rank"])
                 current_resolution, current_language = rank_dimension_labels(current_rank)
@@ -6535,22 +8312,29 @@ def process_subscription(subscription, records, settings, downloader, results, r
                 })
             continue
         if not subscription.get("wash_enabled", True):
-            log_debug(settings, f"跳过 {code}：发现更高等级版本，但该订阅已关闭洗版。", subscription["performer"])
+            log_wash_decision("发现更高版本，当前订阅的洗版已关闭")
             results.append({"subscription": subscription["performer"], "code": code, "title": candidate["title"], "state": "upgrade_available", "message": "发现更高优先级版本，洗版当前已关闭。"})
             continue
         if time.time() < record.get("retry_after", 0):
-            log_debug(settings, f"跳过 {code}：洗版任务仍在失败重试冷却期。", subscription["performer"])
+            log_wash_decision("发现更高版本，等待上次失败后的重试")
             continue
         try:
             reason = upgrade_reason(current_rank, candidate["rank"])
-            record["pending"] = submit_candidate(subscription, candidate, settings["mteam_token"], downloader, record)
+            log_wash_decision(f"准备提交更高版本（{reason}）")
+            record["pending"] = submit_candidate(
+                subscription, candidate, settings["mteam_token"], downloader, record, minimum_grade=reference_grade,
+            )
+            if coappearance_releases:
+                record["pending"]["shared_subscription_ids"] = list(dict.fromkeys(item["subscription_id"] for item in coappearance_releases))
             record.pop("retry_after", None)
             record.pop("last_error", None)
             record["pending"]["state"] = "upgrading"
             record["pending"]["upgrade_reason"] = reason
             record["pending"]["message"] = f"洗版原因：{reason}。更高优先级版本正在下载；完成后将清理旧版。"
+            if on_submission:
+                on_submission()
             results.append({"subscription": subscription["performer"], "code": code, "title": candidate["title"], "state": "upgrading", "message": record["pending"]["message"]})
-        except PerformerMismatchError as error:
+        except (PerformerMismatchError, NonChineseCandidateError) as error:
             results.append({"subscription": subscription["performer"], "code": code, "title": candidate["title"], "state": "skipped", "message": str(error)})
         except MTeamRateLimitError:
             raise
@@ -6558,6 +8342,12 @@ def process_subscription(subscription, records, settings, downloader, results, r
             record["last_error"] = str(error)
             record["retry_after"] = time.time() + 3600
             results.append({"subscription": subscription["performer"], "code": code, "title": candidate["title"], "state": "failed", "message": str(error)})
+    if excluded_language:
+        log_event(f"排除非中文影片：跳过 {excluded_language} 个未确认有中文版本的番号。",
+                  event="non_chinese_filtered", subscription=subscription["performer"])
+    refresh_bound_local_details(deferred_details, settings["mteam_token"], subscription["performer"])
+    for code in sorted(refresh_codes - candidates.keys()):
+        refresh_local_rank(code)
     existing_upgrade_records = {
         code: record for code, record in subscription_records.items()
         if record.get("pending")
@@ -6572,7 +8362,7 @@ def process_subscription(subscription, records, settings, downloader, results, r
         )
         poll_downloader_records(
             downloader, existing_upgrade_records, immediate_results, records,
-            subscription["performer"], settings["mteam_token"],
+            subscription["performer"], settings["mteam_token"], deferred_subtitles=deferred_subtitles,
         )
         for updated in immediate_results:
             previous = next((item for item in reversed(results)
@@ -6586,57 +8376,52 @@ def process_subscription(subscription, records, settings, downloader, results, r
         log_event("已有洗版任务状态已核对。", event="downloader_sync_completed", subscription=subscription["performer"])
 
     own_scan_key = os.path.realpath(subscription["download_dir"])
+    for args in deferred_subtitles:
+        check_requested_stop()
+        _download_release_subtitles(*args)
     own_local_releases = scans_by_directory.get(own_scan_key, {})
+    context = check_context()
+    if context is not None and own_scan_key not in context.scans:
+        own_local_releases = scan_local_releases(subscription["download_dir"])
     for code, items in own_local_releases.items():
+        check_requested_stop()
         record = subscription_records.get(code)
         if record:
             _download_existing_local_subtitles(code, items, record, settings["mteam_token"], subscription["performer"])
-    context = check_context()
     if context is not None and own_scan_key not in context.scans:
         own_local_releases = scan_local_releases(subscription["download_dir"])
     rows = index_subscription_videos(subscription["id"], own_local_releases, subscription_records)
     collect_subscription_subtitles(rows, settings.get("subtitle_collection_dir", ""), subscription["performer"])
+    if rows:
+        log_event("正在同步本地封面、截图和 NFO。", event="local_artwork_sync_started", subscription=subscription["performer"])
     sync_subscription_covers(subscription, rows, records, settings)
 
 
-def _run_poll_once(trigger, subscription_id="", refresh_existing_info=False, completed_subscription_ids=None):
+def _run_poll_once(status):
     previous_context = check_context()
     previous_downloader = getattr(MTEAM_POLL_CACHE, "downloader", None)
     MTEAM_POLL_CACHE.execution = CheckContext()
     try:
-        return _run_poll_once_impl(trigger, subscription_id, refresh_existing_info, completed_subscription_ids)
+        return _run_poll_once_impl(status)
     finally:
         MTEAM_POLL_CACHE.execution = previous_context
         MTEAM_POLL_CACHE.downloader = previous_downloader
 
 
-def _run_poll_once_impl(trigger, subscription_id="", refresh_existing_info=False, completed_subscription_ids=None):
+def _run_poll_once_impl(status):
     MTEAM_POLL_CACHE.active = {"details": {}, "options": {}}
-    if not SCHEDULE_FILE.exists():
-        legacy_last_run = scheduler_last_run()
-        if legacy_last_run:
-            legacy_time = datetime.datetime.fromtimestamp(legacy_last_run, datetime.timezone.utc).isoformat(timespec="seconds")
-            write_json(SCHEDULE_FILE, {"last_run_at": legacy_time})
-    try:
-        read_json(STATUS_FILE, {})
-    except AppError as error:
-        status = {"state": "failed", "trigger": trigger, "started_at": now_iso(), "completed_at": now_iso(), "last_scan_at": "", "results": [], "message": str(error)}
-        write_json(STATUS_FILE, status)
-        log_event(str(error), level="error", event="failed")
-        MTEAM_POLL_CACHE.active = None
-        MTEAM_POLL_CACHE.performer = ""
-        return status
-    status = {"state": "running", "trigger": trigger, "subscription_id": subscription_id, "refresh_existing_info": bool(refresh_existing_info), "started_at": now_iso(), "completed_at": "", "last_scan_at": "", "results": [], "message": "正在检查 M-Team 订阅。"}
-    write_json(STATUS_FILE, status)
-    log_event("开始检查订阅。", event="started")
+    trigger = status["trigger"]
+    subscription_id = status["subscription_id"]
+    refresh_existing_info = status["refresh_existing_info"]
     settings = {}
     subscriptions = []
     records = {}
     local_scan_cache = {}
     local_task_cache = {}
-    completed_subscription_ids = set(completed_subscription_ids or ())
+    completed_subscription_ids = set(status["completed_subscription_ids"])
     MTEAM_POLL_CACHE.completed_subscription_ids = completed_subscription_ids
     try:
+        check_requested_stop()
         settings = get_settings()
         subscriptions = list_subscriptions()
         if subscription_id:
@@ -6655,10 +8440,6 @@ def _run_poll_once_impl(trigger, subscription_id="", refresh_existing_info=False
                 for item in subscription_records.values():
                     if item.get("last_error"):
                         item.pop("retry_after", None)
-        cooldown = read_json(MTEAM_LIMIT_FILE, {})
-        remaining = int(cooldown.get("retry_at", 0) - time.time())
-        if remaining > 0:
-            raise MTeamRateLimitError(f"M-Team 限流冷却中，约 {remaining} 秒后可重试。", remaining)
         if not settings.get("mteam_token"):
             raise AppError("请先配置 M-Team 存取令牌。")
         if not subscriptions:
@@ -6681,11 +8462,18 @@ def _run_poll_once_impl(trigger, subscription_id="", refresh_existing_info=False
             context.metrics = {}
             context.stages = {}
             context.wait_seconds = 0.0
+            context.pace_seconds = 0.0
+            subscription_started = time.perf_counter()
             MTEAM_POLL_CACHE.performer = subscription["performer"]
+            check_requested_stop()
             log_event("开始搜索。", event="subscription_started", subscription=subscription["performer"])
+            first_result = len(status["results"])
             try:
                 if hasattr(downloader, "progress_callback"):
                     downloader.progress_callback = lambda message, event, performer=subscription["performer"]: log_event(message, event=event, subscription=performer)
+                if Path(subscription["download_dir"]).is_dir():
+                    videos = scan_local_releases(subscription["download_dir"])
+                    archive_subscription_videos(subscription, videos, downloader, local_task_cache, records)
                 subscription_records = records.get(subscription["id"], {})
                 for item in subscription_records.values():
                     for release in (item.get("pending"), item.get("current")):
@@ -6698,48 +8486,64 @@ def _run_poll_once_impl(trigger, subscription_id="", refresh_existing_info=False
                     if release and release.get("hash") and release.get("state") not in ("completed", "failed", "superseded")
                 }
                 log_event(f"正在同步下载器任务状态（{len(tracked_hashes)} 个活动任务）。", event="downloader_sync_started", subscription=subscription["performer"])
-                poll_downloader_records(downloader, subscription_records, status["results"], records, subscription["performer"], settings["mteam_token"])
+                deferred_subtitles = []
+                poll_downloader_records(downloader, subscription_records, status["results"], records, subscription["performer"],
+                                        settings["mteam_token"], deferred_subtitles=deferred_subtitles)
                 log_event("下载器任务状态同步完成。", event="downloader_sync_completed", subscription=subscription["performer"])
-                first_result = len(status["results"])
-                process_subscription(subscription, records, settings, downloader, status["results"], refresh_existing_info, local_scan_cache, local_task_cache)
-                for item in status["results"][first_result:]:
+                first_release_result = len(status["results"])
+                submission_count = 0
+
+                def save_submission():
+                    nonlocal submission_count
+                    submission_count += 1
+                    if "first_submission" not in context.stages:
+                        context.stages["first_submission"] = max(0, time.perf_counter() - subscription_started - context.wait_seconds)
+                    write_json(RECORDS_FILE, records)
+
+                process_subscription(
+                    subscription, records, settings, downloader, status["results"], refresh_existing_info,
+                    local_scan_cache, local_task_cache, on_submission=save_submission, deferred_subtitles=deferred_subtitles,
+                )
+                for item in status["results"][first_release_result:]:
                     detail = " ".join(part for part in (item.get("code", ""), item.get("state", ""), item.get("title", ""), item.get("message", "")) if part)
                     log_event(detail or "订阅处理完成。", level="error" if item.get("state") in ("failed", "missing", "copy_failed", "cleanup_failed") else "info", event="release", subscription=subscription["performer"])
-                write_json(RECORDS_FILE, records)
-                log_event("订阅检查完成。", event="subscription_completed", subscription=subscription["performer"])
-                completed_subscription_ids.add(subscription["id"])
-            except MTeamRequestInterrupted as error:
-                write_json(RECORDS_FILE, records)
-                status["results"].append({"subscription": subscription["performer"], "state": "interrupted", "message": str(error)})
-                status["state"] = "failed"
-                status["message"] = str(error)
-                log_event(str(error), level="warning", event="request_interrupted", subscription=subscription["performer"])
-                break
-            except MTeamRateLimitError as error:
-                previous_limit = read_json(MTEAM_LIMIT_FILE, {})
-                consecutive, retry_after = rate_limit_retry_delay(error, previous_limit)
-                write_json(MTEAM_LIMIT_FILE, {"retry_at": time.time() + retry_after, "retry_after": retry_after, "consecutive_rate_limits": consecutive, "message": str(error), "trigger": trigger, "subscription_id": subscription_id, "limited_performer": subscription["performer"], "refresh_existing_info": bool(refresh_existing_info), "completed_subscription_ids": sorted(completed_subscription_ids), "round_id": getattr(MTEAM_POLL_CACHE, "round_id", "")})
-                write_json(RECORDS_FILE, records)
-                status["results"].append({"subscription": subscription["performer"], "state": "failed", "message": str(error)})
-                status["state"] = "failed"
-                status["message"] = f"{error} 连续第 {consecutive} 次限流，{retry_after} 秒后继续。"
-                log_event(status["message"], level="error", event="rate_limited", subscription=subscription["performer"])
-                break
+                states = [item.get("state") for item in status["results"][first_release_result:]]
+                log_event(
+                    f"订阅检查完成。登记下载或洗版 {submission_count} 项，"
+                    f"跳过 {states.count('skipped')} 项，失败 {states.count('failed')} 项。",
+                    event="subscription_completed", subscription=subscription["performer"],
+                )
+            except (MTeamRateLimitError, MTeamRequestInterrupted, CheckStopped):
+                if not check_stop_requested():
+                    del status["results"][first_result:]
+                raise
             except AppError as error:
                 status["results"].append({"subscription": subscription["performer"], "state": "failed", "message": str(error)})
                 log_event(str(error), level="error", event="subscription_failed", subscription=subscription["performer"])
             finally:
+                write_json(RECORDS_FILE, records)
                 context.report(settings, subscription["performer"])
-        if status["state"] != "failed":
-            status["state"] = "completed"
-            status["message"] = f"检查完成，共处理 {len(status['results'])} 条资源状态。"
+            completed_subscription_ids.add(subscription["id"])
+            status["completed_subscription_ids"] = sorted(completed_subscription_ids)
+            write_json(STATUS_FILE, status)
+        status["state"] = "completed"
+        status["message"] = f"检查完成，共处理 {len(status['results'])} 条资源状态。"
+    except CheckStopped as error:
+        status.update(state="stopped", message=str(error))
+    except MTeamRequestInterrupted as error:
+        cooldown = read_json(MTEAM_LIMIT_FILE, {})
+        status.update(state="waiting_retry" if cooldown.get("retry_at", 0) > time.time() else "running",
+                      retry_at=cooldown.get("retry_at", 0), message=str(error))
+        log_event(str(error), level="warning", event="request_interrupted", subscription=MTEAM_POLL_CACHE.performer)
     except MTeamRateLimitError as error:
         previous_limit = read_json(MTEAM_LIMIT_FILE, {})
         consecutive, retry_after = rate_limit_retry_delay(error, previous_limit)
         subscription_name = next((item["performer"] for item in list_subscriptions() if item.get("id") == subscription_id), "") if subscription_id else getattr(MTEAM_POLL_CACHE, "performer", "")
-        write_json(MTEAM_LIMIT_FILE, {"retry_at": time.time() + retry_after, "retry_after": retry_after, "consecutive_rate_limits": consecutive, "message": str(error), "trigger": trigger, "subscription_id": subscription_id, "limited_performer": subscription_name, "refresh_existing_info": bool(refresh_existing_info), "completed_subscription_ids": sorted(completed_subscription_ids), "round_id": getattr(MTEAM_POLL_CACHE, "round_id", "")})
-        status["state"] = "failed"
-        status["message"] = f"{error} 连续第 {consecutive} 次限流，{retry_after} 秒后继续。"
+        retry_at = time.time() + retry_after
+        checkpoint = {key: status[key] for key in ("trigger", "subscription_id", "refresh_existing_info", "completed_subscription_ids", "round_id", "run_id")}
+        write_json(MTEAM_LIMIT_FILE, {**checkpoint, "retry_at": retry_at, "retry_after": retry_after,
+                                     "consecutive_rate_limits": consecutive, "limited_performer": subscription_name})
+        status.update(state="waiting_retry", retry_at=retry_at, message=f"{error} 连续第 {consecutive} 次限流，{retry_after} 秒后继续。")
         log_event(status["message"], level="error", event="rate_limited", subscription=subscription_name)
     except AppError as error:
         status["state"] = "failed"
@@ -6750,76 +8554,93 @@ def _run_poll_once_impl(trigger, subscription_id="", refresh_existing_info=False
         status["state"] = "failed"
         status["message"] = f"检查失败：{error}"
         log_event(status["message"], level="error", event="failed")
-    status["completed_at"] = now_iso()
-    status["last_scan_at"] = status["completed_at"]
-    record_scheduled_run(trigger, status["completed_at"])
-    try:
-        with file_lock():
-            if has_queued_scans():
-                status["state"] = "queued"
-                status["message"] = "当前检查已完成，后续检查仍在队列中。"
-            write_json(STATUS_FILE, status)
-    except AppError as error:
-        status["state"] = "failed"
-        status["message"] = str(error)
-        write_json(STATUS_FILE, status)
-    log_event(status["message"], level="error" if status["state"] == "failed" else "success", event=status["state"])
     MTEAM_POLL_CACHE.active = None
     MTEAM_POLL_CACHE.performer = ""
     return status
 
 
-def run_poll(trigger, subscription_id="", refresh_existing_info=False):
-    completed_subscription_ids = set()
-    round_started = False
-    round_id = uuid.uuid4().hex
-    while True:
-        cooldown = read_json(MTEAM_LIMIT_FILE, {})
-        retry_at = float(cooldown.get("retry_at", 0) or 0)
-        if retry_at > 0:
-            trigger = cooldown.get("trigger", trigger)
-            subscription_id = cooldown.get("subscription_id", subscription_id)
-            round_id = cooldown.get("round_id") or round_id
-            refresh_existing_info = bool(cooldown.get("refresh_existing_info", refresh_existing_info))
-            completed_subscription_ids.update(cooldown.get("completed_subscription_ids", []))
-        MTEAM_POLL_CACHE.round_id = round_id
-        if not round_started:
+def run_poll(trigger, subscription_id="", refresh_existing_info=False, *, resume=None):
+    if not SCHEDULE_FILE.exists():
+        legacy = scheduler_last_run()
+        write_json(SCHEDULE_FILE, {"last_run_at": datetime.datetime.fromtimestamp(
+            legacy, datetime.timezone.utc).isoformat(timespec="seconds") if legacy else ""})
+    try:
+        previous = read_json(STATUS_FILE, {})
+        error_message = ""
+    except AppError as error:
+        previous, error_message = {}, str(error)
+    resume = resume or {}
+    run_id = resume.get("run_id") or uuid.uuid4().hex
+    round_id = resume.get("round_id") or run_id
+    if resume.get("run_id") == previous.get("run_id") == run_id:
+        resume = {**resume, **previous}
+    trigger = resume.get("trigger", trigger)
+    subscription_id = resume.get("subscription_id", subscription_id)
+    status = {
+        "state": "running", "run_id": run_id, "round_id": round_id, "trigger": trigger,
+        "subscription_id": subscription_id, "refresh_existing_info": bool(resume.get("refresh_existing_info", refresh_existing_info)),
+        "started_at": resume.get("started_at") or now_iso(), "completed_at": "", "last_scan_at": "",
+        "completed_subscription_ids": resume.get("completed_subscription_ids", []),
+        "results": resume.get("results", []), "message": "正在检查 M-Team 订阅。",
+    }
+    MTEAM_POLL_CACHE.run_id = run_id
+    MTEAM_POLL_CACHE.round_id = round_id
+    try:
+        if not resume.get("round_id"):
             log_poll_round_separator("开始", trigger, subscription_id, round_id)
-            round_started = True
-        remaining = int(retry_at - time.time() + 0.999) if retry_at else 0
-        if remaining > 0:
-            try:
-                status = read_json(STATUS_FILE, {})
-            except AppError:
-                status = {}
-            status.update({
-                "state": "waiting_retry", "trigger": trigger, "subscription_id": subscription_id,
-                "refresh_existing_info": bool(refresh_existing_info), "retry_at": retry_at,
-                "retry_in": remaining, "completed_at": "",
-                "message": f"M-Team 限流，{remaining} 秒后自动重新检查。",
-            })
+        log_event("恢复未完成的检查。" if resume else "开始检查订阅。", event="started")
+        while not error_message:
+            if check_stop_requested(run_id):
+                status.update(state="stopped", message="本轮检查已停止，已保存处理进度。")
+                break
+            cooldown = read_json(MTEAM_LIMIT_FILE, {})
+            deadline = float(cooldown.get("retry_at", 0) or 0)
+            if deadline > time.time():
+                status.update(state="waiting_retry", retry_at=deadline, message="M-Team 限流，冷却结束后继续检查。")
+                write_json(STATUS_FILE, status)
+                performer = cooldown.get("limited_performer", "")
+                log_event(status["message"], event="retry_waiting", subscription=performer)
+                try:
+                    wait_for_check_deadline(deadline)
+                except CheckStopped:
+                    status.update(state="stopped", message="本轮检查已停止，限流等待已取消。")
+                    break
+                except MTeamRequestInterrupted:
+                    return status
+                log_event("限流冷却结束，继续检查未完成的订阅。", event="retry_resuming", subscription=performer)
+            status.update(state="running", retry_at=0, message="正在检查 M-Team 订阅。")
             write_json(STATUS_FILE, status)
-            log_event(status["message"], event="retry_waiting", subscription=cooldown.get("limited_performer", ""))
-            while remaining > 0 and not STOP_SCHEDULER:
-                time.sleep(min(5, remaining))
-                remaining = int(retry_at - time.time() + 0.999)
-            if STOP_SCHEDULER:
-                MTEAM_POLL_CACHE.round_id = ""
+            status = _run_poll_once(status)
+            if status["state"] not in ("running", "waiting_retry"):
+                break
+            write_json(STATUS_FILE, status)
+            if STOP_SCHEDULER or status["state"] == "running":
                 return status
-            continue
-
-        if completed_subscription_ids:
-            log_event(f"限流冷却结束，跳过已完成的 {len(completed_subscription_ids)} 条订阅，继续处理剩余订阅。", event="retry_resuming", subscription=cooldown.get("limited_performer", ""))
-        status = _run_poll_once(trigger, subscription_id, refresh_existing_info, completed_subscription_ids)
-        cooldown = read_json(MTEAM_LIMIT_FILE, {})
-        retry_at = float(cooldown.get("retry_at", 0) or 0)
-        if status.get("state") == "failed" and retry_at > time.time():
-            continue
-        if retry_at:
-            MTEAM_LIMIT_FILE.unlink(missing_ok=True)
-        log_poll_round_separator("结束 · 失败" if status.get("state") == "failed" else "结束", trigger, subscription_id, round_id)
-        MTEAM_POLL_CACHE.round_id = ""
+        if error_message:
+            status.update(state="failed", message=error_message)
+        with file_lock():
+            if status["state"] == "completed" and check_stop_requested(run_id):
+                status.update(state="stopped", message="本轮检查已停止，已保存处理进度。")
+            cooldown = read_json(MTEAM_LIMIT_FILE, {})
+            if cooldown and not cooldown.get("repair_job_id"):
+                if float(cooldown.get("retry_at", 0) or 0) > time.time():
+                    write_json(MTEAM_LIMIT_FILE, {"retry_at": cooldown["retry_at"], "resume": False})
+                else:
+                    MTEAM_LIMIT_FILE.unlink(missing_ok=True)
+            timestamp = now_iso()
+            status.update(completed_at=timestamp, last_scan_at=timestamp, retry_at=0, retry_in=0)
+            record_scheduled_run(trigger, timestamp)
+            write_json(STATUS_FILE, status)
+            if check_stop_requested(run_id):
+                CHECK_STOP_FILE.unlink(missing_ok=True)
+        level, separator = {"failed": ("error", "结束 · 失败"), "stopped": ("warning", "结束 · 已停止")}.get(status["state"], ("success", "结束"))
+        log_event(status["message"], level=level, event=status["state"])
+        log_poll_round_separator(separator, trigger, subscription_id, round_id)
         return status
+    finally:
+        MTEAM_POLL_CACHE.run_id = ""
+        MTEAM_POLL_CACHE.round_id = ""
+        MTEAM_POLL_CACHE.completed_subscription_ids = set()
 
 
 def run_mteam_id_backfill_request(request):
@@ -6894,10 +8715,14 @@ def scheduler_last_run():
             return datetime.datetime.fromisoformat(value).timestamp()
         except (TypeError, ValueError, OverflowError):
             pass
+    elif "last_run_at" in scheduled:
+        return 0.0
     try:
         status = read_json(STATUS_FILE, {})
     except AppError as error:
         log_event(str(error), level="error", event="state_error")
+        return 0.0
+    if status.get("trigger") == "manual" or (status.get("run_id") and status.get("state") in ("running", "waiting_retry")):
         return 0.0
     value = status.get("last_scan_at") or status.get("completed_at") or status.get("started_at")
     if not value:
@@ -6924,6 +8749,8 @@ def recover_interrupted_poll():
     else:
         if status.get("state") != "running":
             return False
+        if status.get("run_id"):
+            return False
         message = "上次检查未正常完成，已恢复调度状态。"
     try:
         has_queued_requests = has_queued_scans()
@@ -6942,6 +8769,21 @@ def recover_interrupted_poll():
     return True
 
 
+def run_due_cover_index_cleanup():
+    stamp = DATA_ROOT / "last-cover-index-cleanup.json"
+    try:
+        last = read_json(stamp, {}).get("last_run_at")
+        if isinstance(last, (int, float)) and 0 <= time.time() - last < COVER_INDEX_CLEANUP_INTERVAL:
+            return
+        removed = clean_orphan_cover_index()
+        if not STOP_SCHEDULER and not DISABLED_FILE.exists():
+            write_json(stamp, {"last_run_at": time.time()})
+        if removed:
+            log_event(f"封面索引清理完成：移除 {removed} 条无订阅引用的记录。", event="local_cover_cleanup_completed")
+    except (AppError, OSError, RuntimeError, sqlite3.Error) as error:
+        log_event(f"封面索引清理失败，将在下次空闲时重试：{error}。", level="warning", event="local_cover_cleanup_failed")
+
+
 def scheduler_loop():
     global STOP_SCHEDULER
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
@@ -6953,23 +8795,22 @@ def scheduler_loop():
     recover_interrupted_mteam_id_backfills()
     recover_data_repairs()
     last_run = scheduler_last_run()
+    next_cleanup_check = 0.0
     while not STOP_SCHEDULER and not DISABLED_FILE.exists():
         try:
             cooldown = read_json(MTEAM_LIMIT_FILE, {})
-            retry_pending = bool(cooldown.get("retry_at"))
-            request = {} if retry_pending else pop_scan_request()
+            retry_pending = bool(cooldown.get("retry_at")) and cooldown.get("resume", True)
+            status = read_json(STATUS_FILE, {})
+            unfinished = status if status.get("run_id") and status.get("state") in ("running", "waiting_retry") else None
+            request = {} if retry_pending or unfinished else pop_scan_request()
             settings = get_settings()
             due = settings.get("auto_scan", True) and time.time() - last_run >= settings.get("poll_interval_minutes", 60) * 60
             if retry_pending and cooldown.get("repair_job_id"):
                 run_data_repair_request({"job_id": cooldown["repair_job_id"]})
-            elif retry_pending:
-                run_trigger = cooldown.get("trigger", "scheduled")
-                run_poll(
-                    run_trigger, cooldown.get("subscription_id", ""),
-                    cooldown.get("refresh_existing_info", False),
-                )
-                if run_trigger == "scheduled":
-                    last_run = time.time()
+            elif unfinished or retry_pending:
+                resume = unfinished or cooldown
+                run_poll(resume.get("trigger", "scheduled"), resume=resume)
+                last_run = scheduler_last_run()
             elif request and request.get("action") == "repair_data":
                 run_data_repair_request(request)
             elif request and request.get("action") == "mteam_id_backfill":
@@ -6978,7 +8819,10 @@ def scheduler_loop():
                 run_trigger = request.get("trigger", "scheduled")
                 run_poll(run_trigger, request.get("subscription_id", ""), request.get("refresh_existing_info", False))
                 if run_trigger == "scheduled":
-                    last_run = time.time()
+                    last_run = scheduler_last_run()
+            elif time.monotonic() >= next_cleanup_check:
+                next_cleanup_check = time.monotonic() + 60
+                run_due_cover_index_cleanup()
         except Exception as error:
             message = f"后台调度器执行异常：{error}"
             try:
@@ -7016,8 +8860,12 @@ def request_path():
     return path or "/"
 
 
-def emit(status, content_type, body):
-    sys.stdout.write(f"Status: {status}\r\nContent-Type: {content_type}\r\nCache-Control: no-store\r\n\r\n")
+def emit(status, content_type, body, *, download_filename="", cache_control="no-store"):
+    sys.stdout.write(f"Status: {status}\r\nContent-Type: {content_type}\r\nCache-Control: {cache_control}\r\n")
+    if download_filename:
+        filename = urllib.parse.quote(download_filename, safe="")
+        sys.stdout.write(f"Content-Disposition: attachment; filename=\"{filename}\"; filename*=UTF-8''{filename}\r\n")
+    sys.stdout.write("\r\n")
     if isinstance(body, bytes):
         sys.stdout.flush()
         sys.stdout.buffer.write(body)
@@ -7029,6 +8877,14 @@ def emit_json(status, value):
     emit(status, "application/json; charset=utf-8", json.dumps(value, ensure_ascii=False))
 
 
+def versioned_image_cache_control(query_string):
+    query = urllib.parse.parse_qs(query_string)
+    version = query.get("v", [""])[0]
+    if version.isdecimal():
+        return "private, max-age=31536000, immutable"
+    return "no-store"
+
+
 def handle_request():
     path = request_path()
     method = os.environ.get("REQUEST_METHOD", "GET").upper()
@@ -7037,6 +8893,18 @@ def handle_request():
             result = public_settings()
         elif path == "/api/settings" and method == "POST":
             result = save_settings(read_body())
+        elif path == "/api/actresses" and method == "GET":
+            result = list_actresses()
+        elif path == "/api/actresses" and method == "POST":
+            result = save_actress_translation(read_body())
+        elif path == "/api/actresses/add" and method == "POST":
+            result = save_actress_translation(read_body(), create=True)
+        elif path == "/api/actresses/merge" and method == "POST":
+            result = merge_actress_name(read_body())
+        elif path == "/api/actresses/profile" and method == "POST":
+            result = get_actress_profile(read_body())
+        elif method == "POST" and (profile_route := re.fullmatch(r"/api/subscriptions/([^/]+)/actress-profile", path)):
+            result = get_subscription_actress_profile(profile_route[1])
         elif path == "/api/subscriptions" and method == "GET":
             result = subscriptions_with_video_counts()
         elif path == "/api/subscriptions" and method == "POST":
@@ -7074,24 +8942,42 @@ def handle_request():
             image = get_local_cover_image(subscription_id, code, poster=image_type == "poster")
             if image is None:
                 emit_json("404 Not Found", {"error": "暂无本地海报。" if image_type == "poster" else "暂无本地封面。"})
+            elif urllib.parse.parse_qs(os.environ.get("QUERY_STRING", "")).get("download") == ["1"]:
+                mime_type, data = image
+                extension = next(ext for ext, mime in cover_images.IMAGE_TYPES.items() if mime == mime_type)
+                prefix = f"{code}-" if re.fullmatch(r"[A-Z0-9]+(?:-[A-Z0-9]+)+", code) else ""
+                emit("200 OK", mime_type, data, download_filename=f"{prefix}{image_type}{extension}")
             else:
-                emit("200 OK", *image)
+                emit("200 OK", *image, cache_control=versioned_image_cache_control(os.environ.get("QUERY_STRING", "")))
             return
         elif method == "GET" and (gallery := re.fullmatch(r"/api/subscriptions/([^/]+)/videos/([^/]+)/screenshots(?:/([0-9]{1,9}))?", path)):
             subscription_id, code, position = gallery.groups()
             if position is None:
                 result = get_local_screenshots(subscription_id, code)
             else:
-                image = get_local_screenshot_image(subscription_id, code, int(position))
+                index = int(position)
+                image = get_local_screenshot_image(subscription_id, code, index)
                 if image is None:
                     emit_json("404 Not Found", {"error": "找不到这张本地截图。"})
+                elif urllib.parse.parse_qs(os.environ.get("QUERY_STRING", "")).get("download") == ["1"]:
+                    mime_type, data = image
+                    extension = next(ext for ext, mime in cover_images.IMAGE_TYPES.items() if mime == mime_type)
+                    prefix = f"{code}-" if re.fullmatch(r"[A-Z0-9]+(?:-[A-Z0-9]+)+", code) else ""
+                    emit("200 OK", mime_type, data, download_filename=f"{prefix}screenshot-{index}{extension}")
                 else:
-                    emit("200 OK", *image)
+                    emit("200 OK", *image, cache_control=versioned_image_cache_control(os.environ.get("QUERY_STRING", "")))
                 return
         elif method == "GET" and (gallery := re.fullmatch(r"/api/subscriptions/([^/]+)/videos/([^/]+)/gallery", path)):
             result = get_local_gallery(*gallery.groups())
+        elif method == "POST" and (cover_download := re.fullmatch(r"/api/subscriptions/([^/]+)/videos/([^/]+)/cover-download", path)):
+            subscription_id, code = cover_download.groups()
+            image = get_subscription_cover_download(subscription_id, code, read_body().get("path", ""))
+            emit("200 OK", image[0], image[1], download_filename=image[2])
+            return
         elif method == "POST" and (nfo_request := re.fullmatch(r"/api/subscriptions/([^/]+)/videos/([^/]+)/nfo", path)):
             result = get_subscription_video_nfo(*nfo_request.groups(), read_body().get("path", ""))
+        elif method == "POST" and (hardlinks := re.fullmatch(r"/api/subscriptions/([^/]+)/videos/([^/]+)/hardlinks", path)):
+            result = get_subscription_video_hardlinks(*hardlinks.groups(), read_body().get("path", ""))
         elif path.startswith("/api/subscriptions/") and "/videos/" in path and path.endswith("/file-info") and method == "POST":
             subscription_id, code = path.removeprefix("/api/subscriptions/").removesuffix("/file-info").split("/videos/", 1)
             payload = read_body()
@@ -7117,6 +9003,8 @@ def handle_request():
         elif path == "/api/scan" and method == "POST":
             payload = read_body()
             result = queue_scan("manual", refresh_existing_info=payload.get("refresh_existing_info", False))
+        elif path == "/api/stop" and method == "POST":
+            result = request_check_stop(read_body().get("run_id", ""))
         elif path == "/api/status" and method == "GET":
             result = get_status()
         elif path == "/api/activity" and method == "GET":

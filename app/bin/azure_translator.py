@@ -3,8 +3,10 @@
 import http.client
 import json
 import re
+import time
 import urllib.error
 import urllib.request
+from collections import Counter
 
 
 TRANSLATE_URL = "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&from=ja&to=zh-Hans"
@@ -41,17 +43,33 @@ def contains_hashtags(value):
     return False
 
 
+def actress_name_pattern(names):
+    return re.compile("|".join(map(re.escape, sorted(names, key=len, reverse=True)))) if names else None
+
+
+def contains_actress_name(value, pattern):
+    if isinstance(value, str):
+        return pattern.search(value) is not None
+    if isinstance(value, dict):
+        return any(pattern.search(label) or contains_actress_name(item, pattern) for label, item in value.items())
+    if isinstance(value, list):
+        return any(contains_actress_name(item, pattern) for item in value)
+    return False
+
+
 def translate_batch(texts, key, region, on_response=None):
     headers = {"Content-Type": "application/json; charset=UTF-8", "Ocp-Apim-Subscription-Key": key}
     if region:
         headers["Ocp-Apim-Subscription-Region"] = region
-    body = json.dumps([{"Text": text} for text in texts], ensure_ascii=False).encode("utf-8")
+    payload = [{"Text": text} for text in texts]
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(TRANSLATE_URL, data=body, headers=headers, method="POST")
+    started = time.perf_counter()
     try:
         with OPENER.open(request, timeout=15) as response:
             raw = response.read(2 * 1024 * 1024 + 1)
             if on_response:
-                on_response(response.status, raw)
+                on_response(response.status, raw, time.perf_counter() - started, payload)
             result = json.loads(raw)
         if not isinstance(result, list) or len(result) != len(texts):
             raise ValueError
@@ -63,7 +81,8 @@ def translate_batch(texts, key, region, on_response=None):
         with error:
             if on_response:
                 try:
-                    on_response(error.code, error.read(2 * 1024 * 1024 + 1))
+                    raw = error.read(2 * 1024 * 1024 + 1)
+                    on_response(error.code, raw, time.perf_counter() - started, payload)
                 except (OSError, http.client.HTTPException):
                     pass
             raise TranslationError(f"Azure 翻译请求失败（HTTP {error.code}）。", error.code in (401, 403, 429)) from None
@@ -73,7 +92,41 @@ def translate_batch(texts, key, region, on_response=None):
         raise TranslationError("Azure 翻译响应格式无效。") from None
 
 
-def translate_metadata(fields, key, region, on_response=None):
+def translate_metadata(fields, key, region, on_response=None, actress_translations=None):
+    replacements = {
+        name: translation.strip()
+        for name, translation in (actress_translations or {}).items()
+        if isinstance(name, str) and name and isinstance(translation, str) and translation.strip()
+    }
+    placeholders = {
+        name: f"__AVSUB_ACTRESS_{index:04d}__"
+        for index, name in enumerate(replacements)
+    }
+    name_pattern = actress_name_pattern(placeholders)
+    restore_placeholders = {placeholder: replacements[name] for name, placeholder in placeholders.items()}
+    placeholder_pattern = actress_name_pattern(restore_placeholders)
+
+    def protect(value):
+        if isinstance(value, str):
+            return name_pattern.sub(lambda match: placeholders[match.group()], value) if name_pattern else value
+        if isinstance(value, dict):
+            return {protect(label): protect(item) for label, item in value.items()}
+        if isinstance(value, list):
+            return [protect(item) for item in value]
+        return value
+
+    def restore(value):
+        if isinstance(value, str):
+            if placeholder_pattern:
+                return placeholder_pattern.sub(lambda match: restore_placeholders[match.group()], value)
+            return value
+        if isinstance(value, dict):
+            return {restore(label): restore(item) for label, item in value.items()}
+        if isinstance(value, list):
+            return [restore(item) for item in value]
+        return value
+
+    protected_fields = protect(fields)
     inputs = {}
 
     def collect_text(text):
@@ -105,19 +158,37 @@ def translate_metadata(fields, key, region, on_response=None):
             return HASHTAG.sub(lambda match: match[1] + inputs.get(match[2], match[2]), value)
         return inputs.get(value, value)
 
-    for value in fields.values():
+    for value in protected_fields.values():
         collect(value)
-    batch = []
-    size = 0
-    for text in inputs:
-        length = len(text)
-        if length > 50000:
-            raise TranslationError("单项 DMM 文本超过 Azure 翻译长度限制。")
-        if len(batch) == 100 or size + length > 50000:
-            inputs.update(zip(batch, translate_batch(batch, key, region, on_response)))
-            batch, size = [], 0
-        batch.append(text)
-        size += length
-    if batch:
-        inputs.update(zip(batch, translate_batch(batch, key, region, on_response)))
-    return {field: apply(value) for field, value in fields.items()}
+    def translate_inputs(values):
+        batch = []
+        size = 0
+        for text in values:
+            length = len(text)
+            if length > 50000:
+                raise TranslationError("单项 DMM 文本超过 Azure 翻译长度限制。")
+            if len(batch) == 100 or size + length > 50000:
+                values.update(zip(batch, translate_batch(batch, key, region, on_response)))
+                batch, size = [], 0
+            batch.append(text)
+            size += length
+        if batch:
+            values.update(zip(batch, translate_batch(batch, key, region, on_response)))
+
+    translate_inputs(inputs)
+    if placeholder_pattern:
+        parts_pattern = re.compile(f"({placeholder_pattern.pattern})")
+        retry_parts = {}
+        fragments = {}
+        for original, translated in inputs.items():
+            if Counter(placeholder_pattern.findall(original)) != Counter(placeholder_pattern.findall(translated)):
+                parts = parts_pattern.split(original)
+                retry_parts[original] = parts
+                for part in parts[::2]:
+                    if re.search(r"[ぁ-ヿ一-龯々]", part):
+                        fragments.setdefault(part, part)
+        translate_inputs(fragments)
+        for original, parts in retry_parts.items():
+            parts[::2] = [fragments.get(part, part) for part in parts[::2]]
+            inputs[original] = "".join(parts)
+    return restore({field: apply(value) for field, value in protected_fields.items()})

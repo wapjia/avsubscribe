@@ -73,6 +73,13 @@ class FileMetadataDownloader(FakeDownloader):
 
 
 class ReleaseLogicTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        self.enterContext(patch.object(app, "DATA_ROOT", root))
+        self.enterContext(patch.object(app, "LOCAL_VIDEO_DATABASE", root / "local-videos.sqlite3"))
+
     def test_es_module_assets_are_served_with_javascript_mime_types(self):
         self.assertEqual(app.WEB_MEDIA_TYPES[".js"], "application/javascript; charset=utf-8")
         self.assertEqual(app.WEB_MEDIA_TYPES[".mjs"], "application/javascript; charset=utf-8")
@@ -242,7 +249,7 @@ Height : 2 160 pixels"""
             "smallDescr": "LTX模型 4K高清画质破解 4k x264", "standard": "6", "videoCodec": "1",
         }]}}
         with patch.object(app, "mteam_json", return_value=response), patch.object(
-            app, "mteam_option_map", side_effect=lambda endpoint, token: {"6": "1080p"} if "standardList" in endpoint else {"1": "H.264"}
+            app, "mteam_option_map", side_effect=lambda endpoint, token, ids: {"6": "1080p"} if "standardList" in endpoint else {"1": "H.264"}
         ):
             rows = app.mteam_search("凉森玲梦", "token")
         self.assertEqual(rows[0]["rank"][0], 2)
@@ -275,7 +282,7 @@ Height : 2 160 pixels"""
             self.assertEqual(api.call_args_list[1].kwargs["method"], "POST")
             self.assertIn("subtitle-token", download.call_args.args[0])
 
-    def test_mteam_subtitle_download_maps_numeric_language_id_once(self):
+    def test_mteam_subtitle_download_reuses_persisted_language_dictionary_across_rounds(self):
         with tempfile.TemporaryDirectory() as directory:
             video = Path(directory) / "SONE-948-破解-C.mp4"
             video.touch()
@@ -283,12 +290,18 @@ Height : 2 160 pixels"""
             languages = {"code": 0, "data": [{"id": 3, "langName": "Chinese"}]}
             link = {"code": 0, "data": {"credential": "credential"}}
             metadata = {"content_type": "application/x-subrip", "content_disposition": 'attachment; filename="subtitle.srt"'}
-            with patch.object(app, "mteam_json", side_effect=[subtitle_list, languages, link]) as api, patch.object(
+            with patch.object(app.MTEAM_POLL_CACHE, "active", None, create=True), \
+                 patch.object(app, "mteam_json", side_effect=[subtitle_list, languages, link, subtitle_list, link]) as api, patch.object(
                 app, "mteam_request", return_value=(b"subtitle", metadata),
             ):
                 result = app.mteam_subtitle_download("SONE-948", "123456", [video], "token")
+                again = app.mteam_subtitle_download("SONE-948", "123456", [video], "token")
             self.assertEqual(Path(result["files"][0]).name, "SONE-948-破解-C.MT.zh-HK.srt")
-            self.assertEqual([call.args[0] for call in api.call_args_list], ["/subtitle/list?id=123456", "/subtitle/langs", "/subtitle/genlink?id=21"])
+            self.assertEqual(again["files"], result["files"])
+            self.assertEqual([call.args[0] for call in api.call_args_list], [
+                "/subtitle/list?id=123456", "/subtitle/langs", "/subtitle/genlink?id=21",
+                "/subtitle/list?id=123456", "/subtitle/genlink?id=21",
+            ])
 
     def test_mteam_subtitle_download_searches_by_video_id_without_requiring_response_link_field(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -466,7 +479,7 @@ Height : 2 160 pixels"""
         self.assertEqual(enriched["resolution"], "1080p")
 
     def test_detail_lookup_failure_prevents_download(self):
-        subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": "/video", "wash_enabled": True}
+        subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": "/video", "wash_enabled": True, "exclude_non_chinese": False}
         candidate = {"id": "1", "code": "SSNI-618", "title": "SSNI-618 1080p x265", "rank": [1, 0, 2], "seeders": 10, "created": "2026", "metadata_complete": False}
         downloader = FakeDownloader()
         records = {}
@@ -504,12 +517,55 @@ Height : 2 160 pixels"""
             app.MTEAM_POLL_CACHE.active = None
 
     def test_mteam_detail_force_refresh_bypasses_poll_detail_cache(self):
-        app.MTEAM_POLL_CACHE.active = {"details": {"1278591": {"mediainfo": "cached"}}, "options": {}}
+        cached = {"mediainfo": "cached"}
+        app.MTEAM_POLL_CACHE.active = {"details": {"1278591": (cached, {"data": cached})}, "options": {}}
         self.addCleanup(setattr, app.MTEAM_POLL_CACHE, "active", None)
         with patch.object(app, "mteam_json", return_value={"code": 0, "data": {"mediainfo": "fresh"}}) as request:
             self.assertEqual(app.mteam_detail("1278591", "token", force_refresh=True), {"mediainfo": "fresh"})
         request.assert_called_once()
-        self.assertEqual(app.MTEAM_POLL_CACHE.active["details"]["1278591"], {"mediainfo": "fresh"})
+        self.assertEqual(app.MTEAM_POLL_CACHE.active["details"]["1278591"], (
+            {"mediainfo": "fresh"}, {"code": 0, "data": {"mediainfo": "fresh"}},
+        ))
+
+    def test_mteam_detail_persists_full_json_for_seven_days_and_force_refresh_replaces_it(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        self.enterContext(patch.object(app, "DATA_ROOT", root))
+        self.enterContext(patch.object(app, "LOCAL_VIDEO_DATABASE", root / "local-videos.sqlite3"))
+        app.MTEAM_POLL_CACHE.active = None
+        self.addCleanup(setattr, app.MTEAM_POLL_CACHE, "active", None)
+        original = {"id": "1278591", "name": "影片", "extraField": {"value": 1}}
+        refreshed = {"id": "1278591", "name": "影片新资料", "extraField": {"value": 2}}
+        expired = {"id": "1278591", "name": "影片过期更新", "extraField": {"value": 3}}
+        with patch.object(app, "mteam_json", side_effect=[{"data": original}, {"data": refreshed}, {"data": expired}]) as request:
+            self.assertEqual(app.mteam_detail("1278591", "token"), original)
+            app.MTEAM_POLL_CACHE.active = None
+            self.assertEqual(app.mteam_detail("1278591", "token"), original)
+            self.assertEqual(request.call_count, 1)
+            connection = app.connect_video_database()
+            try:
+                cached_response = connection.execute(
+                    "SELECT response_json FROM mteam_detail_cache WHERE mteam_id=?", ("1278591",),
+                ).fetchone()[0]
+                self.assertEqual(json.loads(cached_response), {"data": original})
+            finally:
+                connection.close()
+            self.assertEqual(app.mteam_detail("1278591", "token", force_refresh=True), refreshed)
+            app.MTEAM_POLL_CACHE.active = None
+            self.assertEqual(app.mteam_detail("1278591", "token"), refreshed)
+            self.assertEqual(request.call_count, 2)
+            connection = app.connect_video_database()
+            try:
+                checked_at = connection.execute(
+                    "SELECT checked_at FROM mteam_detail_cache WHERE mteam_id=?", ("1278591",),
+                ).fetchone()[0]
+            finally:
+                connection.close()
+            with patch.object(app.time, "time", return_value=checked_at + app.MTEAM_DETAIL_CACHE_TTL_SECONDS + 1):
+                app.MTEAM_POLL_CACHE.active = None
+                self.assertEqual(app.mteam_detail("1278591", "token"), expired)
+            self.assertEqual(request.call_count, 3)
 
     def test_mteam_form_request_urlencodes_payload(self):
         response = FakeResponse(b'{"code":0,"data":"token"}')
@@ -606,7 +662,7 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
         self.enterContext(patch.object(app, "DATA_ROOT", root))
         self.enterContext(patch.object(app, "LOCAL_VIDEO_DATABASE", root / "local-videos.sqlite3"))
         self.enterContext(patch.object(app, "LOG_DATABASE_FILE", root / "activity-log.sqlite3"))
-        for name in ("SETTINGS_FILE", "SUBSCRIPTIONS_FILE", "RECORDS_FILE", "STATUS_FILE", "SCHEDULE_FILE", "BACKFILL_STATUS_FILE", "BACKFILL_STATUS_LOCK_FILE", "LOG_FILE", "LOG_LOCK_FILE", "REQUEST_FILE", "LOCK_FILE", "DISABLED_FILE", "MTEAM_LIMIT_FILE", "MTEAM_REQUEST_STATE_FILE", "MTEAM_REQUEST_LOCK_FILE"):
+        for name in ("SETTINGS_FILE", "SUBSCRIPTIONS_FILE", "RECORDS_FILE", "STATUS_FILE", "SCHEDULE_FILE", "BACKFILL_STATUS_FILE", "BACKFILL_STATUS_LOCK_FILE", "LOG_FILE", "LOG_LOCK_FILE", "REQUEST_FILE", "LOCK_FILE", "DISABLED_FILE", "MTEAM_LIMIT_FILE", "CHECK_STOP_FILE", "MTEAM_REQUEST_STATE_FILE", "MTEAM_REQUEST_LOCK_FILE"):
             self.enterContext(patch.object(app, name, root / (name.lower() + ".json")))
         self.enterContext(patch.object(app, "mteam_detail", return_value={"performer": "三上悠亚 Actress"}))
 
@@ -774,6 +830,8 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
         two = app.create_subscription({"performer": "三上悠亚", "keywords": "1080p", "download_dir": "/vol1/video/b"})
         records = {one["id"]: {"SSNI-618": {"code": "SSNI-618"}}, two["id"]: {"SSNI-618": {"code": "SSNI-618"}}}
         self.assertNotEqual(one["id"], two["id"])
+        self.assertEqual(one["search_keywords"], ["三上悠亚 ltx"])
+        self.assertEqual(two["search_keywords"], ["三上悠亚 1080p"])
         self.assertEqual(one["blacklist"], ["SSNI-939", "FC2-PPV-1234567"])
         self.assertEqual(len(records), 2)
         with self.assertRaises(app.AppError):
@@ -782,6 +840,27 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
             app.create_subscription({"performer": "Test", "download_dir": "/"})
         with self.assertRaisesRegex(app.AppError, "黑名单番号格式无效"):
             app.create_subscription({"performer": "Test", "blacklist": ["not-a-code"], "download_dir": "/video"})
+
+    def test_subscription_accepts_multiple_exact_search_keywords_and_defaults_to_ltx(self):
+        subscription = app.create_subscription({
+            "performer": "新有菜", "search_keywords": ["新有菜 ltx", "桥本有菜 ltx", "新有菜 ltx"],
+            "download_dir": "/vol1/video/aliases",
+        })
+        self.assertEqual(subscription["search_keywords"], ["新有菜 ltx", "桥本有菜 ltx"])
+        defaulted = app.validate_subscription({"performer": "三上悠亚", "download_dir": "/vol1/video/default"})
+        self.assertEqual(defaulted["search_keywords"], ["三上悠亚 ltx"])
+        self.assertEqual(app.subscription_search_keywords({
+            "performer": "新有菜", "search_keywords": ["新有菜 ltx", "桥本有菜 ltx"],
+        }), ["新有菜 ltx", "桥本有菜 ltx"])
+
+    def test_multiple_search_keywords_run_separately_and_deduplicate_mteam_ids(self):
+        first = {"id": "100", "code": "ABC-001", "title": "ABC-001 A"}
+        duplicate = {"id": "100", "code": "ABC-001", "title": "ABC-001 A"}
+        second = {"id": "200", "code": "ABC-002", "title": "ABC-002 B"}
+        with patch.object(app, "mteam_search", side_effect=[[first], [duplicate, second]]) as search:
+            results = app.search_subscription_releases(["新有菜 ltx", "桥本有菜 ltx"], "token", "新有菜")
+        self.assertEqual([call.args[0] for call in search.call_args_list], ["新有菜 ltx", "桥本有菜 ltx"])
+        self.assertEqual([item["id"] for item in results], ["100", "200"])
 
     def test_subscription_edit_and_delete_preserve_other_subscription(self):
         one = app.create_subscription({"performer": "One", "download_dir": "/video/one"})
@@ -795,6 +874,14 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
         one = app.create_subscription({"performer": "One", "blacklist": ["IPX-811"], "download_dir": "/video/one"})
         updated = app.update_subscription(one["id"], {"performer": "One Updated", "download_dir": "/video/one"})
         self.assertEqual(updated["blacklist"], ["IPX-811"])
+
+    def test_subscription_language_filter_defaults_on_and_preserves_explicit_off(self):
+        subscription = app.create_subscription({"performer": "Actress", "download_dir": "/video/one"})
+        self.assertTrue(subscription["exclude_non_chinese"])
+        app.update_subscription(subscription["id"], {"exclude_non_chinese": False})
+        updated = app.update_subscription(subscription["id"], {"performer": "Updated"})
+        self.assertFalse(updated["exclude_non_chinese"])
+        self.assertFalse(app.list_subscriptions()[0]["exclude_non_chinese"])
 
     def test_queue_scan_can_target_one_subscription(self):
         one = app.create_subscription({"performer": "One", "download_dir": "/video/one"})
@@ -879,6 +966,31 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
         status = app.get_status()
         self.assertFalse(status["auto_scan"])
         self.assertEqual(status["next_scan_at"], 0)
+
+    def test_active_check_can_be_stopped_and_stop_request_is_scoped_to_run(self):
+        app.write_json(app.STATUS_FILE, {"state": "running", "run_id": "active-run", "results": []})
+        result = app.request_check_stop("active-run")
+        self.assertEqual(result["state"], "stopping")
+        self.assertTrue(app.check_stop_requested("active-run"))
+        self.assertFalse(app.check_stop_requested("next-run"))
+        self.assertTrue(app.get_status()["stop_requested"])
+        with self.assertRaisesRegex(app.AppError, "已切换"):
+            app.request_check_stop("old-run")
+
+    def test_stop_request_rejects_inactive_check(self):
+        app.write_json(app.STATUS_FILE, {"state": "completed", "run_id": "old-run", "results": []})
+        with self.assertRaisesRegex(app.AppError, "已结束"):
+            app.request_check_stop("old-run")
+
+    def test_stopping_during_rate_limit_wait_ends_the_current_check(self):
+        deadline = app.time.time() + 300
+        app.write_json(app.MTEAM_LIMIT_FILE, {"retry_at": deadline, "trigger": "scheduled"})
+        with patch.object(app.time, "sleep", side_effect=lambda _seconds: app.request_check_stop(app.get_status()["run_id"])):
+            status = app.run_poll("scheduled")
+        self.assertEqual(status["state"], "stopped")
+        self.assertIn("等待已取消", status["message"])
+        self.assertFalse(app.CHECK_STOP_FILE.exists())
+        self.assertEqual(app.read_json(app.MTEAM_LIMIT_FILE, {}), {"retry_at": deadline, "resume": False})
 
     def test_scheduler_recovers_stale_running_state_without_queued_requests(self):
         app.write_json(app.STATUS_FILE, {"state": "running", "started_at": "2026-11-17T00:00:00+00:00", "results": []})
@@ -1410,7 +1522,7 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
         self.assertEqual((mapped["subscription"], mapped["code"], mapped["progress"], mapped["mteam_id"]), ("Actress", "SSNI-618", 42.0, "1289514"))
         self.assertEqual(mapped["message"], "qBittorrent：下载中")
         unknown_subscription = next(item for item in rows if item["hash"] == "numberedhash")
-        self.assertEqual((unknown_subscription["subscription"], unknown_subscription["code"]), ("qBittorrent", "IPX-811"))
+        self.assertEqual((unknown_subscription["subscription"], unknown_subscription["code"]), ("未关联订阅", "IPX-811"))
         queued = next(item for item in rows if item["hash"] == "queuedhash")
         self.assertEqual(queued["message"], "qBittorrent：等待下载")
         self.assertNotIn("otherhash", [item["hash"] for item in rows])
@@ -1436,6 +1548,29 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
             rows = app.get_activity()
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0]["subscription"], rows[0]["state"], rows[0]["pending"]), ("Upgrading", "upgrading", True))
+
+    def test_activity_resolves_unrecorded_tagged_task_by_unique_mapped_save_path(self):
+        owner = app.create_subscription({"performer": "彩月七緒", "download_dir": "/local/actress"})
+        for name in ("One", "Two"):
+            app.create_subscription({"performer": name, "download_dir": "/local/shared"})
+        app.write_json(app.SETTINGS_FILE, {"downloader": {
+            "url": "http://nas:8080", "path_mappings": [{"local": "/local", "remote": "/remote"}],
+        }})
+        task = {"name": "CAWD-987", "state": "queuedDL", "tags": app.QB_SUBSCRIPTION_TAG}
+        tasks = [
+            {**task, "hash": "new", "save_path": "/remote/actress/CAWD-987/"},
+            {**task, "hash": "legacy", "save_path": "/remote/actress"},
+            {**task, "hash": "ambiguous", "save_path": "/remote/shared/CAWD-987"},
+            {**task, "hash": "unrelated", "save_path": "/remote/actress/OTHER-123"},
+            {**task, "hash": "untagged", "save_path": "/remote/actress/CAWD-987", "tags": ""},
+        ]
+        with patch.object(app.Downloader, "_qb_login"), patch.object(app.Downloader, "_json", return_value=(tasks, None)):
+            rows = {item["hash"]: item for item in app.get_activity()}
+        for key in ("new", "legacy"):
+            self.assertEqual((rows[key]["subscription_id"], rows[key]["subscription"]), (owner["id"], "彩月七緒"))
+        for key in ("ambiguous", "unrelated"):
+            self.assertEqual(rows[key]["subscription"], "未关联订阅")
+        self.assertNotIn("untagged", rows)
 
     def test_activity_does_not_assign_untracked_tasks_to_a_subscription_by_title(self):
         subscription = app.create_subscription({"performer": "三上悠亚", "download_dir": "/vol1/video"})
@@ -1463,7 +1598,7 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
             rows = app.get_activity()
         self.assertEqual([row["hash"] for row in rows], ["orphanhash"])
         self.assertEqual((rows[0]["subscription_id"], rows[0]["subscription"], rows[0]["code"], rows[0]["mteam_id"]),
-                         ("", "qBittorrent", "SSIS-663", ""))
+                         ("", "未关联订阅", "SSIS-663", ""))
 
     def test_activity_surfaces_downloader_read_errors(self):
         app.write_json(app.SETTINGS_FILE, {"downloader": {"type": "qbittorrent", "url": "http://nas:8080"}})
@@ -1561,15 +1696,16 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
         for path in (paired_nfo, paired_subtitle, orphan_nfo, orphan_subtitle):
             path.touch()
 
-        removed = app.cleanup_orphan_sidecars(str(root))
+        removed, removed_dirs = app.cleanup_orphan_sidecars(str(root))
 
         self.assertCountEqual(removed, [str(orphan_nfo), str(orphan_subtitle)])
+        self.assertEqual(removed_dirs, [])
         self.assertTrue(paired_nfo.exists())
         self.assertTrue(paired_subtitle.exists())
         self.assertFalse(orphan_nfo.exists())
         self.assertFalse(orphan_subtitle.exists())
 
-    def test_cleanup_orphan_sidecars_removes_newly_empty_subfolders_only(self):
+    def test_cleanup_orphan_sidecars_removes_existing_and_new_empty_subfolders(self):
         root = Path(app.DATA_ROOT) / "videos"
         root.mkdir()
         orphan_dir = root / "orphan" / "nested"
@@ -1578,32 +1714,89 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
         orphan_subtitle = orphan_dir / "IPX-811.zh.srt"
         orphan_nfo.touch()
         orphan_subtitle.touch()
+        empty = root / "empty" / "nested"
+        empty.mkdir(parents=True)
+        collection = root / "collection"
+        (collection / "empty").mkdir(parents=True)
+        hidden_dir = root / "hidden-file"
+        hidden_dir.mkdir()
+        (hidden_dir / ".keep").touch()
         keep_dir = root / "has-video"
         keep_dir.mkdir()
         (keep_dir / "SSNI-229.mp4").touch()
         (keep_dir / "other.txt").touch()
 
-        removed = app.cleanup_orphan_sidecars(str(root))
+        removed, removed_dirs = app.cleanup_orphan_sidecars(str(root), excluded_dirs=[str(collection)])
 
         self.assertCountEqual(removed, [str(orphan_nfo), str(orphan_subtitle)])
+        self.assertCountEqual(removed_dirs, [str(path) for path in (orphan_dir, orphan_dir.parent, empty, empty.parent)])
         self.assertFalse((root / "orphan").exists())
+        self.assertFalse(empty.parent.exists())
         self.assertTrue(root.is_dir())
+        self.assertTrue((collection / "empty").is_dir())
+        self.assertTrue((hidden_dir / ".keep").is_file())
         self.assertTrue(keep_dir.is_dir())
         self.assertTrue((keep_dir / "SSNI-229.mp4").exists())
         self.assertTrue((keep_dir / "other.txt").exists())
+
+    def test_cleanup_orphan_sidecars_removes_artwork_only_from_orphan_subtrees(self):
+        root = Path(app.DATA_ROOT) / "videos"
+        orphans = [
+            root / "ABC-123" / "poster.JPG",
+            root / "DEF-456" / "preview" / "screenshot-1.jpeg",
+            root / "DEF-456" / "fanart.webp",
+            root / "DEF-456" / "DEF-456.nfo",
+            root / "DEF-456" / "DEF-456.zh-HK.srt",
+        ]
+        retained = [
+            root / "poster.jpg",
+            root / "GHI-789" / "poster.png",
+            root / "GHI-789" / "GHI-789.nfo",
+            root / "GHI-789" / "release" / "GHI-789.mp4",
+            root / "GHI-789" / "release" / "extra" / "screenshot-1.png",
+            root / "JKL-123" / "JKL-123.mkv.!qB",
+            root / "JKL-123" / "JKL-123.srt",
+            root / "JKL-123" / "poster.jpg",
+            root / "notes" / "photo.png",
+            root / "notes" / "readme.txt",
+            root / "collection" / "ABC-123.srt",
+            root / "collection" / "photo.jpg",
+        ]
+        for path in orphans + retained:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+
+        removed, _removed_dirs = app.cleanup_orphan_sidecars(str(root), excluded_dirs=[str(root / "collection")])
+
+        self.assertCountEqual(removed, [str(path) for path in orphans])
+        self.assertFalse((root / "ABC-123").exists())
+        self.assertFalse((root / "DEF-456").exists())
+        for path in retained:
+            self.assertTrue(path.is_file(), path)
 
     def test_subscription_scan_cleans_orphan_sidecars_only_when_enabled(self):
         root = Path(app.DATA_ROOT) / "videos"
         root.mkdir()
         orphan = root / "IPX-811.nfo"
         orphan.touch()
+        poster = root / "IPX-811" / "poster.jpg"
+        poster.parent.mkdir()
+        poster.touch()
+        empty = root / "empty"
+        empty.mkdir()
         subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": str(root), "wash_enabled": True}
         with patch.object(app, "mteam_search", return_value=[]):
             app.process_subscription(subscription, {}, {"mteam_token": "token", "cleanup_orphan_sidecars": False}, FakeDownloader(), [])
         self.assertTrue(orphan.exists())
+        self.assertTrue(poster.exists())
+        self.assertTrue(empty.is_dir())
         with patch.object(app, "mteam_search", return_value=[]):
             app.process_subscription(subscription, {}, {"mteam_token": "token", "cleanup_orphan_sidecars": True}, FakeDownloader(), [])
         self.assertFalse(orphan.exists())
+        self.assertFalse(poster.parent.exists())
+        self.assertFalse(empty.exists())
+        cleanup_log = next(entry for entry in app.get_logs() if entry["event"] == "orphan_sidecars_cleaned")
+        self.assertEqual(cleanup_log["message"], "自动清理：孤立配套文件 2 个，空目录 2 个。")
 
     def test_local_video_scan_enumerates_nfo_files_once_per_directory(self):
         root = Path(app.DATA_ROOT) / "videos"
@@ -2120,7 +2313,7 @@ class UpgradeTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.enterContext(patch.object(app, "LOCAL_VIDEO_DATABASE", __import__("pathlib").Path(self.directory.name) / "local-videos.sqlite3"))
         self.enterContext(patch.object(app, "LOG_DATABASE_FILE", __import__("pathlib").Path(self.directory.name) / "activity-log.sqlite3"))
-        for name in ("DATA_ROOT", "SETTINGS_FILE", "SUBSCRIPTIONS_FILE", "RECORDS_FILE", "STATUS_FILE", "SCHEDULE_FILE", "BACKFILL_STATUS_FILE", "BACKFILL_STATUS_LOCK_FILE", "LOG_FILE", "LOG_LOCK_FILE", "REQUEST_FILE", "LOCK_FILE", "DISABLED_FILE", "MTEAM_LIMIT_FILE", "MTEAM_REQUEST_STATE_FILE", "MTEAM_REQUEST_LOCK_FILE"):
+        for name in ("DATA_ROOT", "SETTINGS_FILE", "SUBSCRIPTIONS_FILE", "RECORDS_FILE", "STATUS_FILE", "SCHEDULE_FILE", "BACKFILL_STATUS_FILE", "BACKFILL_STATUS_LOCK_FILE", "LOG_FILE", "LOG_LOCK_FILE", "REQUEST_FILE", "LOCK_FILE", "DISABLED_FILE", "MTEAM_LIMIT_FILE", "CHECK_STOP_FILE", "MTEAM_REQUEST_STATE_FILE", "MTEAM_REQUEST_LOCK_FILE"):
             self.enterContext(patch.object(app, name, __import__("pathlib").Path(self.directory.name) / (name.lower() + ".json")))
         self.enterContext(patch.object(app, "mteam_detail", return_value={"performer": "三上悠亚 Actress"}))
 
@@ -2153,7 +2346,7 @@ class UpgradeTests(unittest.TestCase):
         download.assert_called_once_with("IPX-536", "1278591", [video], "token")
 
     def test_keyword_query_is_performer_plus_additional_term(self):
-        subscription = {"id": "sub", "performer": "三上悠亚", "keywords": "ltx", "download_dir": "/video", "wash_enabled": True}
+        subscription = {"id": "sub", "performer": "三上悠亚", "keywords": "ltx", "download_dir": "/video", "wash_enabled": True, "exclude_non_chinese": False}
         downloader = FakeDownloader()
         records = {}
         captured = []
@@ -2231,7 +2424,7 @@ class UpgradeTests(unittest.TestCase):
 
     def test_detail_actor_mismatch_is_skipped_instead_of_saved_to_wrong_folder(self):
         subscription = {"id": "sub", "performer": "桃乃木香奈", "keywords": "", "download_dir": "/video/momonogi", "wash_enabled": True}
-        candidate = {"id": "1280000", "code": "IPZZ-034", "title": "IPZZ-034", "rank": [1, 0, 1], "seeders": 10, "created": "2026"}
+        candidate = {"id": "1280000", "code": "IPZZ-034", "title": "IPZZ-034", "rank": [1, 1, 1], "seeders": 10, "created": "2026"}
         records = {}
         results = []
         downloader = FakeDownloader()
@@ -2285,8 +2478,75 @@ class UpgradeTests(unittest.TestCase):
         records = {"sub": {"SSIS-181": {"code": "SSIS-181", "current": {"id": "old", "rank": [2, 2, 2], "hash": "oldhash"}, "mteam_metadata": existing_metadata}}}
         with patch.object(app, "mteam_search", return_value=[candidate]) as search, patch.object(app, "scan_local_releases", return_value={}):
             app.process_subscription(subscription, records, {"mteam_token": "token"}, FakeDownloader(), [])
-        search.assert_called_once_with("Actress", "token")
+        search.assert_called_once_with("Actress ltx", "token")
         self.assertIs(records["sub"]["SSIS-181"]["mteam_metadata"], existing_metadata)
+
+    def test_shared_coappearance_number_compares_and_washes_across_subscription_directories(self):
+        root = Path(self.directory.name) / "new-arina"
+        root.mkdir()
+        video = root / "SSIS-698.mkv"
+        video.write_bytes(b"existing target video")
+        app.save_actress_translation({"source_name": "新ありな", "chinese_name": "新有菜"}, create=True)
+        app.save_actress_translation({"source_name": "三上悠亜", "chinese_name": "三上悠亚"}, create=True)
+        subscription = {"id": "new-arina", "performer": "新有菜", "download_dir": str(root), "wash_enabled": True}
+        local = {"SSIS-698": [{"path": str(video), "title": "SSIS-698", "rank": [1, 0, 1], "metadata": {}}]}
+        current = {"id": "", "code": "SSIS-698", "title": "SSIS-698", "rank": [1, 0, 1], "state": "completed", "local_existing": True, "local_paths": [str(video)], "owns_task": False}
+        records = {"new-arina": {"SSIS-698": {"code": "SSIS-698", "current": current}}}
+        candidate = {"id": "1279572", "code": "SSIS-698", "title": "SSIS-698 共演", "rank": [2, 2, 2], "seeders": 20, "created": "2026", "metadata_complete": True}
+        downloader = FakeDownloader()
+        results = []
+        with patch.object(app, "list_subscriptions", return_value=[subscription, {"id": "other", "performer": "三上悠亚", "download_dir": "/other"}]), \
+             patch.object(app, "mteam_search", return_value=[candidate]), \
+             patch.object(app, "mteam_detail", return_value={"出演者": "三上悠亜,新ありな,相沢みなみ"}), \
+             patch.object(app, "find_indexed_local_releases", return_value=[{"subscription_id": "other", "path": "/other/SSIS-698.mkv", "rank": [1, 2, 1], "mtime_ns": 1}]), \
+             patch.object(app, "scan_local_releases", return_value=local), \
+             patch.object(app, "cache_local_file_mteam_metadata"), \
+             patch.object(app, "apply_local_file_mteam_ranks"), \
+             patch.object(app, "fetch_torrent", return_value=torrent_bytes()):
+            app.process_subscription(subscription, records, {"mteam_token": "token"}, downloader, results)
+        self.assertEqual(records["new-arina"]["SSIS-698"]["current"]["local_roots"], [str(root), "/other"])
+        self.assertEqual(records["new-arina"]["SSIS-698"]["pending"]["shared_subscription_ids"], ["other"])
+        self.assertEqual(len(downloader.added), 1)
+        self.assertIn("洗版原因", results[-1]["message"])
+
+    def test_completed_coappearance_wash_replaces_old_files_and_hardlinks_new_version_to_each_subscription(self):
+        source_root = Path(self.directory.name) / "source"
+        source_dir = source_root / "SSIS-698"
+        source_dir.mkdir(parents=True)
+        new_video = source_dir / "SSIS-698-4K.mkv"
+        new_video.write_bytes(b"new shared version")
+        new_video.with_suffix(".nfo").write_text("new nfo", encoding="utf-8")
+        other_root = Path(self.directory.name) / "other"
+        other_dir = other_root / "SSIS-698"
+        other_dir.mkdir(parents=True)
+        old_video = other_dir / "SSIS-698-1080p.mkv"
+        old_video.write_bytes(b"old shared version")
+        old_video.with_suffix(".nfo").write_text("old nfo", encoding="utf-8")
+        old_current = {
+            "id": "", "code": "SSIS-698", "title": "old", "rank": [1, 2, 1],
+            "state": "completed", "local_existing": True, "local_paths": [str(old_video)],
+            "local_roots": [str(source_root), str(other_root)], "download_dir": str(source_root),
+        }
+        pending = {
+            "id": "1279572", "code": "SSIS-698", "title": "new", "rank": [2, 2, 2],
+            "hash": "newhash", "state": "upgrading", "owns_task": True,
+            "download_dir": str(source_root), "shared_subscription_ids": ["other"],
+        }
+        source_record = {"code": "SSIS-698", "current": old_current, "pending": pending}
+        other_record = {"code": "SSIS-698", "current": dict(old_current)}
+        all_records = {"source": {"SSIS-698": source_record}, "other": {"SSIS-698": other_record}}
+        downloader = FakeDownloader("newhash", complete=True)
+        with patch.object(app, "list_subscriptions", return_value=[
+            {"id": "source", "performer": "新有菜", "download_dir": str(source_root)},
+            {"id": "other", "performer": "三上悠亚", "download_dir": str(other_root)},
+        ]):
+            app.poll_downloader_records(downloader, all_records["source"], [], all_records, token="")
+        linked_video = other_dir / new_video.name
+        self.assertTrue(linked_video.is_file())
+        self.assertEqual(linked_video.stat().st_ino, new_video.stat().st_ino)
+        self.assertFalse(old_video.exists())
+        self.assertFalse(old_video.with_suffix(".nfo").exists())
+        self.assertEqual(other_record["current"]["local_paths"], [str(linked_video)])
 
     def test_blacklisted_number_is_not_submitted_or_upgraded(self):
         subscription = {"id": "sub", "performer": "Actress", "keywords": "", "blacklist": ["SSNI-618"], "download_dir": "/video", "wash_enabled": True}
@@ -2299,7 +2559,7 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(records["sub"], {})
 
     def test_manual_poll_persists_number_and_downloader_state(self):
-        candidate = {"id": "1", "code": "SSNI-618", "title": "SSNI-618 1080p x265", "rank": [1, 0, 2], "seeders": 10, "created": "2026"}
+        candidate = {"id": "1", "code": "SSNI-618", "title": "SSNI-618 1080p x265", "rank": [1, 1, 2], "seeders": 10, "created": "2026"}
         app.write_json(app.SETTINGS_FILE, {"mteam_token": "token", "downloader": {"type": "qbittorrent", "url": "http://nas:8080"}, "poll_interval_minutes": 60, "auto_scan": True})
         app.write_json(app.SUBSCRIPTIONS_FILE, [{"id": "sub", "performer": "三上悠亚", "keywords": "ltx", "download_dir": "/video", "wash_enabled": True}])
         app.write_json(app.RECORDS_FILE, {"sub": {"SSNI-618": {"code": "SSNI-618", "last_error": "參數錯誤", "retry_after": time.time() + 3600}}})
@@ -2320,7 +2580,7 @@ class UpgradeTests(unittest.TestCase):
         self.assertTrue(all(item["subscription"] == "三上悠亚" for item in round_entries if item["event"] == "run_separator"))
 
     def test_missing_downloader_task_is_resubmitted_for_same_mteam_release(self):
-        subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": "/video", "wash_enabled": True}
+        subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": "/video", "wash_enabled": True, "exclude_non_chinese": False}
         candidate = {"id": "1287499", "code": "SSIS-419", "title": "SSIS-419 初体験は三上悠亜", "rank": [1, 0, 1], "seeders": 10, "created": "2026", "metadata_complete": True}
         records = {"sub": {"SSIS-419": {"code": "SSIS-419", "current": {
             "id": "1287499", "code": "SSIS-419", "title": candidate["title"], "rank": [1, 0, 1],
@@ -2420,7 +2680,7 @@ class UpgradeTests(unittest.TestCase):
     def test_completed_record_without_local_video_is_resubmitted(self):
         root = Path(self.directory.name) / "videos"
         root.mkdir()
-        subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": str(root), "wash_enabled": True}
+        subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": str(root), "wash_enabled": True, "exclude_non_chinese": False}
         candidate = {"id": "1287499", "code": "SSIS-419", "title": "SSIS-419 Actress", "rank": [1, 0, 1], "seeders": 10, "created": "2026", "metadata_complete": True}
         records = {"sub": {"SSIS-419": {"code": "SSIS-419", "current": {
             "id": "1287499", "code": "SSIS-419", "title": candidate["title"], "rank": [1, 0, 1],
@@ -2437,14 +2697,40 @@ class UpgradeTests(unittest.TestCase):
         self.assertTrue(any(item["state"] == "missing" for item in results))
 
     def test_debug_mode_logs_per_number_skip_reason(self):
-        subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": "/video", "wash_enabled": True}
+        subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": "/video", "wash_enabled": True, "exclude_non_chinese": False}
         candidate = {"id": "1287499", "code": "SSIS-419", "title": "SSIS-419 Actress", "rank": [1, 0, 1], "seeders": 10, "created": "2026", "metadata_complete": True}
         records = {"sub": {"SSIS-419": {"code": "SSIS-419", "current": {"id": "1287499", "hash": "old-task", "state": "downloading"}}}}
         with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "scan_local_releases", return_value={}):
             app.process_subscription(subscription, records, {"mteam_token": "token", "debug_mode": True}, FakeDownloader(), [])
         messages = [entry["message"] for entry in app.get_logs() if entry["event"] == "debug_decision"]
         self.assertTrue(any("已由本地文件 ID 或记录确认安装" in message for message in messages))
-        self.assertTrue(any("候选开始：M-Team ID 1287499" in message and "current=ID 1287499" in message for message in messages))
+        candidate_log = next(message for message in messages if "正在核对候选版本" in message)
+        self.assertIn("候选版本 · 1080p · 非中文 · x264（M-Team ID 1287499）", candidate_log)
+        self.assertIn("当前记录 · 下载中 · M-Team ID 1287499", candidate_log)
+        self.assertIn("本地未发现该番号的视频", candidate_log)
+        self.assertNotIn("待下载版本", candidate_log)
+
+    def test_candidate_diagnostic_uses_file_id_from_subscription_records(self):
+        root = Path(self.directory.name) / "debug-bound-local-id"
+        root.mkdir()
+        video = root / "IPX-216.mp4"
+        video.touch()
+        subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": str(root), "wash_enabled": True}
+        candidate = {"id": "1278125", "code": "IPX-216", "title": "IPX-216 1080p x264", "rank": [1, 1, 1], "seeders": 10, "created": "2026", "metadata_complete": True}
+        metadata = {**app.candidate_metadata(candidate), "size": video.stat().st_size, "mtime_ns": video.stat().st_mtime_ns,
+                    "rank_version": app.LOCAL_MTEAM_RANK_VERSION}
+        records = {"sub": {"IPX-216": {
+            "code": "IPX-216", "local_files": {str(video): metadata}, "mteam_metadata": app.candidate_metadata(candidate),
+        }}}
+        app.write_json(app.SUBSCRIPTIONS_FILE, [subscription])
+        with patch.object(app, "mteam_search", return_value=[candidate]):
+            app.process_subscription(subscription, records, {"mteam_token": "token", "debug_mode": True}, FakeDownloader(), [])
+        candidate_log = next(
+            entry["message"] for entry in app.get_logs()
+            if entry["event"] == "debug_decision" and "正在核对候选版本" in entry["message"]
+        )
+        self.assertIn("本地版本 · 1080p · 中文字幕 · x264（M-Team ID 1278125", candidate_log)
+        self.assertNotIn("未绑定 M-Team ID", candidate_log)
 
     def test_debug_mode_logs_when_local_number_is_missing_from_search_results(self):
         root = Path(self.directory.name) / "debug-missing-search-result"
@@ -2457,6 +2743,29 @@ class UpgradeTests(unittest.TestCase):
         messages = [entry["message"] for entry in app.get_logs() if entry["event"] == "debug_decision"]
         self.assertTrue(any("ABF-017 搜索诊断" in message and "没有返回该番号候选" in message for message in messages))
 
+    def test_debug_search_diagnostic_uses_human_readable_candidate_details(self):
+        root = Path(self.directory.name) / "debug-search-result"
+        root.mkdir()
+        (root / "SSIS-951.mp4").touch()
+        subscription = {"id": "sub", "performer": "河北彩花", "keywords": "", "download_dir": str(root), "wash_enabled": True}
+        candidate = {
+            "id": "1280508", "code": "SSIS-951",
+            "title": "SSIS-951 夜、ホテル、女上司と二人きり。相部屋逆NTR 河北彩花",
+            "rank": [1, 1, 2], "seeders": 12, "metadata_complete": True,
+        }
+        with patch.object(app, "mteam_search", return_value=[candidate]):
+            app.process_subscription(subscription, {}, {"mteam_token": "token", "debug_mode": True}, FakeDownloader(), [])
+        messages = [entry["message"] for entry in app.get_logs() if entry["event"] == "debug_decision"]
+        diagnostic = next(message for message in messages if "SSIS-951 搜索诊断" in message)
+        self.assertIn("找到 1 个候选", diagnostic)
+        self.assertIn("候选 1 · M-Team ID 1280508", diagnostic)
+        self.assertIn("版本等级：1080p · 中文字幕 · x265", diagnostic)
+        self.assertIn("详情分级完整", diagnostic)
+        self.assertIn("主标题：《SSIS-951 夜、ホテル、女上司と二人きり。相部屋逆NTR 河北彩花》", diagnostic)
+        self.assertNotIn("rank=", diagnostic)
+        self.assertNotIn("complete=", diagnostic)
+        self.assertNotIn("候选选择：候选", "\n".join(messages))
+
     def test_manual_poll_can_check_only_the_requested_subscription(self):
         app.write_json(app.SETTINGS_FILE, {"mteam_token": "token", "downloader": {"type": "qbittorrent", "url": "http://nas:8080"}})
         app.write_json(app.SUBSCRIPTIONS_FILE, [
@@ -2466,7 +2775,101 @@ class UpgradeTests(unittest.TestCase):
         with patch.object(app, "Downloader", return_value=FakeDownloader()), patch.object(app, "mteam_search", return_value=[]) as search, patch.object(app, "scan_local_releases", return_value={}):
             result = app.run_poll("manual", "two")
         self.assertEqual(result["state"], "completed")
-        search.assert_called_once_with("Two", "token")
+        search.assert_called_once_with("Two ltx", "token")
+
+    def test_poll_saves_submitted_task_hash_before_subscription_finishes(self):
+        app.write_json(app.SETTINGS_FILE, {"mteam_token": "token", "downloader": {"url": "http://nas:8080"}})
+        subscription = {"id": "one", "performer": "Actress", "download_dir": "/video/one", "wash_enabled": True}
+        app.write_json(app.SUBSCRIPTIONS_FILE, [subscription])
+        candidate = {"id": "10001", "code": "CAWD-987", "title": "CAWD-987", "rank": [1, 2, 1],
+                     "metadata_complete": True}
+
+        def verify_submission(*_):
+            records = app.read_json(app.RECORDS_FILE, {})
+            self.assertEqual(records["one"]["CAWD-987"]["current"]["hash"], "newhash")
+
+        with patch.object(app, "Downloader", return_value=FakeDownloader()), \
+             patch.object(app, "scan_local_releases", return_value={}), \
+             patch.object(app, "mteam_search", return_value=[candidate]), \
+             patch.object(app, "fetch_torrent", return_value=torrent_bytes()), \
+             patch.object(app, "sync_subscription_covers", side_effect=verify_submission) as sync:
+            status = app.run_poll("manual", "one")
+        self.assertEqual(status["state"], "completed")
+        sync.assert_called_once()
+
+    def test_scheduled_and_manual_checks_complete_each_subscription_before_the_next(self):
+        app.write_json(app.SETTINGS_FILE, {"mteam_token": "token", "downloader": {"url": "http://nas:8080"}})
+        subscriptions = []
+        for name in ("One", "Two"):
+            directory = Path(self.directory.name) / name
+            directory.mkdir()
+            subscriptions.append({"id": name, "performer": name, "download_dir": str(directory), "wash_enabled": True})
+        app.write_json(app.SUBSCRIPTIONS_FILE, subscriptions)
+        for trigger in ("manual", "scheduled"):
+            with self.subTest(trigger=trigger):
+                events = []
+                app.write_json(app.RECORDS_FILE, {name: {"IPX-810": {
+                    "code": "IPX-810", "current": {"hash": name, "state": "completed", "rank": [1, 1, 1]},
+                }, "IPX-811": {"mteam_metadata": {"id": "123456", "rank": [0, 0, 0]}}} for name in ("One", "Two")})
+                candidate = {"id": "10001", "code": "CAWD-987", "title": "CAWD-987", "rank": [1, 2, 1],
+                             "metadata_complete": True}
+
+                def search(keyword, _token):
+                    events.append(("search", keyword.split()[0]))
+                    return [candidate]
+
+                def submit(subscription, *_):
+                    events.append(("submit", subscription["id"]))
+                    return {**candidate, "hash": subscription["id"] + "-new"}
+
+                def enrich(seed, *_):
+                    events.append(("rank", seed["code"]))
+                    return seed
+
+                with patch.object(app, "Downloader", return_value=FakeDownloader(complete=True)), \
+                     patch.object(app, "archive_subscription_videos", side_effect=lambda sub, *_: events.append(("archive", sub["id"]))), \
+                     patch.object(app, "scan_local_releases", return_value={}), \
+                     patch.object(app, "find_local_releases", return_value=[{"path": "/already-complete"}]), \
+                     patch.object(app, "mteam_search", side_effect=search), \
+                     patch.object(app, "submit_candidate", side_effect=submit), \
+                     patch.object(app, "enrich_candidate_from_detail", side_effect=enrich), \
+                     patch.object(app, "_download_release_subtitles", side_effect=lambda _release, _code, _token, name, _meta: events.append(("subtitle", name))), \
+                     patch.object(app, "sync_subscription_covers", side_effect=lambda sub, *_: events.append(("artwork", sub["id"]))):
+                    self.assertEqual(app.run_poll(trigger)["state"], "completed")
+                expected = [(stage, "IPX-811" if stage == "rank" else name) for name in ("One", "Two")
+                            for stage in ("archive", "search", "submit", "rank", "subtitle", "artwork")]
+                self.assertEqual(events, expected)
+
+    def test_scheduled_poll_archives_local_videos_before_search_like_manual_poll(self):
+        root = Path(self.directory.name) / "scheduled-archive"
+        root.mkdir()
+        video = root / "SSIS-698 1080p.mp4"
+        video.touch()
+        subscription = {"id": "scheduled", "performer": "Actress", "download_dir": str(root), "wash_enabled": True}
+        app.write_json(app.SETTINGS_FILE, {"mteam_token": "token", "downloader": {"type": "qbittorrent", "url": "http://nas:8080"}})
+        app.write_json(app.SUBSCRIPTIONS_FILE, [subscription])
+        observed = []
+
+        def archive(*args):
+            observed.append("archive")
+            self.assertEqual(args[0]["id"], "scheduled")
+            self.assertIn("SSIS-698", args[1])
+            return True
+
+        def search(*args, **kwargs):
+            observed.append("search")
+            return []
+
+        scan = {"SSIS-698": [{"path": str(video), "title": video.name, "rank": [1, 0, 1], "metadata": {}}]}
+        with patch.object(app, "Downloader", return_value=FakeDownloader()), \
+             patch.object(app, "scan_local_releases", return_value=scan), \
+             patch.object(app, "archive_subscription_videos", side_effect=archive) as archive_call, \
+             patch.object(app, "mteam_search", side_effect=search):
+            result = app.run_poll("scheduled")
+
+        self.assertEqual(result["state"], "completed")
+        archive_call.assert_called_once()
+        self.assertEqual(observed, ["archive", "search"])
 
     def test_rate_limit_waits_with_countdown_then_retries_poll(self):
         app.write_json(app.SETTINGS_FILE, {"mteam_token": "token", "downloader": {"type": "qbittorrent", "url": "http://nas:8080"}})
@@ -2483,7 +2886,7 @@ class UpgradeTests(unittest.TestCase):
             status = app.run_poll("manual")
         self.assertEqual(status["state"], "completed")
         self.assertEqual(search.call_count, 3)
-        self.assertEqual([call.args[0] for call in search.call_args_list], ["One", "Two", "Two"])
+        self.assertEqual([call.args[0] for call in search.call_args_list], ["One ltx", "Two ltx", "Two ltx"])
         self.assertTrue(countdown_states)
         waiting_states = [item for item in countdown_states if item["state"] == "waiting_retry"]
         self.assertTrue(waiting_states)
@@ -2509,7 +2912,7 @@ class UpgradeTests(unittest.TestCase):
             status = app.run_poll("manual")
 
         self.assertEqual(status["state"], "completed")
-        self.assertEqual([call.args[0] for call in search.call_args_list], ["One", "Two", "Two", "Two"])
+        self.assertEqual([call.args[0] for call in search.call_args_list], ["One ltx", "Two ltx", "Two ltx", "Two ltx"])
         self.assertEqual(observed_limit_counts, {1, 2})
         self.assertEqual(len([item for item in app.get_logs() if item["event"] == "rate_limited"]), 2)
         self.assertFalse(app.MTEAM_LIMIT_FILE.exists())
@@ -2545,6 +2948,70 @@ class UpgradeTests(unittest.TestCase):
         events = [item["event"] for item in app.get_logs()]
         self.assertIn("retry_waiting", events)
         self.assertIn("retry_resuming", events)
+
+    def test_stop_during_http_and_json_rate_limit_preserves_queue_and_cooldown(self):
+        subscription = {"id": "one", "performer": "Actress", "download_dir": "/video", "wash_enabled": True}
+        app.write_json(app.SETTINGS_FILE, {"mteam_token": "token", "downloader": {"url": "http://nas:8080"}})
+        app.write_json(app.SUBSCRIPTIONS_FILE, [subscription])
+        clock = [1000.0]
+        for transport in ("HTTP", "JSON"):
+            with self.subTest(transport=transport):
+                app.MTEAM_LIMIT_FILE.unlink(missing_ok=True)
+                app.REQUEST_FILE.unlink(missing_ok=True)
+                clock[0] = 1000.0
+                headers = Message()
+                headers["Retry-After"] = "60"
+                response = io.BytesIO(b'{"code":429,"message":"too many requests"}')
+                limited = urllib.error.HTTPError("https://api.m-team.cc/api/torrent/search", 429, "", headers, response)
+                if transport == "JSON":
+                    limited = FakeResponse(response.getvalue())
+
+                def stop_and_queue(seconds):
+                    active = app.get_status()
+                    self.assertEqual(active["state"], "waiting_retry")
+                    app.queue_scan("manual", "one")
+                    self.assertEqual(app.get_status()["state"], "waiting_retry")
+                    self.assertEqual(app.get_status()["queued_count"], 1)
+                    app.request_check_stop(active["run_id"])
+                    clock[0] += seconds
+
+                with patch.object(app, "MTEAM_DEFAULT_COOLDOWN", 60), \
+                     patch.object(app.time, "time", side_effect=lambda: clock[0]), \
+                     patch.object(app.time, "sleep", side_effect=stop_and_queue), \
+                     patch.object(app, "Downloader", return_value=FakeDownloader()), \
+                     patch.object(app, "scan_local_releases", return_value={}), \
+                     patch.object(app, "wait_for_mteam_request"), \
+                     patch.object(app.MTEAM_OPENER, "open", side_effect=[limited]) as request:
+                    status = app.run_poll("manual")
+                request.assert_called_once()
+                self.assertEqual(status["state"], "stopped")
+                self.assertEqual(app.get_status()["queued_count"], 1)
+                self.assertEqual(app.read_json(app.MTEAM_LIMIT_FILE, {}), {"retry_at": 1060.0, "resume": False})
+                self.assertEqual(clock[0], 1001.0)
+
+    def test_restarting_check_preserves_round_and_skips_completed_subscriptions(self):
+        app.write_json(app.SETTINGS_FILE, {"mteam_token": "token", "downloader": {"url": "http://nas:8080"}})
+        app.write_json(app.SUBSCRIPTIONS_FILE, [
+            {"id": code, "performer": code, "download_dir": f"/video/{code}", "wash_enabled": True}
+            for code in ("one", "two")
+        ])
+        with patch.object(app, "Downloader", return_value=FakeDownloader()), \
+             patch.object(app, "scan_local_releases", return_value={}), \
+             patch.object(app, "mteam_search", side_effect=[[], app.MTeamRequestInterrupted("服务停止"), []]) as search:
+            interrupted = app.run_poll("scheduled")
+            checkpoint = app.read_json(app.STATUS_FILE, {})
+            self.assertEqual(interrupted["state"], "running")
+            self.assertEqual(checkpoint["completed_subscription_ids"], ["one"])
+            self.assertEqual(app.read_json(app.SCHEDULE_FILE, {})["last_run_at"], "")
+            self.assertFalse(app.recover_interrupted_poll())
+            resumed = app.run_poll("scheduled", resume=checkpoint)
+        self.assertEqual([call.args[0] for call in search.call_args_list], ["one ltx", "two ltx", "two ltx"])
+        self.assertEqual(resumed["run_id"], checkpoint["run_id"])
+        self.assertEqual(resumed["state"], "completed")
+        separators = [entry for entry in app.get_logs() if entry["event"] == "run_separator"]
+        self.assertEqual(len(separators), 4)
+        self.assertEqual({entry["round_id"] for entry in separators}, {resumed["round_id"]})
+        self.assertEqual(app.read_json(app.SCHEDULE_FILE, {})["last_run_at"], resumed["completed_at"])
 
     def test_scheduler_stop_during_rate_wait_does_not_start_next_subscription(self):
         app.write_json(app.SETTINGS_FILE, {"mteam_token": "token", "downloader": {"type": "qbittorrent", "url": "http://nas:8080"}})
@@ -2586,15 +3053,15 @@ class UpgradeTests(unittest.TestCase):
 
     def test_higher_release_is_added_before_old_data_is_removed(self):
         subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": "/video", "wash_enabled": True}
-        old = {"id": "old", "code": "IPX-811", "title": "IPX-811 1080p x264", "rank": [1, 0, 1], "hash": "oldhash", "state": "completed", "progress": 100}
-        candidate = {"id": "new", "code": "IPX-811", "title": "IPX-811 4K 中文 x265", "rank": [2, 1, 2], "seeders": 8, "created": "2026"}
+        old = {"id": "old", "code": "IPX-811", "title": "IPX-811 4K x264", "rank": [2, 0, 1], "hash": "oldhash", "state": "completed", "progress": 100}
+        candidate = {"id": "new", "code": "IPX-811", "title": "IPX-811 1080p 中文 x265", "rank": [1, 1, 2], "seeders": 8, "created": "2026"}
         records = {"sub": {"IPX-811": {"code": "IPX-811", "current": old}}}
         downloader = FakeDownloader("newhash")
         with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "fetch_torrent", return_value=torrent_bytes()), patch.object(app, "scan_local_releases", return_value={}):
             results = []
             app.process_subscription(subscription, records, {"mteam_token": "token"}, downloader, results)
         self.assertEqual(records["sub"]["IPX-811"]["pending"]["state"], "upgrading")
-        self.assertIn("分辨率：1080p → 4K", records["sub"]["IPX-811"]["pending"]["message"])
+        self.assertIn("分辨率：4K → 1080p", records["sub"]["IPX-811"]["pending"]["message"])
         self.assertIn("中文等级：非中文 → 中文字幕", records["sub"]["IPX-811"]["pending"]["message"])
         self.assertEqual(results[-1]["message"], records["sub"]["IPX-811"]["pending"]["message"])
         self.assertEqual(downloader.removed, [])
@@ -2603,6 +3070,52 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(downloader.removed, [("oldhash", True)])
         self.assertEqual(records["sub"]["IPX-811"]["current"]["hash"], "newhash")
         self.assertNotIn("pending", records["sub"]["IPX-811"])
+
+    def test_chinese_filter_selects_chinese_alternative_and_can_be_disabled(self):
+        subscription = {"id": "sub", "performer": "Actress", "download_dir": "/video"}
+        base = {"code": "IPX-811", "title": "IPX-811", "seeders": 8, "created": "2026", "metadata_complete": True}
+        native = {**base, "id": "1", "rank": [2, 0, 2]}
+        chinese = {**base, "id": "2", "rank": [1, 1, 1]}
+        details = {
+            "1": {"performer": "Actress", "hasChineseSubtitle": False},
+            "2": {"performer": "Actress", "hasChineseSubtitle": True},
+        }
+        for enabled, offers, expected in ((True, [native, chinese], "2"), (False, [native, chinese], "2"),
+                                          (True, [native], None), (False, [native], "1")):
+            with self.subTest(enabled=enabled), \
+                 patch.object(app, "mteam_search", return_value=offers), \
+                 patch.object(app, "mteam_detail", side_effect=lambda identifier, *_: details[identifier]), \
+                 patch.object(app, "fetch_torrent", return_value=torrent_bytes()) as fetch, \
+                 patch.object(app, "scan_local_releases", return_value={}):
+                records, downloader = {}, FakeDownloader()
+                app.process_subscription({**subscription, "exclude_non_chinese": enabled}, records, {"mteam_token": "token"}, downloader, [])
+                if expected is None:
+                    fetch.assert_not_called()
+                    self.assertEqual(records["sub"], {})
+                else:
+                    fetch.assert_called_once_with(expected, "token")
+                    self.assertEqual(records["sub"]["IPX-811"]["current"]["id"], expected)
+
+    def test_chinese_filter_does_not_wash_with_non_chinese_or_unconfirmed_candidates(self):
+        subscription = {"id": "sub", "performer": "Actress", "download_dir": "/video"}
+        current = {"id": "old", "code": "IPX-811", "title": "IPX-811", "rank": [1, 2, 1],
+                   "hash": "oldhash", "state": "completed"}
+        base = {"code": "IPX-811", "title": "IPX-811", "seeders": 8, "created": "2026"}
+        candidates = [{**base, "id": "1", "rank": [2, 0, 2], "metadata_complete": True},
+                      {**base, "id": "2", "rank": [2, 0, 2], "metadata_complete": False},
+                      {**base, "id": "3", "rank": [2, 2, 2], "metadata_complete": True}]
+        details = {"2": {"performer": "Actress", "smallDescr": "日文字幕", "resolution": "4K", "videoCodec": "x265"},
+                   "3": {"performer": "Actress", "labelsNew": [], "hasChineseSubtitle": False}}
+        records, downloader = {"sub": {"IPX-811": {"code": "IPX-811", "current": current}}}, FakeDownloader()
+        with patch.object(app, "mteam_search", return_value=candidates), \
+             patch.object(app, "mteam_detail", side_effect=lambda identifier, *_: details[identifier]), \
+             patch.object(app, "fetch_torrent") as fetch, patch.object(app, "scan_local_releases", return_value={}):
+            app.process_subscription(subscription, records, {"mteam_token": "token"}, downloader, [])
+        fetch.assert_not_called()
+        self.assertEqual(downloader.removed, [])
+        self.assertIs(records["sub"]["IPX-811"]["current"], current)
+        self.assertNotIn("pending", records["sub"]["IPX-811"])
+        self.assertTrue(any(item["event"] == "non_chinese_filtered" for item in app.get_logs()))
 
     def test_same_pending_mteam_release_is_not_resubmitted_when_rank_improves(self):
         subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": "/video", "wash_enabled": True}
@@ -2620,7 +3133,7 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual(records["sub"]["IPX-811"]["pending"]["rank"], [2, 2, 2])
 
     def test_upgrade_reason_describes_each_rank_dimension(self):
-        self.assertEqual(app.upgrade_reason([1, 0, 1], [2, 2, 2]), "分辨率：1080p → 4K；中文等级：非中文 → 内嵌中文")
+        self.assertEqual(app.upgrade_reason([2, 0, 1], [1, 2, 2]), "中文等级：非中文 → 内嵌中文；分辨率：4K → 1080p")
 
     def test_codec_only_improvement_does_not_trigger_wash(self):
         subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": "/video", "wash_enabled": True}
@@ -2629,11 +3142,17 @@ class UpgradeTests(unittest.TestCase):
         records = {"sub": {"IPX-811": {"code": "IPX-811", "current": current}}}
         downloader = FakeDownloader("new-hash")
         with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "fetch_torrent") as fetch, patch.object(app, "scan_local_releases", return_value={}):
-            app.process_subscription(subscription, records, {"mteam_token": "token"}, downloader, [])
+            app.process_subscription(subscription, records, {"mteam_token": "token", "debug_mode": True}, downloader, [])
         fetch.assert_not_called()
         self.assertEqual(downloader.added, [])
         self.assertNotIn("pending", records["sub"]["IPX-811"])
         self.assertEqual(records["sub"]["IPX-811"]["current"]["hash"], "old-hash")
+        decision = next(entry["message"] for entry in app.get_logs() if "洗版判断" in entry["message"])
+        self.assertEqual(decision.splitlines(), [
+            "IPX-811 洗版判断 · 分辨率和中文等级相同，无需洗版",
+            "候选版本 · 1080p · 中文字幕 · x265（M-Team ID new）",
+            "当前记录 · 1080p · 中文字幕 · x264（M-Team ID old）",
+        ])
 
     def test_existing_local_number_skips_duplicate_and_is_removed_after_upgrade(self):
         root = Path(self.directory.name) / "videos"
@@ -2803,6 +3322,13 @@ class UpgradeTests(unittest.TestCase):
         results = []
         with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "mteam_detail", return_value=detail) as detail_lookup, patch.object(app, "fetch_torrent", return_value=torrent_bytes()):
             app.process_subscription(subscription, records, {"mteam_token": "token"}, downloader, results)
+            app.process_subscription(subscription, records, {"mteam_token": "token"}, downloader, [])
+        detail_lookup.assert_called_once_with("1292971", "token", force_refresh=True)
+        verification = records["sub"]["ABF-017"]["rank_verification"]
+        with patch.object(app.time, "time", return_value=verification["checked_at"] + app.MTEAM_RANK_RECHECK_SECONDS), \
+             patch.object(app, "mteam_search", return_value=[candidate]), \
+             patch.object(app, "mteam_detail", return_value=detail) as detail_lookup:
+            app.process_subscription(subscription, records, {"mteam_token": "token"}, downloader, [])
         detail_lookup.assert_called_once_with("1292971", "token", force_refresh=True)
         self.assertEqual(records["sub"]["ABF-017"]["mteam_metadata"]["rank"], [1, 2, 1])
         self.assertNotIn("pending", records["sub"]["ABF-017"])
@@ -2914,7 +3440,7 @@ class UpgradeTests(unittest.TestCase):
         video.write_bytes(b"already downloaded")
         video.with_suffix(".nfo").write_text("<movie><video><width>3840</width><height>2160</height><codec>HEVC</codec></video><subtitlelanguage>chi</subtitlelanguage></movie>", encoding="utf-8")
         subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": str(root), "wash_enabled": True}
-        candidate = {"id": "new", "code": "IPX-811", "title": "IPX-811 1080p x264", "rank": [1, 0, 1], "seeders": 8, "created": "2026"}
+        candidate = {"id": "new", "code": "IPX-811", "title": "IPX-811 1080p x264", "rank": [1, 1, 1], "seeders": 8, "created": "2026"}
         records = {}
         downloader = FakeDownloader()
         with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "fetch_torrent", return_value=torrent_bytes()):
@@ -2924,21 +3450,21 @@ class UpgradeTests(unittest.TestCase):
 
     def test_local_duplicate_wash_recurses_within_subscription_directory(self):
         root = Path(self.directory.name) / "三上悠亚"
-        nested = root / "SSNI-229 4K 内嵌中文 x265"
+        nested = root / "SSNI-229 1080p 中文字幕 x265"
         nested.mkdir(parents=True)
         better = nested / "SSNI-229-U.ltx.mp4"
-        lower = root / "SSNI-229 1080p 中文字幕 x264-U.ltx.mp4"
+        lower = root / "SSNI-229 4K x264-U.ltx.mp4"
         better.write_bytes(b"better")
         lower.write_bytes(b"lower")
-        better.with_suffix(".nfo").write_text("<movie><video><width>3840</width><height>2160</height><codec>HEVC</codec></video></movie>", encoding="utf-8")
-        lower.with_suffix(".nfo").write_text("<movie><video><width>1920</width><height>1080</height><codec>AVC</codec></video></movie>", encoding="utf-8")
+        better.with_suffix(".nfo").write_text("<movie><video><width>1920</width><height>1080</height><codec>HEVC</codec></video><subtitlelanguage>chi</subtitlelanguage></movie>", encoding="utf-8")
+        lower.with_suffix(".nfo").write_text("<movie><video><width>3840</width><height>2160</height><codec>AVC</codec></video></movie>", encoding="utf-8")
         subscription = {"id": "sub", "performer": "三上悠亚", "keywords": "", "download_dir": str(root), "wash_enabled": True}
         with patch.object(app, "mteam_search", return_value=[]):
             app.process_subscription(subscription, {}, {"mteam_token": "token", "local_multi_disk_wash": True}, FakeDownloader(), [])
         self.assertTrue(better.exists())
         self.assertFalse(lower.exists())
         local_wash = next(item for item in app.get_logs() if item["event"] == "local_wash_completed")
-        self.assertIn("分辨率：1080p → 4K", local_wash["message"])
+        self.assertIn("中文等级：非中文 → 中文字幕；分辨率：4K → 1080p", local_wash["message"])
         self.assertEqual(local_wash["subscription"], "三上悠亚")
 
     def test_check_auto_binds_each_duplicate_before_local_washing(self):
@@ -3117,9 +3643,7 @@ class UpgradeTests(unittest.TestCase):
         second.write_bytes(b"second")
         subscription = {"id": "sub", "performer": "Actress", "download_dir": str(root)}
         records = {"sub": {"MIRD-284": {"local_files": {str(first): {"id": "111"}, str(second): {"id": "222"}}}}}
-        failures = [app.AppError("详情接口失败"),
-            {"performer": "Other", "resolution": "2160p", "videoCodec": "x265", "labelsNew": ["中字"]},
-            {"performer": "Actress", "labelsNew": ["中字"]}]
+        failures = [app.AppError("详情接口失败"), {"performer": "Actress", "labelsNew": ["中字"]}]
         for failure in failures:
             with self.subTest(failure=failure):
                 kwargs = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
@@ -3154,7 +3678,8 @@ class UpgradeTests(unittest.TestCase):
         second.write_bytes(b"second")
         subscription = {"id": "sub", "performer": "Actress", "download_dir": str(root)}
         records = {"sub": {"MIRD-284": {"local_files": {str(first): {"id": "111"}, str(second): {"id": "222"}}}}}
-        with patch.object(app, "mteam_detail", side_effect=app.MTeamRateLimitError("限流")):
+        with patch.object(app, "mteam_search", return_value=[]), \
+             patch.object(app, "mteam_detail", side_effect=app.MTeamRateLimitError("限流")):
             with self.assertRaises(app.MTeamRateLimitError):
                 app.process_subscription(subscription, records, {"mteam_token": "token", "local_multi_disk_wash": True}, FakeDownloader(), [])
         self.assertTrue(first.exists())
@@ -3300,7 +3825,7 @@ class UpgradeTests(unittest.TestCase):
         log = next(item for item in app.get_logs() if item["event"] == "local_wash_completed")
         self.assertIn("版本等级相同", log["message"])
 
-    def test_other_subscription_local_number_is_hardlinked_without_downloading(self):
+    def test_other_subscription_local_number_is_hardlinked_and_higher_candidate_is_queued_for_wash(self):
         root = Path(self.directory.name)
         source_dir = root / "source-subscription"
         target_dir = root / "target-subscription"
@@ -3320,19 +3845,21 @@ class UpgradeTests(unittest.TestCase):
         candidate = {"id": "1289514", "code": "IPX-811", "title": "IPX-811 4K 内嵌中文 x265", "rank": [2, 2, 2], "seeders": 20, "created": "2026", "metadata_complete": True}
         downloader = FakeDownloader()
         records = {}
-        with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "mteam_detail", return_value={"performer": "Co-star B"}), patch.object(app, "fetch_torrent") as fetch:
+        with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "mteam_detail", return_value={"performer": "Co-star A, Co-star B"}), patch.object(app, "fetch_torrent") as fetch:
             app.process_subscription(app.list_subscriptions()[1], records, {"mteam_token": "token"}, downloader, [])
-        fetch.assert_not_called()
-        self.assertEqual(downloader.added, [])
+        fetch.assert_called_once_with("1289514", "token")
+        self.assertEqual(len(downloader.added), 1)
         target_video = target_dir / "IPX-811" / source.name
         self.assertTrue(target_video.exists())
         self.assertEqual(source.stat().st_ino, target_video.stat().st_ino)
         self.assertEqual((target_video.parent / subtitle.name).stat().st_ino, subtitle.stat().st_ino)
         self.assertEqual((target_video.parent / nfo.name).stat().st_ino, nfo.stat().st_ino)
         target_record = records["target"]["IPX-811"]
-        self.assertTrue(target_record["shared_local"])
+        self.assertEqual(target_record["pending"]["shared_subscription_ids"], ["source"])
+        self.assertEqual(target_record["pending"]["rank"], [2, 2, 2])
         self.assertTrue(target_record["current"]["local_existing"])
-        self.assertEqual(target_record["current"]["local_paths"], [str(target_video)])
+        self.assertIn(str(target_video), target_record["current"]["local_paths"])
+        self.assertIn(str(source), target_record["current"]["local_paths"])
         self.assertEqual(target_record["current"]["rank"], [1, 1, 1])
         app.remove_local_releases([str(target_video)], str(target_dir), "IPX-811")
         self.assertTrue(source.exists())
@@ -3340,6 +3867,39 @@ class UpgradeTests(unittest.TestCase):
         self.assertTrue(nfo.exists())
         with closing(sqlite3.connect(app.LOCAL_VIDEO_DATABASE)) as database:
             self.assertEqual(database.execute("SELECT subscription_id, code FROM local_videos ORDER BY subscription_id").fetchall(), [("source", "IPX-811"), ("target", "IPX-811")])
+
+    def test_local_video_index_exposes_hardlink_count(self):
+        root = Path(self.directory.name) / "hardlink-index"
+        root.mkdir()
+        original = root / "SSIS-698.mkv"
+        linked = root / "SSIS-698-linked.mkv"
+        original.write_bytes(b"same underlying video")
+        os.link(original, linked)
+        rows = app.index_subscription_videos("hardlinks", app.scan_local_releases(str(root)), {})
+        counts = {Path(item["path"]).name: item["hardlink_count"] for row in rows for item in row["files"]}
+        self.assertEqual(counts, {original.name: 2, linked.name: 2})
+
+    def test_hardlink_path_endpoint_returns_only_indexed_paths_to_same_inode(self):
+        root = Path(self.directory.name) / "hardlink-paths"
+        first_dir = root / "first"
+        second_dir = root / "second"
+        first_dir.mkdir(parents=True)
+        second_dir.mkdir()
+        first = first_dir / "SSIS-698.mkv"
+        second = second_dir / "SSIS-698-linked.mkv"
+        unrelated = second_dir / "SSIS-698-other.mkv"
+        first.write_bytes(b"shared inode")
+        os.link(first, second)
+        unrelated.write_bytes(b"different inode")
+        app.write_json(app.SUBSCRIPTIONS_FILE, [
+            {"id": "first", "performer": "A", "download_dir": str(first_dir)},
+            {"id": "second", "performer": "B", "download_dir": str(second_dir)},
+        ])
+        app.index_subscription_videos("first", app.scan_local_releases(str(first_dir)), {})
+        app.index_subscription_videos("second", app.scan_local_releases(str(second_dir)), {})
+        self.assertEqual(app.get_subscription_video_hardlinks("first", "SSIS-698", str(first)), {
+            "paths": sorted([str(first.resolve()), str(second.resolve())]), "count": 2,
+        })
 
     def test_other_subscription_indexed_number_with_missing_file_is_not_reused(self):
         root = Path(self.directory.name)
@@ -3355,7 +3915,7 @@ class UpgradeTests(unittest.TestCase):
         ])
         app.index_subscription_videos("source", app.scan_local_releases(str(source_dir)), {})
         source.unlink()
-        candidate = {"id": "1289514", "code": "IPX-811", "title": "IPX-811 1080p x264", "rank": [1, 0, 1], "seeders": 20, "created": "2026", "metadata_complete": True}
+        candidate = {"id": "1289514", "code": "IPX-811", "title": "IPX-811 1080p x264", "rank": [1, 1, 1], "seeders": 20, "created": "2026", "metadata_complete": True}
         downloader = FakeDownloader()
         with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "mteam_detail", return_value={"performer": "Co-star B"}), patch.object(app, "fetch_torrent", return_value=torrent_bytes()):
             app.process_subscription(app.list_subscriptions()[1], {}, {"mteam_token": "token"}, downloader, [])
@@ -3377,7 +3937,7 @@ class UpgradeTests(unittest.TestCase):
             {"id": "target", "performer": "Co-star B", "download_dir": str(target_dir)},
         ])
         app.index_subscription_videos("source", app.scan_local_releases(str(source_dir)), {})
-        candidate = {"id": "1289514", "code": "IPX-811", "title": "IPX-811 1080p x264", "rank": [1, 0, 1], "seeders": 20, "created": "2026", "metadata_complete": True}
+        candidate = {"id": "1289514", "code": "IPX-811", "title": "IPX-811 1080p x264", "rank": [1, 1, 1], "seeders": 20, "created": "2026", "metadata_complete": True}
         downloader = FakeDownloader()
         results = []
         with patch.object(app, "mteam_search", return_value=[candidate]), patch.object(app, "mteam_detail", return_value={"performer": "Unrelated Actress"}), patch.object(app, "fetch_torrent") as fetch:
@@ -3554,7 +4114,7 @@ class UpgradeTests(unittest.TestCase):
         source.write_bytes(b"video")
         target = root / "actress-subscription"
         subscription = {"id": "sub", "performer": "Actress", "keywords": "", "download_dir": str(target), "wash_enabled": True}
-        candidate = {"id": "1289514", "code": "SSNI-229", "title": "SSNI-229 4K", "rank": [2, 0, 1], "seeders": 5, "created": "2026", "metadata_complete": True}
+        candidate = {"id": "1289514", "code": "SSNI-229", "title": "SSNI-229 4K", "rank": [2, 1, 1], "seeders": 5, "created": "2026", "metadata_complete": True}
 
         class ExistingTaskDownloader(FakeDownloader):
             def add(self, data, title, download_dir):

@@ -19,6 +19,7 @@ case "$REL_PATH" in
   /app.js) FILE="app.js" ;;
   /version.js) FILE="version.js" ;;
   /log-utils.mjs) FILE="log-utils.mjs" ;;
+  /repair-status.mjs) FILE="repair-status.mjs" ;;
   *) printf 'Status: 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nNot Found'; exit 0 ;;
 esac
 case "$FILE" in
