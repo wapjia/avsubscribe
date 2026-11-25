@@ -16,6 +16,7 @@ case "$REL_PATH" in
   /vendor/*) PATH_INFO="$REL_PATH"; export PATH_INFO; exec python3 "$APP_ROOT/bin/app.py" ;;
   ""|/|/index.html) FILE="index.html" ;;
   /style.css) FILE="style.css" ;;
+  /app-icon.png) FILE="app-icon.png" ;;
   /app.js) FILE="app.js" ;;
   /version.js) FILE="version.js" ;;
   /log-utils.mjs) FILE="log-utils.mjs" ;;
@@ -25,6 +26,7 @@ esac
 case "$FILE" in
   *.html) CONTENT_TYPE="text/html; charset=utf-8" ;;
   *.css) CONTENT_TYPE="text/css; charset=utf-8" ;;
+  *.png) CONTENT_TYPE="image/png" ;;
   *.js|*.mjs) CONTENT_TYPE="application/javascript; charset=utf-8" ;;
 esac
 if [ ! -f "$APP_ROOT/www/$FILE" ]; then

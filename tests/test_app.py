@@ -680,6 +680,7 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
 
         self.assertFalse(public["cleanup_orphan_sidecars"])
         self.assertFalse(public["debug_mode"])
+        self.assertEqual(public["log_retention_days"], 15)
         self.assertEqual(public["mteam_request_interval_seconds"], 5)
         enabled = app.save_settings({"cleanup_orphan_sidecars": True})
         self.assertTrue(enabled["cleanup_orphan_sidecars"])
@@ -689,6 +690,14 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
         self.assertTrue(app.get_settings()["debug_mode"])
         app.save_settings({"clear_mteam_token": True})
         self.assertFalse(app.public_settings()["mteam_token_configured"])
+
+    def test_log_retention_setting_is_validated_and_persisted(self):
+        self.assertEqual(app.get_settings()["log_retention_days"], 15)
+        self.assertEqual(app.save_settings({"log_retention_days": 30})["log_retention_days"], 30)
+        self.assertEqual(app.get_settings()["log_retention_days"], 30)
+        for invalid in (0, 366, True, "15"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(app.AppError, "1 到 365 天"):
+                app.save_settings({"log_retention_days": invalid})
 
     def test_transmission_setting_is_rejected_and_legacy_setting_defaults_to_qbittorrent(self):
         with self.assertRaisesRegex(app.AppError, "仅支持 qBittorrent"):
@@ -1647,14 +1656,57 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
         self.assertEqual(app.clear_logs("Actress"), {"deleted": 1})
         self.assertEqual([item["message"] for item in app.get_logs()], ["legacy", "old"])
 
-    def test_legacy_log_import_retains_only_the_most_recent_500_entries(self):
+    def test_legacy_log_import_is_not_truncated_to_500_entries(self):
+        timestamp = app.now_iso()
         app.write_json(app.LOG_FILE, [
-            {"time": str(index), "event": "status", "message": str(index)}
+            {"time": timestamp, "event": "status", "message": str(index)}
             for index in range(505)
         ])
         rows = app.get_logs()
         self.assertEqual(len(rows), 500)
         self.assertEqual((rows[0]["message"], rows[-1]["message"]), ("5", "504"))
+        self.assertEqual(len(app.get_logs(limit=500, before_id=rows[0]["id"])), 5)
+
+    def test_logs_can_be_loaded_in_older_pages_without_losing_newer_entries(self):
+        timestamp = app.now_iso()
+        app.write_json(app.LOG_FILE, [
+            {"time": timestamp, "event": "status", "message": str(index)}
+            for index in range(505)
+        ])
+        newest = app.get_logs(limit=200)
+        self.assertEqual((newest[0]["message"], newest[-1]["message"]), ("305", "504"))
+        older = app.get_logs(limit=200, before_id=newest[0]["id"])
+        self.assertEqual((older[0]["message"], older[-1]["message"]), ("105", "304"))
+        self.assertEqual(len(app.get_logs(limit=500)), 500)
+
+    def test_log_search_and_category_filters_query_all_retained_rows(self):
+        timestamp = app.now_iso()
+        app.write_json(app.LOG_FILE, [
+            {
+                "time": timestamp, "event": "status", "subscription": "Other",
+                "message": f"ordinary {index}"
+            }
+            for index in range(250)
+        ] + [
+            {"time": timestamp, "event": "mteam_search_completed", "subscription": "Actress", "message": "needle rare match"}
+        ])
+        matches = app.get_logs(limit=200, keyword="needle rare", category="M-Team", subscription="Actress")
+        self.assertEqual([item["message"] for item in matches], ["needle rare match"])
+        self.assertEqual(app.get_logs(limit=200, keyword="ordinary", category="M-Team"), [])
+
+    def test_log_retention_prunes_by_age_instead_of_entry_count(self):
+        now = app.datetime.datetime.now(app.datetime.timezone.utc)
+        old_time = (now - app.datetime.timedelta(days=16)).isoformat(timespec="seconds")
+        recent_time = (now - app.datetime.timedelta(days=2)).isoformat(timespec="seconds")
+        app.write_json(app.LOG_FILE, [
+            {"time": old_time, "event": "status", "message": "expired"},
+            {"time": recent_time, "event": "status", "message": "recent"},
+        ])
+        connection = app.connect_log_database()
+        self.addCleanup(connection.close)
+        with connection:
+            self.assertEqual(app.prune_activity_logs(connection, force=True), 1)
+        self.assertEqual([row["message"] for row in app.get_logs()], ["recent"])
 
     def test_concurrent_log_writes_are_preserved(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
@@ -3490,7 +3542,7 @@ class UpgradeTests(unittest.TestCase):
             app.process_subscription(subscription, records, {"mteam_token": "token", "local_multi_disk_wash": True}, downloader, [])
         self.assertTrue(embedded.exists())
         self.assertFalse(external.exists())
-        self.assertEqual(downloader.removed, [("second", False)])
+        self.assertEqual(downloader.removed, [("second", True)])
         self.assertEqual(downloader.list_calls, 1)
         self.assertCountEqual(downloader.file_calls, ["first", "second"])
         self.assertEqual(detail.call_count, 2)
@@ -3605,7 +3657,7 @@ class UpgradeTests(unittest.TestCase):
         self.assertFalse(external.exists())
         self.assertTrue(embedded_nfo.exists())
         self.assertFalse(external_subtitle.exists())
-        self.assertEqual(downloader.removed, [("externalhash", False)])
+        self.assertEqual(downloader.removed, [("externalhash", True)])
         self.assertEqual({call.args[0] for call in detail.call_args_list}, {"111", "222"})
         log = next(item for item in app.get_logs() if item["event"] == "local_wash_completed")
         self.assertIn("中文等级：中文字幕 → 内嵌中文", log["message"])
@@ -3739,8 +3791,40 @@ class UpgradeTests(unittest.TestCase):
         self.assertFalse(lower.exists())
         self.assertFalse(nfo.exists())
         self.assertFalse(subtitle.exists())
-        self.assertEqual(downloader.removed, [("oldhash", False)])
+        self.assertEqual(downloader.removed, [("oldhash", True)])
         self.assertNotIn("current", records["sub"]["SSNI-229"])
+
+    def test_local_duplicate_wash_matches_task_by_torrent_file_list_when_content_path_differs(self):
+        root = Path(self.directory.name) / "torrent-file-match"
+        root.mkdir()
+        better = root / "SSNI-229 4K 内嵌中文 x265.mp4"
+        lower = root / "SSNI-229 1080p 中文字幕 x264.mp4"
+        better.write_bytes(b"better")
+        lower.write_bytes(b"lower")
+
+        class FileListDownloader(FakeDownloader):
+            def list_tasks(self, hashes=None):
+                return {"oldhash": {
+                    "name": "SSNI-229 torrent",
+                    "complete": True,
+                    "content_path": str(root / "stale-location" / lower.name),
+                    "save_path": str(root),
+                }}
+
+            def list_task_files(self, info_hash):
+                self.file_list_hash = info_hash
+                return [{"name": lower.name, "size": lower.stat().st_size}]
+
+        downloader = FileListDownloader()
+        releases = app.scan_local_releases(str(root))
+        app.wash_local_duplicate_releases(
+            str(root), releases, "Actress", downloader, downloader.list_tasks(), {}
+        )
+
+        self.assertEqual(downloader.file_list_hash, "oldhash")
+        self.assertEqual(downloader.removed, [("oldhash", True)])
+        self.assertFalse(lower.exists())
+        self.assertTrue(better.exists())
 
     def test_local_duplicate_wash_keeps_files_when_downloader_task_is_shared(self):
         root = Path(self.directory.name) / "videos"

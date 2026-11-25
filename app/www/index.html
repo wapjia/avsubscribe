@@ -9,7 +9,7 @@
 <body>
   <main class="shell">
     <aside class="sidebar" aria-label="主菜单">
-      <header class="brand-row"><div class="brand-mark" aria-hidden="true">片</div><div class="brand"><p class="eyebrow">FNOS · M-TEAM</p><div class="brand-title"><h1>影片订阅</h1><span id="app-version" class="app-version"></span></div></div></header>
+      <header class="brand-row"><img class="brand-mark" src="app-icon.png" alt=""><div class="brand"><p class="eyebrow">FNOS · M-TEAM</p><div class="brand-title"><h1>影片订阅</h1><span id="app-version" class="app-version"></span></div></div></header>
       <div class="sidebar-heading"><span>工作区</span></div>
       <nav class="main-nav" aria-label="工作区">
         <button class="nav-item active" data-view="all" aria-current="page"><span class="nav-icon" aria-hidden="true">▦</span><span>仪表台</span></button>
@@ -121,6 +121,7 @@
         <div class="settings-row"><div class="settings-control"><label class="toggle"><input id="local-multi-disk-wash" type="checkbox"><span class="switch"></span><span>洗版本地重复番号</span></label></div><div class="settings-row-description"><strong>仅限同一女优的订阅目录</strong><span>比较目录内同番号影片；仅在分辨率或中文等级明确较低时删除本地文件，不跨女优目录洗版。</span></div></div>
         <div class="settings-row"><div class="settings-control"><label class="toggle"><input id="cleanup-orphan-sidecars" type="checkbox"><span class="switch"></span><span>清理孤立配套文件</span></label></div><div class="settings-row-description"><strong>自动清理孤立配套文件和空目录</strong><span>检查时清理找不到对应视频的 NFO 和字幕，以及只剩图片或配套文件的子目录。原本就为空的子目录也会清理。</span></div></div>
         <div class="settings-row"><div class="settings-control"><label class="toggle"><input id="debug-mode" type="checkbox"><span class="switch"></span><span>调试模式</span></label></div><div class="settings-row-description"><strong>记录检查详情和接口响应</strong><span>「接口响应」日志显示请求耗时，展开后可查看并复制脱敏后的 JSON。</span></div></div>
+        <div class="settings-row"><div class="settings-control"><label for="log-retention-days">日志保存时间<input id="log-retention-days" type="number" min="1" max="365" step="1">天</label></div><div class="settings-row-description"><strong>自动清理过期日志</strong><span>默认保存 15 天；清理按时间执行，不限制日志总条数。</span></div></div>
       </div>
       <div class="settings-save-bar"><span>更改需要保存后才会生效。</span><button id="save-settings-footer" class="primary" type="button">保存设置</button></div>
       </section>
@@ -135,6 +136,7 @@
           </div>
         </div>
         <ol id="log-list" class="log-list" tabindex="-1"><li class="log-empty">等待检查任务。</li></ol>
+        <p id="log-history-status" class="log-history-status" aria-live="polite"></p>
       </section>
 
     </div>

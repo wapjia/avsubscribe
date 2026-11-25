@@ -5,6 +5,24 @@ from pathlib import Path
 
 
 class BuildVersionTests(unittest.TestCase):
+    def test_header_uses_the_supplied_application_icon(self):
+        root = Path(__file__).resolve().parents[1]
+        html = (root / "app/www/index.html").read_text(encoding="utf-8")
+        icon = root / "app/www/app-icon.png"
+        self.assertIn('class="brand-mark" src="app-icon.png" alt=""', html)
+        self.assertTrue(icon.is_file())
+        self.assertEqual(icon.read_bytes(), (root / "assets/app-icon-64.png").read_bytes())
+
+    def test_logs_load_older_pages_when_scrolled_to_the_bottom(self):
+        root = Path(__file__).resolve().parents[1]
+        html = (root / "app/www/index.html").read_text(encoding="utf-8")
+        script = (root / "app/www/app.js").read_text(encoding="utf-8")
+        self.assertIn('id="log-history-status"', html)
+        self.assertNotIn('id="load-older-logs"', html)
+        self.assertIn('$("#log-list").addEventListener("scroll"', script)
+        self.assertIn("list.scrollTop + list.clientHeight >= list.scrollHeight - 96", script)
+        self.assertIn("已加载全部日志", script)
+
     def test_build_increments_only_patch_version(self):
         self.assertEqual(bump_version("1.0.0"), "1.0.1")
         self.assertEqual(bump_version("2.4.19"), "2.4.20")
@@ -30,6 +48,11 @@ class BuildVersionTests(unittest.TestCase):
     def test_cgi_allows_loading_version_module_imported_by_app(self):
         cgi = (Path(__file__).resolve().parents[1] / "app/ui/index.cgi").read_text(encoding="utf-8")
         self.assertIn("/version.js) FILE=\"version.js\" ;;", cgi)
+
+    def test_cgi_serves_application_icon_as_png(self):
+        cgi = (Path(__file__).resolve().parents[1] / "app/ui/index.cgi").read_text(encoding="utf-8")
+        self.assertIn('/app-icon.png) FILE="app-icon.png" ;;', cgi)
+        self.assertIn('*.png) CONTENT_TYPE="image/png" ;;', cgi)
 
     def test_cgi_serves_round_log_module_as_javascript(self):
         cgi = (Path(__file__).resolve().parents[1] / "app/ui/index.cgi").read_text(encoding="utf-8")

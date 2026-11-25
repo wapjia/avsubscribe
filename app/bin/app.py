@@ -89,7 +89,7 @@ LOCAL_MTEAM_RANK_VERSION = 3
 MTEAM_RANK_VERSION = 2
 VIDEO_EXTENSIONS = {".3gp", ".avi", ".divx", ".flv", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".mts", ".ogv", ".rmvb", ".strm", ".ts", ".vob", ".webm", ".wmv"}
 SUBTITLE_EXTENSIONS = {".ass", ".idx", ".srt", ".ssa", ".sub", ".sup", ".vtt"}
-DEFAULT_SETTINGS = {"mteam_token": "", "downloader": {"type": "qbittorrent", "url": "", "username": "", "password": "", "path_mappings": []}, "poll_interval_minutes": 60, "mteam_request_interval_seconds": 5, "auto_scan": True, "local_multi_disk_wash": False, "cleanup_orphan_sidecars": False, "subtitle_collection_dir": "", "debug_mode": False}
+DEFAULT_SETTINGS = {"mteam_token": "", "downloader": {"type": "qbittorrent", "url": "", "username": "", "password": "", "path_mappings": []}, "poll_interval_minutes": 60, "mteam_request_interval_seconds": 5, "auto_scan": True, "local_multi_disk_wash": False, "cleanup_orphan_sidecars": False, "subtitle_collection_dir": "", "log_retention_days": 15, "debug_mode": False}
 CODE_RE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z0-9]{2,10})[- _.\u2010-\u2015]+(\d{2,8})(?!\d)", re.IGNORECASE)
 FC2_CODE_RE = re.compile(r"(?<![A-Za-z0-9])(FC2)[- _.\u2010-\u2015]?(PPV)[- _.\u2010-\u2015]+(\d{3,8})(?!\d)", re.IGNORECASE)
 EPISODE_CODE_RE = re.compile(r"S\d{1,2}E\d{1,3}-\d{3,4}", re.IGNORECASE)
@@ -1121,7 +1121,7 @@ def log_event(message, level="info", event="status", subscription=""):
                 "INSERT INTO activity_logs(time, level, event, subscription, message, round_id) VALUES (?, ?, ?, ?, ?, ?)",
                 (entry["time"], entry["level"], entry["event"], entry["subscription"], entry["message"], entry["round_id"]),
             )
-            connection.execute("DELETE FROM activity_logs WHERE id NOT IN (SELECT id FROM activity_logs ORDER BY id DESC LIMIT 500)")
+            prune_activity_logs(connection)
     finally:
         connection.close()
 
@@ -1252,6 +1252,7 @@ def connect_log_database():
         )
     """)
     connection.execute("CREATE INDEX IF NOT EXISTS activity_logs_subscription_id ON activity_logs(subscription, id)")
+    connection.execute("CREATE INDEX IF NOT EXISTS activity_logs_time ON activity_logs(time)")
     connection.execute("CREATE TABLE IF NOT EXISTS activity_log_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     connection.commit()
     try:
@@ -1267,10 +1268,9 @@ def connect_log_database():
                         entries = []
                     connection.executemany(
                         "INSERT INTO activity_logs(time, level, event, subscription, message, round_id) VALUES (?, ?, ?, ?, ?, ?)",
-                        [(str(item.get("time", "")), str(item.get("level", "info")), str(item.get("event", "status")), str(item.get("subscription", "")), str(item.get("message", ""))[:2000], str(item.get("round_id", ""))) for item in entries[-500:] if isinstance(item, dict)],
+                        [(str(item.get("time", "")), str(item.get("level", "info")), str(item.get("event", "status")), str(item.get("subscription", "")), str(item.get("message", ""))[:2000], str(item.get("round_id", ""))) for item in entries if isinstance(item, dict)],
                     )
                     connection.execute("INSERT INTO activity_log_meta(key, value) VALUES ('legacy_json_imported', '1')")
-                    connection.execute("DELETE FROM activity_logs WHERE id NOT IN (SELECT id FROM activity_logs ORDER BY id DESC LIMIT 500)")
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -1282,23 +1282,117 @@ def connect_log_database():
     return connection
 
 
-def get_logs(limit=500, after_id=None):
+_last_log_prune = 0.0
+_log_prune_lock = threading.Lock()
+
+
+def prune_activity_logs(connection=None, force=False):
+    global _last_log_prune
+    now = time.monotonic()
+    if not force and now - _last_log_prune < 600:
+        return 0
+    with _log_prune_lock:
+        now = time.monotonic()
+        if not force and now - _last_log_prune < 600:
+            return 0
+        own_connection = connection is None
+        connection = connect_log_database() if own_connection else connection
+        try:
+            retention_days = get_settings().get("log_retention_days", 15)
+            cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=retention_days)).isoformat(timespec="seconds")
+            cursor = connection.execute("DELETE FROM activity_logs WHERE time < ?", (cutoff,))
+            if own_connection:
+                connection.commit()
+            _last_log_prune = now
+            return cursor.rowcount
+        finally:
+            if own_connection:
+                connection.close()
+
+
+LOG_CATEGORY_SQL = """CASE
+    WHEN event = 'debug_http_response' THEN '接口响应'
+    WHEN event GLOB 'repair_archive_*' THEN '归档'
+    WHEN event GLOB 'repair_*' THEN '修复'
+    WHEN event = 'debug_artwork' OR event = 'local_artwork_sync_started' THEN '本地资料'
+    WHEN event GLOB 'debug_*' THEN '排查'
+    WHEN event GLOB 'subtitle_*' THEN '字幕'
+    WHEN event GLOB 'local_cover_*' THEN '封面'
+    WHEN event GLOB 'local_screenshot_*' THEN '截图'
+    WHEN event = 'local_nfo_sync' THEN 'NFO'
+    WHEN event = 'dmm_actress_sync' THEN '女优资料'
+    WHEN event = 'dmm_translation_failed' THEN '翻译'
+    WHEN event GLOB 'local_scan_*' OR event GLOB 'local_video_*' OR event GLOB 'local_wash_*' OR event = 'orphan_sidecars_cleaned' THEN '本地'
+    WHEN event GLOB 'mteam_*' THEN 'M-Team'
+    WHEN event GLOB 'downloader_*' OR event GLOB 'existing_task_*' OR event GLOB 'duplicate_task*' THEN '下载器'
+    WHEN event GLOB 'retry_*' OR event = 'waiting_retry' OR event GLOB '*rate_limited*' THEN '等待'
+    WHEN event GLOB 'scheduler_*' OR event = 'state_error' THEN '系统'
+    WHEN event = 'release' THEN '资源'
+    WHEN event IN ('started', 'completed', 'failed', 'queued', 'subscription_started', 'subscription_completed', 'subscription_failed', 'request_interrupted') THEN '检查'
+    ELSE '状态'
+END"""
+
+
+def get_logs(limit=500, after_id=None, before_id=None, keyword="", category="", subscription=None):
     limit = max(1, min(int(limit), 500))
+    keyword = str(keyword or "").strip()
+    category = str(category or "").strip()
+    if len(keyword) > 500:
+        raise AppError("日志搜索关键字过长。")
+    if len(category) > 40:
+        raise AppError("日志类型无效。")
+    terms = keyword.split()
+    if len(terms) > 20:
+        raise AppError("日志搜索关键字最多支持 20 个词。")
     connection = connect_log_database()
     try:
+        with connection:
+            prune_activity_logs(connection)
+        where = []
+        parameters = []
         if after_id is not None:
             try:
                 after_id = max(0, int(after_id))
             except (TypeError, ValueError):
                 raise AppError("日志增量游标无效。")
+            where.append("id > ?")
+            parameters.append(after_id)
+        elif before_id is not None:
+            try:
+                before_id = max(0, int(before_id))
+            except (TypeError, ValueError):
+                raise AppError("日志分页游标无效。")
+            where.append("id < ?")
+            parameters.append(before_id)
+        if subscription is not None:
+            subscription = str(subscription)
+            if len(subscription) > 120:
+                raise AppError("日志订阅范围无效。")
+            where.append("subscription = ?")
+            parameters.append(subscription)
+        if category:
+            where.append(f"({LOG_CATEGORY_SQL}) = ?")
+            parameters.append(category)
+        for term in terms:
+            escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            where.append(f"(subscription LIKE ? ESCAPE '\\' COLLATE NOCASE OR event LIKE ? ESCAPE '\\' COLLATE NOCASE OR message LIKE ? ESCAPE '\\' COLLATE NOCASE OR ({LOG_CATEGORY_SQL}) LIKE ? ESCAPE '\\' COLLATE NOCASE)")
+            pattern = f"%{escaped}%"
+            parameters.extend((pattern, pattern, pattern, pattern))
+        predicate = f"WHERE {' AND '.join(where)}" if where else ""
+        if after_id is not None:
             rows = connection.execute(
-                "SELECT id, time, level, event, subscription, message, round_id FROM activity_logs WHERE id > ? ORDER BY id ASC LIMIT ?",
-                (after_id, limit),
+                f"SELECT id, time, level, event, subscription, message, round_id FROM activity_logs {predicate} ORDER BY id ASC LIMIT ?",
+                (*parameters, limit),
             ).fetchall()
+        elif before_id is not None:
+            rows = connection.execute(
+                f"SELECT id, time, level, event, subscription, message, round_id FROM activity_logs {predicate} ORDER BY id DESC LIMIT ?",
+                (*parameters, limit),
+            ).fetchall()[::-1]
         else:
             rows = connection.execute(
-                "SELECT id, time, level, event, subscription, message, round_id FROM activity_logs ORDER BY id DESC LIMIT ?",
-                (limit,),
+                f"SELECT id, time, level, event, subscription, message, round_id FROM activity_logs {predicate} ORDER BY id DESC LIMIT ?",
+                (*parameters, limit),
             ).fetchall()[::-1]
         return [dict(zip(("id", "time", "level", "event", "subscription", "message", "round_id"), row)) for row in rows]
     finally:
@@ -1419,6 +1513,9 @@ def save_settings(payload):
     request_interval = payload.get("mteam_request_interval_seconds", settings.get("mteam_request_interval_seconds", MTEAM_MIN_REQUEST_INTERVAL))
     if isinstance(request_interval, bool) or not isinstance(request_interval, int) or not 1 <= request_interval <= 60:
         raise AppError("M-Team 请求间隔须为 1 到 60 秒。")
+    log_retention_days = payload.get("log_retention_days", settings.get("log_retention_days", 15))
+    if isinstance(log_retention_days, bool) or not isinstance(log_retention_days, int) or not 1 <= log_retention_days <= 365:
+        raise AppError("日志保存时间须为 1 到 365 天。")
     subtitle_collection_dir = payload.get("subtitle_collection_dir", settings.get("subtitle_collection_dir", ""))
     if not isinstance(subtitle_collection_dir, str) or any(ord(char) < 32 or ord(char) == 127 for char in subtitle_collection_dir):
         raise AppError("字幕汇总目录格式无效。")
@@ -1446,9 +1543,11 @@ def save_settings(payload):
         "local_multi_disk_wash": bool(payload.get("local_multi_disk_wash", settings.get("local_multi_disk_wash", False))),
         "cleanup_orphan_sidecars": bool(payload.get("cleanup_orphan_sidecars", settings.get("cleanup_orphan_sidecars", False))),
         "subtitle_collection_dir": subtitle_collection_dir,
+        "log_retention_days": log_retention_days,
         "debug_mode": bool(payload.get("debug_mode", settings.get("debug_mode", False))),
     }
     write_json(SETTINGS_FILE, result)
+    prune_activity_logs(force=True)
     return public_settings(result)
 
 
@@ -1466,6 +1565,7 @@ def public_settings(settings=None):
         "local_multi_disk_wash": settings.get("local_multi_disk_wash", False),
         "cleanup_orphan_sidecars": settings.get("cleanup_orphan_sidecars", False),
         "subtitle_collection_dir": settings.get("subtitle_collection_dir", ""),
+        "log_retention_days": settings.get("log_retention_days", 15),
         "debug_mode": settings.get("debug_mode", False),
     }
 
@@ -6933,30 +7033,46 @@ def local_wash_description(item):
     return f"{Path(item['path']).name}（M-Team ID {identifier}，{rank}，依据：{source}）"
 
 
-def local_task_for_video(video_path, tasks):
+def local_task_for_video(video_path, tasks, downloader=None):
     video = Path(video_path).resolve()
     matches = []
+    code = normalize_code(video.stem) or next(
+        (normalize_code(parent.name) for parent in video.parents if normalize_code(parent.name)), ""
+    )
     for info_hash, task in (tasks or {}).items():
         content_path = str(task.get("content_path", "") or "")
-        if not content_path:
-            continue
-        content = Path(content_path).resolve()
+        content = Path(content_path).resolve() if content_path else None
         if content == video:
             matches.append((str(info_hash).lower(), task))
             continue
-        if content.is_dir():
+        if content and content.is_dir():
             try:
                 video.relative_to(content)
             except ValueError:
                 continue
-            contained_videos = [item.resolve() for item in list_local_video_files(str(content))]
-            if contained_videos == [video]:
+            matches.append((str(info_hash).lower(), task))
+            continue
+        if content and content.is_file():
+            continue
+        task_code = normalize_code(task.get("name", "")) or normalize_code(content_path)
+        save_path = Path(str(task.get("save_path", "") or ""))
+        if (not code or task_code != code or not save_path.is_absolute()
+                or not callable(getattr(downloader, "list_task_files", None))):
+            continue
+        for file_info in downloader.list_task_files(str(info_hash).lower()):
+            relative = str(file_info.get("name", "")).replace("\\", "/")
+            relative_path = Path(relative)
+            if (not relative or relative_path.is_absolute() or ".." in relative_path.parts
+                    or relative_path.suffix.casefold() not in VIDEO_EXTENSIONS):
+                continue
+            if (save_path / relative_path).resolve() == video:
                 matches.append((str(info_hash).lower(), task))
+                break
     return matches
 
 
 def remove_local_release_task(video_path, downloader, tasks, all_records):
-    matches = local_task_for_video(video_path, tasks)
+    matches = local_task_for_video(video_path, tasks, downloader)
     if not matches:
         return ""
     if len(matches) != 1:
@@ -6964,6 +7080,11 @@ def remove_local_release_task(video_path, downloader, tasks, all_records):
     info_hash, task = matches[0]
     if not task.get("complete"):
         raise AppError("对应下载任务尚未完成，已保留任务和本地文件。")
+    content_path = Path(str(task.get("content_path", "") or "")).resolve()
+    if content_path.is_dir():
+        contained_videos = [item.resolve() for item in list_local_video_files(str(content_path))]
+        if contained_videos != [Path(video_path).resolve()]:
+            raise AppError("对应种子还包含其他视频文件，为避免整种删除其他影片，已保留该任务和本地文件。")
     references = []
     for subscription_id, items in (all_records or {}).items():
         for code, record in items.items():
@@ -6973,7 +7094,7 @@ def remove_local_release_task(video_path, downloader, tasks, all_records):
                     references.append((subscription_id, code, record, field, release))
     if len(references) > 1:
         raise AppError("该下载任务被多个订阅记录共用，已保留任务和本地文件。")
-    downloader.remove(info_hash, False)
+    downloader.remove(info_hash, True)
     for _subscription_id, _code, record, field, _release in references:
         record.pop(field, None)
         if not record.get("current") and not record.get("pending"):
@@ -7015,7 +7136,7 @@ def wash_local_duplicate_releases(download_dir, releases, performer="", download
                     tasks = downloader.list_tasks()
                 removed_hash = remove_local_release_task(item["path"], downloader, tasks, all_records) if downloader else ""
                 remove_local_releases([item["path"]], download_dir, code, [download_dir])
-                task_note = f"并已移除下载器任务 {removed_hash}（保留任务数据，由应用精确清理视频及配套文件）" if removed_hash else ""
+                task_note = f"并已从 qBittorrent 删除任务及其已下载文件 {removed_hash}" if removed_hash else ""
                 reason = local_wash_reason(item.get("rank"), winner.get("rank"))
                 log_event(
                     f"本地洗版原因：{reason}；保留：{local_wash_description(winner)}；已删除文件 {local_wash_description(item)}及其 NFO/字幕。{task_note}",
@@ -9012,7 +9133,14 @@ def handle_request():
         elif path == "/api/logs" and method == "GET":
             query = urllib.parse.parse_qs(os.environ.get("QUERY_STRING", ""))
             after_id = query.get("after_id", [None])[0]
-            result = get_logs(after_id=after_id)
+            before_id = query.get("before_id", [None])[0]
+            limit = query.get("limit", [None])[0]
+            result = get_logs(
+                after_id=after_id, before_id=before_id, limit=200 if limit is None else limit,
+                keyword=query.get("keyword", [""])[0],
+                category=query.get("category", [""])[0],
+                subscription=query.get("subscription", [None])[0],
+            )
         elif path == "/api/logs" and method == "DELETE":
             subscription = urllib.parse.parse_qs(os.environ.get("QUERY_STRING", "")).get("subscription", [None])[0]
             result = clear_logs(subscription)

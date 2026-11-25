@@ -61,9 +61,16 @@ let activityRefreshInFlight = false;
 let subscriptionRefreshInFlight = false;
 let subscriptionRevision = 0;
 let logsLoaded = false;
+let hasOlderLogs = false;
+let olderLogsLoading = false;
+let logSearchRevision = 0;
+let logFilterTimer = 0;
+let lastLogScopeKey = "";
+let logViewportFillScheduled = false;
 let lastSubscriptionRefresh = 0;
 let lastActivityRefresh = 0;
 let lastLogId = 0;
+const LOG_PAGE_SIZE = 200;
 let blacklistNumbers = [];
 let searchKeywords = [];
 let pathMappings = [];
@@ -1261,6 +1268,13 @@ function renderPage() {
   }
   renderActivity();
   renderLogs(logEntries);
+  const scopeKey = activeView === "subscription"
+    ? `subscription:${selected?.performer || ""}`
+    : activeView === "all" ? "all" : "";
+  if (scopeKey && scopeKey !== lastLogScopeKey) {
+    lastLogScopeKey = scopeKey;
+    void reloadLogsForFilters();
+  }
 }
 
 function showSubscription(id) {
@@ -1587,7 +1601,8 @@ function renderLogs(entries) {
   const categories = new Set(scopedEntries.filter((entry) => entry.event !== "run_separator")
     .map((entry) => logCategory(entry.event)));
   if (category) categories.add(category);
-  const options = [...categories].sort((a, b) => a.localeCompare(b, "zh-CN"));
+  const options = [...new Set([...select.options].slice(1).map((option) => option.value).concat([...categories]))]
+    .sort((a, b) => a.localeCompare(b, "zh-CN"));
   if (options.join("\n") !== [...select.options].slice(1).map((option) => option.value).join("\n")) {
     select.replaceChildren(new Option("全部类型", ""), ...options.map((value) => new Option(value, value)));
     select.value = category;
@@ -1608,6 +1623,7 @@ function renderLogs(entries) {
     empty.className = "log-empty";
     empty.textContent = filtering ? "没有符合筛选条件的日志。" : "等待检查任务。";
     list.append(empty);
+    scheduleLogViewportFill();
     return;
   }
   const copyButtons = new Set();
@@ -1673,6 +1689,96 @@ function renderLogs(entries) {
     row.append(time, source, message);
     list.append(row);
   }
+  scheduleLogViewportFill();
+}
+
+async function loadOlderLogs() {
+  if (!hasOlderLogs || olderLogsLoading || !logEntries.length) return;
+  const revision = logSearchRevision;
+  olderLogsLoading = true;
+  const status = $("#log-history-status");
+  status.textContent = "正在加载更早日志…";
+  const list = $("#log-list");
+  try {
+    const beforeId = Math.min(...logEntries.map((entry) => Number(entry.id) || Infinity));
+    const params = logFilterParams();
+    params.set("limit", String(LOG_PAGE_SIZE));
+    params.set("before_id", String(beforeId));
+    const older = await api(`/api/logs?${params}`);
+    if (revision !== logSearchRevision) return;
+    const known = new Set(logEntries.map((entry) => Number(entry.id)));
+    logEntries = [...older.filter((entry) => !known.has(Number(entry.id))), ...logEntries];
+    hasOlderLogs = older.length === LOG_PAGE_SIZE;
+    renderLogs(logEntries);
+    status.textContent = hasOlderLogs ? "继续向下滚动可加载更早日志" : "已加载全部日志";
+  } catch (error) {
+    if (revision === logSearchRevision) {
+      status.textContent = "加载失败，滚动到底部可重试";
+      toast(`加载更早日志失败：${error.message}`, true);
+    }
+  } finally {
+    olderLogsLoading = false;
+    if (revision === logSearchRevision && !hasOlderLogs && !status.textContent.includes("失败")) {
+      status.textContent = "已加载全部日志";
+    }
+  }
+}
+
+function scheduleLogViewportFill() {
+  if (logViewportFillScheduled) return;
+  logViewportFillScheduled = true;
+  requestAnimationFrame(() => {
+    logViewportFillScheduled = false;
+    const list = $("#log-list");
+    if (list.clientHeight && list.scrollHeight <= list.clientHeight + 48 && hasOlderLogs) {
+      void loadOlderLogs();
+    }
+  });
+}
+
+$("#log-list").addEventListener("scroll", () => {
+  const list = $("#log-list");
+  if (list.scrollTop + list.clientHeight >= list.scrollHeight - 96) {
+    void loadOlderLogs();
+  }
+});
+
+function logFilterParams() {
+  const params = new URLSearchParams();
+  const keyword = $("#log-keyword").value.trim();
+  const category = $("#log-category-filter").value;
+  if (keyword) params.set("keyword", keyword);
+  if (category) params.set("category", category);
+  if (activeView === "subscription") {
+    const selected = subscriptions.find((item) => item.id === selectedSubscriptionId);
+    if (selected) params.set("subscription", selected.performer);
+  }
+  return params;
+}
+
+async function reloadLogsForFilters() {
+  const revision = ++logSearchRevision;
+  const params = logFilterParams();
+  params.set("limit", String(LOG_PAGE_SIZE));
+  try {
+    const entries = await api(`/api/logs?${params}`);
+    if (revision !== logSearchRevision) return;
+    logEntries = entries;
+    hasOlderLogs = entries.length === LOG_PAGE_SIZE;
+    logsLoaded = true;
+    lastLogId = Math.max(lastLogId, ...entries.map((entry) => Number(entry.id) || 0));
+    renderLogs(logEntries);
+    $("#log-history-status").textContent = hasOlderLogs
+      ? "向下滚动到底部自动加载更早日志"
+      : "已加载全部符合条件的日志";
+  } catch (error) {
+    if (revision === logSearchRevision) toast(`搜索日志失败：${error.message}`, true);
+  }
+}
+
+function scheduleLogsFilterReload(delay = 0) {
+  window.clearTimeout(logFilterTimer);
+  logFilterTimer = window.setTimeout(() => void reloadLogsForFilters(), delay);
 }
 
 const LOG_EVENT_LABELS = {
@@ -1888,7 +1994,10 @@ async function clearLogs() {
     logEntries = scoped
       ? logEntries.filter((entry) => entry.subscription !== selected.performer)
       : [];
+    hasOlderLogs = false;
+    logsLoaded = true;
     renderLogs(logEntries);
+    $("#log-history-status").textContent = "已清理日志";
     toast(`已清理 ${result.deleted} 条${scoped ? `${selected.performer}的` : ""}日志`);
   } catch (error) {
     toast(error.message, true);
@@ -2050,17 +2159,28 @@ async function refresh() {
   if (refreshInFlight) return;
   refreshInFlight = true;
   try {
-    const logsPath = logsLoaded ? `/api/logs?after_id=${lastLogId}` : "/api/logs";
+    const initialLogParams = logFilterParams();
+    initialLogParams.set("limit", String(LOG_PAGE_SIZE));
+    const logParams = logsLoaded ? logFilterParams() : initialLogParams;
+    if (logsLoaded) {
+      logParams.set("after_id", String(lastLogId));
+      logParams.set("limit", String(LOG_PAGE_SIZE));
+    }
+    const logsPath = `/api/logs?${logParams}`;
     const [status, nextLogs, repairs] = await Promise.all([
       api("/api/status"),
       api(logsPath),
       api("/api/repair-jobs")
     ]);
     if (!logsLoaded || nextLogs.length) {
-      logEntries = [...logEntries, ...nextLogs].slice(-500);
+      if (!logsLoaded) hasOlderLogs = nextLogs.length === LOG_PAGE_SIZE;
+      const known = new Set(logEntries.map((entry) => Number(entry.id)));
+      logEntries = [...logEntries, ...nextLogs.filter((entry) => !known.has(Number(entry.id)))];
       logsLoaded = true;
       lastLogId = logEntries.reduce((maximum, entry) => Math.max(maximum, Number(entry.id) || 0), lastLogId);
       renderLogs(logEntries);
+      if (hasOlderLogs) $("#log-history-status").textContent = "向下滚动到底部自动加载更早日志";
+      else if (!logEntries.length) $("#log-history-status").textContent = "已加载全部符合条件的日志";
     }
     renderStatus(status);
     renderDataRepairStatus(repairs);
@@ -2323,6 +2443,7 @@ async function loadSettings() {
   $("#subtitle-collection-dir").value = settings.subtitle_collection_dir || "";
   renderAzureSettings(settings);
   $("#debug-mode").checked = Boolean(settings.debug_mode);
+  $("#log-retention-days").value = settings.log_retention_days || 15;
   renderPathMappings();
   $("#downloader-state").textContent = client.url ? "已配置" : "未配置";
   $("#auto-scan").checked = settings.auto_scan;
@@ -2406,6 +2527,7 @@ async function saveSettings({ clearToken = false, clearAzureKey = false } = {}) 
     azure_region: $("#azure-region").value.trim(),
     clear_azure_key: clearAzureKey,
     debug_mode: $("#debug-mode").checked,
+    log_retention_days: Number($("#log-retention-days").value),
     clear_mteam_token: clearToken
   };
   if ($("#mteam-token").value) payload.mteam_token = $("#mteam-token").value;
@@ -2567,7 +2689,6 @@ $("#existing-toggle").addEventListener("click", (event) => {
 });
 for (const [inputId, clearId, render, resultsSelector] of [
   ["existing-keyword", "clear-existing-keyword", renderExistingVideos, ".existing-section .table-wrap"],
-  ["log-keyword", "clear-log-keyword", () => renderLogs(logEntries), "#log-list"],
 ]) {
   const input = $(`#${inputId}`);
   const clear = $(`#${clearId}`);
@@ -2583,6 +2704,19 @@ for (const [inputId, clearId, render, resultsSelector] of [
     update();
   });
 }
+const logKeywordInput = $("#log-keyword");
+const logKeywordClear = $("#clear-log-keyword");
+const updateLogKeyword = () => {
+  logKeywordClear.hidden = !logKeywordInput.value;
+  scheduleLogsFilterReload(250);
+  $("#log-list").scrollTop = 0;
+};
+logKeywordInput.addEventListener("input", updateLogKeyword);
+logKeywordClear.addEventListener("click", () => {
+  logKeywordInput.value = "";
+  logKeywordInput.focus();
+  updateLogKeyword();
+});
 $("#selected-edit").addEventListener("click", () => {
   const selected = subscriptions.find((item) => item.id === selectedSubscriptionId);
   if (selected) openSubscription(selected);
@@ -2593,7 +2727,7 @@ $("#selected-delete").addEventListener("click", () => {
 });
 $("#clear-logs").addEventListener("click", clearLogs);
 $("#log-category-filter").addEventListener("change", () => {
-  renderLogs(logEntries);
+  scheduleLogsFilterReload();
   $("#log-list").scrollTop = 0;
 });
 function setLogFullscreen(enabled) {
