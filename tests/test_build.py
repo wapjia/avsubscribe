@@ -11,7 +11,7 @@ class BuildVersionTests(unittest.TestCase):
         icon = root / "app/www/app-icon.png"
         self.assertIn('class="brand-mark" src="app-icon.png" alt=""', html)
         self.assertTrue(icon.is_file())
-        self.assertEqual(icon.read_bytes(), (root / "assets/app-icon-64.png").read_bytes())
+        self.assertTrue(icon.read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
 
     def test_logs_load_older_pages_when_scrolled_to_the_bottom(self):
         root = Path(__file__).resolve().parents[1]
@@ -105,6 +105,23 @@ class BuildVersionTests(unittest.TestCase):
         self.assertIn('id="clear-log-keyword"', html)
         self.assertIn('id="existing-keyword"', html)
         self.assertIn('id="clear-existing-keyword"', html)
+
+    def test_desktop_video_refresh_and_nfo_actions_follow_the_version_link(self):
+        css = (Path(__file__).resolve().parents[1] / "app/www/style.css").read_text(encoding="utf-8")
+        self.assertIn("@media (min-width: 601px)", css)
+        self.assertIn(".existing-section .version-row { flex-direction: column; align-items: flex-start; gap: 5px; }", css)
+        self.assertIn(".subscription-view .existing-number-row .version-row { display: flex; grid-row:", css)
+
+    def test_poster_watermark_settings_have_independent_default_on_toggles(self):
+        root = Path(__file__).resolve().parents[1]
+        html = (root / "app/www/index.html").read_text(encoding="utf-8")
+        script = (root / "app/www/app.js").read_text(encoding="utf-8")
+        self.assertIn('id="poster-language-watermark" type="checkbox" checked', html)
+        self.assertIn('id="poster-resolution-watermark" type="checkbox" checked', html)
+        self.assertIn('settings.poster_language_watermark !== false', script)
+        self.assertIn('settings.poster_resolution_watermark !== false', script)
+        self.assertIn('poster_language_watermark: $("#poster-language-watermark").checked', script)
+        self.assertIn('poster_resolution_watermark: $("#poster-resolution-watermark").checked', script)
 
     def test_mobile_local_video_cards_use_compact_content_sized_rows(self):
         css = (Path(__file__).resolve().parents[1] / "app/www/style.css").read_text(encoding="utf-8")

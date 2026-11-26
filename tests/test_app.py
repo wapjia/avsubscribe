@@ -679,6 +679,8 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
         self.assertTrue(app.get_settings()["local_multi_disk_wash"])
 
         self.assertFalse(public["cleanup_orphan_sidecars"])
+        self.assertTrue(public["poster_language_watermark"])
+        self.assertTrue(public["poster_resolution_watermark"])
         self.assertFalse(public["debug_mode"])
         self.assertEqual(public["log_retention_days"], 15)
         self.assertEqual(public["mteam_request_interval_seconds"], 5)
@@ -690,6 +692,16 @@ class SettingsAndSubscriptionTests(unittest.TestCase):
         self.assertTrue(app.get_settings()["debug_mode"])
         app.save_settings({"clear_mteam_token": True})
         self.assertFalse(app.public_settings()["mteam_token_configured"])
+
+    def test_poster_watermark_settings_default_on_and_can_be_toggled_independently(self):
+        self.assertTrue(app.get_settings()["poster_language_watermark"])
+        self.assertTrue(app.get_settings()["poster_resolution_watermark"])
+        saved = app.save_settings({"poster_language_watermark": False})
+        self.assertFalse(saved["poster_language_watermark"])
+        self.assertTrue(saved["poster_resolution_watermark"])
+        self.assertFalse(app.get_settings()["poster_language_watermark"])
+        saved = app.save_settings({"poster_resolution_watermark": False})
+        self.assertFalse(saved["poster_resolution_watermark"])
 
     def test_log_retention_setting_is_validated_and_persisted(self):
         self.assertEqual(app.get_settings()["log_retention_days"], 15)

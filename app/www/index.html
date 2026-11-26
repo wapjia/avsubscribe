@@ -117,6 +117,11 @@
         <div class="settings-row"><div class="settings-control"><label class="interval" for="mteam-request-interval">请求间隔<input id="mteam-request-interval" type="number" min="1" max="60" step="1">秒/次</label></div><div class="settings-row-description"><strong>M-Team API 速度</strong><span>每次请求之间的等待时间；数值越大，请求越慢。默认 5 秒。</span></div></div>
       </div>
       <div class="settings-group">
+        <div class="settings-group-heading"><h3>海报水印</h3><p>控制按本地视频信息合成到海报上的标签。</p></div>
+        <div class="settings-row"><div class="settings-control"><label class="toggle"><input id="poster-language-watermark" type="checkbox" checked><span class="switch"></span><span>语言水印</span></label></div><div class="settings-row-description"><strong>显示中文类型标签</strong><span>在海报左上角显示“内嵌中文”或“外挂中文”。默认开启。</span></div></div>
+        <div class="settings-row"><div class="settings-control"><label class="toggle"><input id="poster-resolution-watermark" type="checkbox" checked><span class="switch"></span><span>分辨率水印</span></label></div><div class="settings-row-description"><strong>显示分辨率标签</strong><span>在海报左上角显示“4K”或“1080P”。默认开启。</span></div></div>
+      </div>
+      <div class="settings-group">
         <div class="settings-group-heading"><h3>本地维护与诊断</h3><p>控制本地文件整理和日志详细程度。</p></div>
         <div class="settings-row"><div class="settings-control"><label class="toggle"><input id="local-multi-disk-wash" type="checkbox"><span class="switch"></span><span>洗版本地重复番号</span></label></div><div class="settings-row-description"><strong>仅限同一女优的订阅目录</strong><span>比较目录内同番号影片；仅在分辨率或中文等级明确较低时删除本地文件，不跨女优目录洗版。</span></div></div>
         <div class="settings-row"><div class="settings-control"><label class="toggle"><input id="cleanup-orphan-sidecars" type="checkbox"><span class="switch"></span><span>清理孤立配套文件</span></label></div><div class="settings-row-description"><strong>自动清理孤立配套文件和空目录</strong><span>检查时清理找不到对应视频的 NFO 和字幕，以及只剩图片或配套文件的子目录。原本就为空的子目录也会清理。</span></div></div>

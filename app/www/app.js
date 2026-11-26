@@ -2440,6 +2440,8 @@ async function loadSettings() {
   pathMappings = (client.path_mappings || []).map((mapping) => ({ local: mapping.local, remote: mapping.remote }));
   $("#local-multi-disk-wash").checked = Boolean(settings.local_multi_disk_wash);
   $("#cleanup-orphan-sidecars").checked = Boolean(settings.cleanup_orphan_sidecars);
+  $("#poster-language-watermark").checked = settings.poster_language_watermark !== false;
+  $("#poster-resolution-watermark").checked = settings.poster_resolution_watermark !== false;
   $("#subtitle-collection-dir").value = settings.subtitle_collection_dir || "";
   renderAzureSettings(settings);
   $("#debug-mode").checked = Boolean(settings.debug_mode);
@@ -2523,6 +2525,8 @@ async function saveSettings({ clearToken = false, clearAzureKey = false } = {}) 
     mteam_request_interval_seconds: Number($("#mteam-request-interval").value), auto_scan: $("#auto-scan").checked,
     local_multi_disk_wash: $("#local-multi-disk-wash").checked,
     cleanup_orphan_sidecars: $("#cleanup-orphan-sidecars").checked,
+    poster_language_watermark: $("#poster-language-watermark").checked,
+    poster_resolution_watermark: $("#poster-resolution-watermark").checked,
     subtitle_collection_dir: $("#subtitle-collection-dir").value.trim(),
     azure_region: $("#azure-region").value.trim(),
     clear_azure_key: clearAzureKey,
@@ -2542,6 +2546,8 @@ async function saveSettings({ clearToken = false, clearAzureKey = false } = {}) 
     pathMappings = (settings.downloader.path_mappings || []).map((mapping) => ({ local: mapping.local, remote: mapping.remote }));
     $("#local-multi-disk-wash").checked = Boolean(settings.local_multi_disk_wash);
     $("#cleanup-orphan-sidecars").checked = Boolean(settings.cleanup_orphan_sidecars);
+    $("#poster-language-watermark").checked = settings.poster_language_watermark !== false;
+    $("#poster-resolution-watermark").checked = settings.poster_resolution_watermark !== false;
     $("#subtitle-collection-dir").value = settings.subtitle_collection_dir || "";
     renderAzureSettings(settings);
     $("#debug-mode").checked = Boolean(settings.debug_mode);

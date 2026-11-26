@@ -21,12 +21,22 @@ from pathlib import Path
 
 MAX_BYTES = 12 * 1024 * 1024
 MAX_PIXELS = 24_000_000
-POSTER_CROP_VERSION = 2
+POSTER_CROP_VERSION = 5
 POSTER_WIDTH_NUMERATOR = 47
 POSTER_WIDTH_DENOMINATOR = 100
 IMAGE_TYPES = {
     ".jpg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif",
 }
+POSTER_LABEL_ASSETS = {
+    "内嵌中文": "embedded-zh.png",
+    "外挂中文": "external-zh.png",
+    "4K": "4k.png",
+    "1080P": "1080p.png",
+}
+
+
+def poster_label_asset_dir():
+    return Path(__file__).resolve().parents[1] / "www" / "poster-labels"
 
 
 class ImageHTTPError(ValueError):
@@ -69,13 +79,13 @@ def image_extension(data):
     raise ValueError("封面图片格式无效。")
 
 
-def crop_poster(image, extension):
-    """Keep the rightmost 47% of the displayed cover at full height."""
+def crop_poster(image, extension, labels=()):
+    """Keep the rightmost 47% of the displayed cover and stamp video labels."""
     formats = {".jpg": "JPEG", ".png": "PNG", ".webp": "WEBP", ".gif": "GIF"}
     try:
         from PIL import Image, ImageOps
     except ImportError:
-        return crop_poster_ffmpeg(image, extension)
+        return crop_poster_ffmpeg(image, extension, labels)
     try:
         with Image.open(io.BytesIO(image), formats=[formats[extension]]) as original:
             if original.width * original.height > MAX_PIXELS:
@@ -85,6 +95,10 @@ def crop_poster(image, extension):
                 raise ValueError("封面宽度不足，无法裁剪。")
             width = (oriented.width * POSTER_WIDTH_NUMERATOR + POSTER_WIDTH_DENOMINATOR // 2) // POSTER_WIDTH_DENOMINATOR
             poster = oriented.crop((oriented.width - max(1, width), 0, oriented.width, oriented.height))
+            if labels and poster.width >= 100 and poster.height >= 50:
+                poster = stamp_poster_labels(poster, labels, Image)
+            if extension == ".jpg" and poster.mode not in ("RGB", "L"):
+                poster = poster.convert("RGB")
             output = io.BytesIO()
             options = {"quality": 95} if extension in (".jpg", ".webp") else {}
             poster.save(output, format=formats[extension], **options)
@@ -93,7 +107,35 @@ def crop_poster(image, extension):
     return checked_poster(output.getvalue(), extension)
 
 
-def crop_poster_ffmpeg(image, extension):
+def stamp_poster_labels(poster, labels, Image):
+    normalized = [label for label in dict.fromkeys(str(label).strip() for label in labels if str(label).strip())
+                  if label in POSTER_LABEL_ASSETS]
+    if not normalized:
+        return poster
+    poster = poster.convert("RGBA")
+    margin_x = max(3, round(poster.width * 0.025))
+    margin_y = max(3, round(poster.height * 0.02))
+    gap = max(2, round(poster.width * 0.015))
+    available_height = poster.height - margin_y * 2 - gap * (len(normalized) - 1)
+    if available_height <= 0:
+        return poster
+    tag_height = max(10, min(44, round(poster.width * 0.12), available_height // len(normalized)))
+    x, y = margin_x, margin_y
+    for label in normalized:
+        path = poster_label_asset_dir() / POSTER_LABEL_ASSETS[label]
+        with Image.open(path) as asset:
+            asset = asset.convert("RGBA")
+            width = max(1, round(asset.width * tag_height / asset.height))
+            if width > poster.width - margin_x * 2:
+                width = poster.width - margin_x * 2
+                tag_height = max(1, round(asset.height * width / asset.width))
+            asset = asset.resize((width, tag_height), Image.Resampling.LANCZOS)
+            poster.alpha_composite(asset, (x, y))
+            y += tag_height + gap
+    return poster
+
+
+def crop_poster_ffmpeg(image, extension, labels=()):
     executable = shutil.which("ffmpeg") or shutil.which("/usr/trim/bin/ffmpeg")
     if not executable:
         raise ValueError("找不到 FFmpeg 或 Pillow，无法裁剪海报。")
@@ -105,19 +147,56 @@ def crop_poster_ffmpeg(image, extension):
         "-threads", "1", "-f", demuxers[extension],
     ]
     rounded_width = f"max(1\\,floor((iw*{POSTER_WIDTH_NUMERATOR}+{POSTER_WIDTH_DENOMINATOR // 2})/{POSTER_WIDTH_DENOMINATOR}))"
-    output_options = [
-        "-filter_threads", "1", "-vf", f"crop={rounded_width}:ih:iw-ow:0:exact=1,setsar=1",
-        "-frames:v", "1", "-threads", "1", "-c:v", encoders[extension],
-    ]
-    if extension == ".jpg":
-        output_options.extend(("-q:v", "2"))
-    muxer = {".gif": "gif", ".webp": "webp"}.get(extension, "image2pipe")
-    output_options.extend(("-fs", str(MAX_BYTES), "-f", muxer, "pipe:1"))
+    normalized = list(dict.fromkeys(str(label).strip() for label in labels if str(label).strip()))
+    filters = [f"crop={rounded_width}:ih:iw-ow:0:exact=1,setsar=1"]
     try:
         with tempfile.TemporaryDirectory(prefix="avsubscribe-poster-") as directory:
             source = Path(directory) / ("cover" + extension)
             source.write_bytes(image)
-            command = [*input_options, "-i", str(source), *output_options]
+            vf_parts = []
+            input_paths = []
+            if normalized:
+                for index, label in enumerate(normalized):
+                    asset = poster_label_asset_dir() / POSTER_LABEL_ASSETS[label]
+                    if asset.is_file():
+                        input_paths.append(asset)
+                if input_paths:
+                    margin_x, margin_y = 10, 10
+                    gap = 6
+                    tag_height = 36
+                    vf_parts.append(f"crop={rounded_width}:ih:iw-ow:0:exact=1,setsar=1[base]")
+                    current = "base"
+                    for index, asset in enumerate(input_paths):
+                        image_label = f"tag{index}"
+                        output_label = f"layer{index}"
+                        input_index = index + 1
+                        y = margin_y + index * (tag_height + gap)
+                        vf_parts.append(f"[{input_index}:v]scale=-1:{tag_height}[{image_label}]")
+                        vf_parts.append(
+                            f"[{current}][{image_label}]overlay={margin_x}:{y}:"
+                            f"shortest=1[{output_label}]"
+                        )
+                        current = output_label
+                    vf_parts[-1] = vf_parts[-1].replace(f"[{current}]", "[vout]")
+                    filters = []
+                else:
+                    vf_parts = filters
+            else:
+                vf_parts = filters
+            output_options = ["-filter_threads", "1"]
+            if input_paths:
+                output_options.extend(("-filter_complex", ";".join(vf_parts), "-map", "[vout]"))
+            else:
+                output_options.extend(("-vf", ",".join(filters)))
+            output_options.extend(("-frames:v", "1", "-threads", "1", "-c:v", encoders[extension]))
+            if extension == ".jpg":
+                output_options.extend(("-q:v", "2"))
+            muxer = {".gif": "gif", ".webp": "webp"}.get(extension, "image2pipe")
+            output_options.extend(("-fs", str(MAX_BYTES), "-f", muxer, "pipe:1"))
+            command = [*input_options, "-i", str(source)]
+            for asset in input_paths:
+                command.extend(("-i", str(asset)))
+            command.extend(output_options)
             result = subprocess.run(command, capture_output=True, timeout=20, check=True)
     except (subprocess.SubprocessError, OSError) as error:
         raise ValueError("FFmpeg 无法裁剪封面。") from error

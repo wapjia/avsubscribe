@@ -89,7 +89,7 @@ LOCAL_MTEAM_RANK_VERSION = 3
 MTEAM_RANK_VERSION = 2
 VIDEO_EXTENSIONS = {".3gp", ".avi", ".divx", ".flv", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".mts", ".ogv", ".rmvb", ".strm", ".ts", ".vob", ".webm", ".wmv"}
 SUBTITLE_EXTENSIONS = {".ass", ".idx", ".srt", ".ssa", ".sub", ".sup", ".vtt"}
-DEFAULT_SETTINGS = {"mteam_token": "", "downloader": {"type": "qbittorrent", "url": "", "username": "", "password": "", "path_mappings": []}, "poll_interval_minutes": 60, "mteam_request_interval_seconds": 5, "auto_scan": True, "local_multi_disk_wash": False, "cleanup_orphan_sidecars": False, "subtitle_collection_dir": "", "log_retention_days": 15, "debug_mode": False}
+DEFAULT_SETTINGS = {"mteam_token": "", "downloader": {"type": "qbittorrent", "url": "", "username": "", "password": "", "path_mappings": []}, "poll_interval_minutes": 60, "mteam_request_interval_seconds": 5, "auto_scan": True, "local_multi_disk_wash": False, "cleanup_orphan_sidecars": False, "poster_language_watermark": True, "poster_resolution_watermark": True, "subtitle_collection_dir": "", "log_retention_days": 15, "debug_mode": False}
 CODE_RE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z0-9]{2,10})[- _.\u2010-\u2015]+(\d{2,8})(?!\d)", re.IGNORECASE)
 FC2_CODE_RE = re.compile(r"(?<![A-Za-z0-9])(FC2)[- _.\u2010-\u2015]?(PPV)[- _.\u2010-\u2015]+(\d{3,8})(?!\d)", re.IGNORECASE)
 EPISODE_CODE_RE = re.compile(r"S\d{1,2}E\d{1,3}-\d{3,4}", re.IGNORECASE)
@@ -1542,6 +1542,8 @@ def save_settings(payload):
         "auto_scan": bool(payload.get("auto_scan", settings["auto_scan"])),
         "local_multi_disk_wash": bool(payload.get("local_multi_disk_wash", settings.get("local_multi_disk_wash", False))),
         "cleanup_orphan_sidecars": bool(payload.get("cleanup_orphan_sidecars", settings.get("cleanup_orphan_sidecars", False))),
+        "poster_language_watermark": bool(payload.get("poster_language_watermark", settings.get("poster_language_watermark", True))),
+        "poster_resolution_watermark": bool(payload.get("poster_resolution_watermark", settings.get("poster_resolution_watermark", True))),
         "subtitle_collection_dir": subtitle_collection_dir,
         "log_retention_days": log_retention_days,
         "debug_mode": bool(payload.get("debug_mode", settings.get("debug_mode", False))),
@@ -1564,6 +1566,8 @@ def public_settings(settings=None):
         "auto_scan": settings.get("auto_scan", True),
         "local_multi_disk_wash": settings.get("local_multi_disk_wash", False),
         "cleanup_orphan_sidecars": settings.get("cleanup_orphan_sidecars", False),
+        "poster_language_watermark": settings.get("poster_language_watermark", True),
+        "poster_resolution_watermark": settings.get("poster_resolution_watermark", True),
         "subtitle_collection_dir": settings.get("subtitle_collection_dir", ""),
         "log_retention_days": settings.get("log_retention_days", 15),
         "debug_mode": settings.get("debug_mode", False),
@@ -4455,7 +4459,36 @@ def format_artwork_timings(timings):
     )
 
 
-def sync_local_poster(connection, directory, code, stem, cover, *, timings=None):
+def local_poster_labels(files, directory, language_watermark=True, resolution_watermark=True):
+    directory = Path(directory).resolve()
+    labels = set()
+    for item in files:
+        try:
+            if Path(item.get("path", "")).resolve().parent != directory:
+                continue
+        except OSError:
+            continue
+        rank = item.get("rank") or []
+        if resolution_watermark and len(rank) > 0:
+            if rank[0] >= 2:
+                labels.add("4K")
+            elif rank[0] == 1:
+                labels.add("1080P")
+        if language_watermark and len(rank) > 1:
+            if rank[1] >= 2:
+                labels.add("内嵌中文")
+            elif rank[1] == 1:
+                labels.add("外挂中文")
+    order = ("内嵌中文", "外挂中文", "4K", "1080P")
+    return [label for label in order if label in labels]
+
+
+def poster_generation_version(language_watermark=True, resolution_watermark=True):
+    options = int(bool(language_watermark)) | (int(bool(resolution_watermark)) << 1)
+    return cover_images.POSTER_CROP_VERSION * 4 + options
+
+
+def sync_local_poster(connection, directory, code, stem, cover, *, labels=(), poster_version=None, timings=None):
     stamp = cover_file_stat(cover)
     if stamp is None:
         return None
@@ -4463,19 +4496,20 @@ def sync_local_poster(connection, directory, code, stem, cover, *, timings=None)
         "SELECT poster_filename, poster_cover_mtime_ns, poster_crop_version FROM local_video_covers WHERE directory=? AND code=?",
         (str(directory), code),
     ).fetchone()
+    poster_version = cover_images.POSTER_CROP_VERSION if poster_version is None else poster_version
     old_path = local_poster_path(directory, code, previous)
     path = directory / (stem + cover.suffix)
     if (old_path == path and stamp.st_mtime_ns == cover_mtime
-            and crop_version == cover_images.POSTER_CROP_VERSION and cover_file_stat(path)):
+            and crop_version == poster_version and cover_file_stat(path)):
         return path
     with artwork_step(timings, "海报裁切"):
-        poster = cover_images.crop_poster(cover_images.read_file(cover), cover.suffix)
+        poster = cover_images.crop_poster(cover_images.read_file(cover), cover.suffix, labels=labels)
 
     def register(filename):
         connection.execute(
             """UPDATE local_video_covers SET poster_filename=?, poster_cover_mtime_ns=?, poster_crop_version=?
                WHERE directory=? AND code=?""",
-            (filename, stamp.st_mtime_ns, cover_images.POSTER_CROP_VERSION, str(directory), code),
+            (filename, stamp.st_mtime_ns, poster_version, str(directory), code),
         )
 
     # A conventional poster already present for this title can be refreshed.
@@ -5197,7 +5231,19 @@ def sync_subscription_covers(subscription, rows, all_records, settings, *, refre
                             unavailable += 1
                         if cover:
                             images["fansrt"] = cover.name
-                            poster = sync_local_poster(connection, directory, code, prefix + "poster", cover, timings=timings)
+                            poster = sync_local_poster(
+                                connection, directory, code, prefix + "poster", cover,
+                                labels=local_poster_labels(
+                                    row["files"], directory,
+                                    settings.get("poster_language_watermark", True),
+                                    settings.get("poster_resolution_watermark", True),
+                                ),
+                                poster_version=poster_generation_version(
+                                    settings.get("poster_language_watermark", True),
+                                    settings.get("poster_resolution_watermark", True),
+                                ),
+                                timings=timings,
+                            )
                             if poster:
                                 images["poster"] = poster.name
                     except (OSError, ValueError, sqlite3.Error, http.client.HTTPException) as error:

@@ -3,6 +3,8 @@ import io
 import json
 import os
 import socket
+import subprocess
+import sys
 import tempfile
 import unittest
 import urllib.error
@@ -622,6 +624,80 @@ class CoverLibraryTests(unittest.TestCase):
             self.assertEqual(poster.getextrema(), ((0, 0), (0, 0), (255, 255)))
 
     @unittest.skipUnless(find_spec("PIL"), "Pillow required to inspect poster pixels")
+    def test_poster_stamps_multiple_video_labels_without_changing_source_cover(self):
+        from PIL import Image
+
+        cover = Image.new("RGB", (400, 240), "navy")
+        source = io.BytesIO()
+        cover.save(source, "PNG")
+        original = source.getvalue()
+        poster_data = cover_images.crop_poster(
+            original, ".png", labels=["内嵌中文", "外挂中文", "4K", "1080P", "4K"],
+        )
+        with Image.open(io.BytesIO(poster_data)) as poster:
+            self.assertEqual(poster.size, (188, 240))
+            poster = poster.convert("RGB")
+            self.assertEqual(poster.getpixel((0, 0)), (0, 0, 128))
+            self.assertNotEqual(poster.getpixel((12, 12)), (0, 0, 128))
+            self.assertEqual(poster.getpixel((poster.width - 3, poster.height - 3)), (0, 0, 128))
+        self.assertEqual(source.getvalue(), original)
+
+    @unittest.skipUnless(find_spec("PIL"), "Pillow required to inspect poster pixels")
+    def test_poster_labels_keep_jpeg_output_valid(self):
+        from PIL import Image
+
+        cover = Image.new("RGB", (400, 240), "navy")
+        source = io.BytesIO()
+        cover.save(source, "JPEG")
+        result = cover_images.crop_poster(source.getvalue(), ".jpg", labels=["4K"])
+        self.assertEqual(cover_images.image_extension(result), ".jpg")
+        with Image.open(io.BytesIO(result)) as poster:
+            self.assertEqual(poster.mode, "RGB")
+            self.assertEqual(poster.size, (188, 240))
+
+    def test_ffmpeg_fallback_uses_packaged_label_png_overlays(self):
+        completed = subprocess.CompletedProcess([], 0, stdout=PNG, stderr=b"")
+        with patch.dict(sys.modules, {"PIL": None}), \
+             patch.object(cover_images.shutil, "which", return_value="ffmpeg"), \
+             patch.object(cover_images.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(
+                cover_images.crop_poster(PNG, ".png", labels=["内嵌中文", "4K"]),
+                PNG,
+            )
+        command = run.call_args.args[0]
+        self.assertIn("-filter_complex", command)
+        self.assertIn("-map", command)
+        self.assertTrue(any(value.endswith("embedded-zh.png") for value in command))
+        self.assertTrue(any(value.endswith("4k.png") for value in command))
+
+    def test_poster_tags_are_derived_from_video_rank_in_its_directory(self):
+        root = self.root
+        rows = [
+            {"path": str(root / "ABC-123-4k.mp4"), "rank": [2, 2, 2]},
+            {"path": str(root / "ABC-123-1080p.mp4"), "rank": [1, 1, 1]},
+            {"path": str(root / "nested" / "ABC-123.mp4"), "rank": [2, 2, 2]},
+        ]
+        self.assertEqual(app.local_poster_labels(rows, root), ["内嵌中文", "外挂中文", "4K", "1080P"])
+        self.assertEqual(
+            app.local_poster_labels(rows, root, language_watermark=False),
+            ["4K", "1080P"],
+        )
+        self.assertEqual(
+            app.local_poster_labels(rows, root, resolution_watermark=False),
+            ["内嵌中文", "外挂中文"],
+        )
+
+    def test_poster_generation_version_encodes_both_watermark_settings(self):
+        self.assertEqual(
+            len({
+                app.poster_generation_version(language, resolution)
+                for language in (False, True)
+                for resolution in (False, True)
+            }),
+            4,
+        )
+
+    @unittest.skipUnless(find_spec("PIL"), "Pillow required to inspect poster pixels")
     def test_nfo_records_rightmost_cover_crop_and_screenshots_in_video_directory(self):
         from PIL import Image
 
@@ -665,7 +741,7 @@ class CoverLibraryTests(unittest.TestCase):
              patch.object(cover_images, "crop_poster", return_value=PNG) as crop:
             self.sync("a", rows)
             self.sync("a", rows)
-        crop.assert_called_once_with(PNG, ".png")
+        crop.assert_called_once_with(PNG, ".png", labels=["内嵌中文", "1080P"])
         fetch.assert_not_called()
         self.assertEqual((video.parent / "fansrt.png").read_bytes(), PNG)
 
